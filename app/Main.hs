@@ -1,4 +1,6 @@
 module Main (main) where
 
+import Multiverse.App qualified as App
+
 main :: IO ()
-main = putStrLn "Hello, Haskell!"
+main = App.run

@@ -1,0 +1,23 @@
+timeline_db = "multiverse.sqlite3"
+
+[logging]
+level = "info"
+
+[telegram]
+bot_token = "123456:replace-me"
+mapping_db = "telegram-mapping.sqlite3"
+poll_timeout_seconds = 30
+
+[[telegram.rooms]]
+platform_key = "-1001234567890"
+# timeline_room = "existing-timeline-room-event-id"
+
+[matrix]
+homeserver = "https://matrix.example.org"
+access_token = "replace-me"
+mapping_db = "matrix-mapping.sqlite3"
+sync_timeout_ms = 30000
+
+[[matrix.rooms]]
+platform_key = "!roomid:matrix.example.org"
+# timeline_room = "existing-timeline-room-event-id"

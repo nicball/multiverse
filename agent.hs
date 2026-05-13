@@ -1,3 +1,9 @@
+module Types where
+
+import Data.ByteString (ByteString)
+import Data.List.NonEmpty (NonEmpty)
+import Data.Text (Text)
+
 type EventId = Int
 type UserId = EventId
 type RoomId = EventId
@@ -71,6 +77,13 @@ data EventContent
 data Timeline
 
 sendEvent :: Timeline -> Event -> IO EventId
+sendEvent = undefined
+
 getEventsAfter :: Timeline -> EventId -> IO [(EventId, Event)]
+getEventsAfter = undefined
+
 getEvent :: Timeline -> EventId -> IO Event
+getEvent = undefined
+
 getUserInfo :: Timeline -> UserId -> Maybe RoomId -> IO UserInfo
+getUserInfo = undefined
