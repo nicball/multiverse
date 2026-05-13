@@ -3,6 +3,9 @@ module Multiverse.Bridge
   , BridgeContext (..)
   , InitialRoomMapping (..)
   , MappingStore (..)
+  , hasPlatformMapping
+  , renderRelayedMessage
+  , submitMapped
   , openMappingStore
   , ensureInitialRooms
   , ensureInitialRoomsWith
@@ -12,6 +15,7 @@ where
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Database.SQLite.Simple
+import Data.List.NonEmpty (toList)
 import Text.Read (readMaybe)
 import Multiverse.Event hiding (eventId)
 import Multiverse.Log
@@ -44,6 +48,50 @@ data InitialRoomMapping = InitialRoomMapping
   , timelineRoom :: Maybe RoomId
   }
   deriving (Eq, Show)
+
+hasPlatformMapping :: MappingStore -> Text -> EventId -> IO Bool
+hasPlatformMapping store platform eventId = any ((== platform) . (.platform)) <$> store.lookupPlatformKeys eventId
+
+renderRelayedMessage :: Timeline timeline => BridgeContext timeline -> SendMessageInfo -> IO Text
+renderRelayedMessage context info = do
+  user <- getUserInfo context.timeline info.sender (Just info.room)
+  let sender = maybe "unknown" (.name) user
+  pure (sender <> ": " <> renderMessageText info.body)
+
+renderMessageText :: Message -> Text
+renderMessageText = Text.intercalate "\n" . map renderMessagePart . toList
+
+renderMessagePart :: MessagePart -> Text
+renderMessagePart = \case
+  Text inline -> renderInline inline
+  Emote inline -> "_ " <> renderInline inline
+  Blob _ _ -> "[blob]"
+  List items -> Text.intercalate "\n" (map renderMessageText (toList items))
+  BlockQuote message -> "> " <> Text.replace "\n" "\n> " (renderMessageText message)
+
+renderInline :: InlineText -> Text
+renderInline = Text.concat . map renderInlinePart . toList
+
+renderInlinePart :: InlineTextPart -> Text
+renderInlinePart = \case
+  Bold inline -> renderInline inline
+  Italic inline -> renderInline inline
+  Link inline url -> renderInline inline <> " (" <> url <> ")"
+  Mention inline _ -> renderInline inline
+  InlineQuote inline -> "\"" <> renderInline inline <> "\""
+  Plain text -> text
+
+submitMapped :: Timeline timeline => BridgeContext timeline -> Event -> IO (Either SubmitError EventId)
+submitMapped context event = do
+  submitted <- submit context.timeline event
+  case submitted of
+    Right eventId -> record eventId
+    Left (ConflictingPlatformKey _ eventId) -> record eventId
+    Left err -> pure (Left err)
+ where
+  record eventId = do
+    context.mappingStore.insertMapping event.platformKey eventId
+    pure (Right eventId)
 
 openMappingStore :: FilePath -> IO MappingStore
 openMappingStore path = do

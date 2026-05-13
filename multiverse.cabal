@@ -60,6 +60,7 @@ library
                     , Multiverse.Bridge
                     , Multiverse.Config
                     , Multiverse.Event
+                    , Multiverse.HTTP
                     , Multiverse.Log
                     , Multiverse.Matrix
                     , Multiverse.SQLite

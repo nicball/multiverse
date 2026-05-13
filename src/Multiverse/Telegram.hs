@@ -5,24 +5,22 @@ module Multiverse.Telegram
 where
 
 import Control.Concurrent (threadDelay)
-import Control.Exception (try)
 import Control.Monad (forever, unless)
 import Data.Aeson
 import Data.ByteString.Char8 qualified as ByteString.Char8
 import Data.ByteString.Lazy qualified as LByteString
-import Data.Text.Encoding.Error (lenientDecode)
 import Data.List.NonEmpty (NonEmpty ((:|)))
-import Data.List.NonEmpty (toList)
 import Data.Maybe (catMaybes)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text
 import Network.HTTP.Client
 import Network.HTTP.Client.TLS
-import Network.HTTP.Types (statusCode)
 import Text.Read (readMaybe)
 import Multiverse.Bridge
 import Multiverse.Event hiding (eventId)
+import Multiverse.HTTP (HttpLogOptions (..), defaultHttpLogOptions)
+import Multiverse.HTTP qualified as HTTP
 import Multiverse.Log
 import Multiverse.Timeline
 import Multiverse.Types
@@ -98,10 +96,9 @@ observeUpdate config context update =
                           , body = plainMessage body
                           }
                   }
-          submitted <- submit context.timeline event
+          submitted <- submitMapped context event
           case submitted of
-            Right eventId -> context.mappingStore.insertMapping platformKey eventId
-            Left (ConflictingPlatformKey _ eventId) -> context.mappingStore.insertMapping platformKey eventId
+            Right _ -> pure ()
             Left err -> logError context.logger ("telegram submit error: " <> Text.pack (show err))
 
 ensureUser :: Timeline timeline => BridgeContext timeline -> TelegramUser -> IO UserId
@@ -112,10 +109,9 @@ ensureUser context user = do
     Just eventId -> pure (UserId eventId)
     Nothing -> do
       let event = Event {platformKey, content = CreateUser UserInfo {name = telegramUserName user, avatar = Nothing}}
-      submitted <- submit context.timeline event
-      case submitted of
-        Right eventId -> context.mappingStore.insertMapping platformKey eventId >> pure (UserId eventId)
-        Left (ConflictingPlatformKey _ eventId) -> context.mappingStore.insertMapping platformKey eventId >> pure (UserId eventId)
+      mapped <- submitMapped context event
+      case mapped of
+        Right eventId -> pure (UserId eventId)
         Left err -> fail ("could not create telegram user: " <> show err)
 
 configuredRoom :: TelegramConfig -> BridgeContext timeline -> TelegramChat -> IO (Maybe RoomId)
@@ -148,38 +144,6 @@ reflectEvent manager config context stored =
         case result of
           Left err -> logError context.logger ("telegram reflect error: " <> Text.pack err)
           Right message -> context.mappingStore.insertMapping (telegramMessageKey message) stored.storedId
-
-hasPlatformMapping :: MappingStore -> Text -> EventId -> IO Bool
-hasPlatformMapping store platform eventId = any ((== platform) . (.platform)) <$> store.lookupPlatformKeys eventId
-
-renderRelayedMessage :: Timeline timeline => BridgeContext timeline -> SendMessageInfo -> IO Text
-renderRelayedMessage context info = do
-  user <- getUserInfo context.timeline info.sender (Just info.room)
-  let sender = maybe "unknown" (.name) user
-  pure (sender <> ": " <> renderMessageText info.body)
-
-renderMessageText :: Message -> Text
-renderMessageText = Text.intercalate "\n" . map renderMessagePart . toList
-
-renderMessagePart :: MessagePart -> Text
-renderMessagePart = \case
-  Text inline -> renderInline inline
-  Emote inline -> "_ " <> renderInline inline
-  Blob _ _ -> "[blob]"
-  List items -> Text.intercalate "\n" (map renderMessageText (toList items))
-  BlockQuote message -> "> " <> Text.replace "\n" "\n> " (renderMessageText message)
-
-renderInline :: InlineText -> Text
-renderInline = Text.concat . map renderInlinePart . toList
-
-renderInlinePart :: InlineTextPart -> Text
-renderInlinePart = \case
-  Bold inline -> renderInline inline
-  Italic inline -> renderInline inline
-  Link inline url -> renderInline inline <> " (" <> url <> ")"
-  Mention inline _ -> renderInline inline
-  InlineQuote inline -> "\"" <> renderInline inline <> "\""
-  Plain text -> text
 
 telegramGetUpdates :: Logger -> Manager -> TelegramConfig -> Maybe Int -> IO (Either String [TelegramUpdate])
 telegramGetUpdates logger manager config offset = do
@@ -226,65 +190,11 @@ telegramGetChat logger manager config chatId = do
   pure (decodeResponse response)
 
 loggedHttp :: Logger -> Request -> Manager -> IO (Response LByteString.ByteString)
-loggedHttp logger request manager = do
-  logDebug logger ("http request " <> requestSummary request)
-  response <- httpLbsWithBackoff logger request manager
-  logDebug logger ("http response " <> responseSummary request response)
-  pure response
+loggedHttp logger = HTTP.loggedHttp logger telegramHttpLogOptions
 
-httpLbsWithBackoff :: Logger -> Request -> Manager -> IO (Response LByteString.ByteString)
-httpLbsWithBackoff logger request manager =
-  go initialHttpBackoffMicros
- where
-  go delayMicros = do
-    result <- try (httpLbs request manager)
-    case result of
-      Right response -> pure response
-      Left (err :: HttpException) -> do
-        logWarn logger ("http request failed, retrying in " <> delayText delayMicros <> ": " <> Text.pack (show err))
-        threadDelay delayMicros
-        go (min maxHttpBackoffMicros (delayMicros * 2))
-
-initialHttpBackoffMicros :: Int
-initialHttpBackoffMicros = 1000000
-
-maxHttpBackoffMicros :: Int
-maxHttpBackoffMicros = 60000000
-
-delayText :: Int -> Text
-delayText micros = Text.pack (show (micros `div` 1000000)) <> "s"
-
-requestSummary :: Request -> Text
-requestSummary request =
-  Text.pack (ByteString.Char8.unpack request.method)
-    <> " "
-    <> requestUrl request
-    <> " request_body="
-    <> requestBodyPreview request.requestBody
-
-responseSummary :: Request -> Response LByteString.ByteString -> Text
-responseSummary request response =
-  Text.pack (ByteString.Char8.unpack request.method)
-    <> " "
-    <> requestUrl request
-    <> " status="
-    <> Text.pack (show (statusCode response.responseStatus))
-    <> " response_body="
-    <> truncateBody response.responseBody
-
-requestBodyPreview :: RequestBody -> Text
-requestBodyPreview = \case
-  RequestBodyLBS body -> truncateBody body
-  RequestBodyBS body -> truncateBody (LByteString.fromStrict body)
-  RequestBodyBuilder size _ -> "builder:" <> Text.pack (show size) <> " bytes"
-  RequestBodyStream size _ -> "stream:" <> Text.pack (show size) <> " bytes"
-  RequestBodyStreamChunked _ -> "chunked"
-  RequestBodyIO _ -> "io"
-
-truncateBody :: LByteString.ByteString -> Text
-truncateBody body =
-  let text = Text.decodeUtf8With lenientDecode (LByteString.toStrict (LByteString.take 512 body))
-   in if LByteString.length body > 512 then text <> "...<truncated>" else text
+telegramHttpLogOptions :: HttpLogOptions
+telegramHttpLogOptions =
+  defaultHttpLogOptions {redactUrl = redactTelegramUrl}
 
 redactTelegramUrl :: Text -> Text
 redactTelegramUrl url =
@@ -294,24 +204,6 @@ redactTelegramUrl url =
       | otherwise ->
           let suffix = Text.dropWhile (/= '/') (Text.drop 4 rest)
            in prefix <> "/bot<redacted>" <> suffix
-
-requestUrl :: Request -> Text
-requestUrl request =
-  redactTelegramUrl
-    ( Text.decodeUtf8 (securePrefix request)
-        <> Text.decodeUtf8 request.host
-        <> portText request
-        <> Text.decodeUtf8 request.path
-        <> Text.decodeUtf8 request.queryString
-    )
-
-securePrefix :: Request -> ByteString.Char8.ByteString
-securePrefix request = if request.secure then "https://" else "http://"
-
-portText :: Request -> Text
-portText request =
-  let defaultPort = if request.secure then 443 else 80
-   in if request.port == defaultPort then "" else ":" <> Text.pack (show request.port)
 
 decodeResponse :: FromJSON a => Response LByteString.ByteString -> Either String a
 decodeResponse response =
