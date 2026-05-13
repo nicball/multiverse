@@ -6,6 +6,7 @@ module Multiverse.Bridge
   , hasPlatformMapping
   , renderRelayedMessage
   , submitMapped
+  , submitMessageMapped
   , openMappingStore
   , ensureInitialRooms
   , ensureInitialRoomsWith
@@ -92,6 +93,19 @@ submitMapped context event = do
   record eventId = do
     context.mappingStore.insertMapping event.platformKey eventId
     pure (Right eventId)
+
+submitMessageMapped :: Timeline timeline => BridgeContext timeline -> Event -> IO (Either SubmitError EventId)
+submitMessageMapped context event =
+  case event.content of
+    SendMessage info -> do
+      submitted <- submitMapped context event
+      case submitted of
+        Left (MissingReferences missing)
+          | Just repliedMessage <- info.replyTo
+          , messageEventId repliedMessage `elem` missing ->
+              submitMapped context event {content = SendMessage info {replyTo = Nothing}}
+        other -> pure other
+    _ -> submitMapped context event
 
 openMappingStore :: FilePath -> IO MappingStore
 openMappingStore path = do

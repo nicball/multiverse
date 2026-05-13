@@ -1,6 +1,5 @@
 module Multiverse.Types
   ( EventId (..)
-  , TimelineSeq (..)
   , UserId (..)
   , RoomId (..)
   , MessageId (..)
@@ -15,12 +14,8 @@ module Multiverse.Types
 where
 
 import Data.Text (Text)
-import Data.Word (Word64)
 
 newtype EventId = EventId Text
-  deriving (Eq, Ord, Read, Show)
-
-newtype TimelineSeq = TimelineSeq Word64
   deriving (Eq, Ord, Read, Show)
 
 newtype UserId = UserId EventId

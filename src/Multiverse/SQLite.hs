@@ -103,14 +103,19 @@ lookupEvent connection wantedId = do
     Right [] -> pure Nothing
     Right (stored : _) -> pure (Just stored)
 
-eventsAfter :: Connection -> Maybe TimelineSeq -> IO [StoredEvent]
-eventsAfter connection afterSeq = do
+eventsAfter :: Connection -> Maybe EventId -> IO [StoredEvent]
+eventsAfter connection afterEventId = do
   rows <-
-    case afterSeq of
+    case afterEventId of
       Nothing ->
         query_ connection "SELECT seq, event_id, event FROM events ORDER BY seq ASC"
-      Just seq_ ->
-        query connection "SELECT seq, event_id, event FROM events WHERE seq > ? ORDER BY seq ASC" (Only (timelineSeqInt seq_))
+      Just eventId_ ->
+        query
+          connection
+          "SELECT seq, event_id, event FROM events\
+          \ WHERE seq > (SELECT seq FROM events WHERE event_id = ?)\
+          \ ORDER BY seq ASC"
+          (Only (renderRead eventId_))
   either throwIO pure (decodeStoredRows rows)
 
 lookupUserInfo :: Connection -> UserId -> Maybe RoomId -> IO (Maybe UserInfo)
@@ -152,8 +157,7 @@ decodeStoredRows = traverse decodeStoredRow
 decodeStoredRow :: StoredRow -> Either CorruptTimeline StoredEvent
 decodeStoredRow row =
   StoredEvent
-    <$> pure (TimelineSeq (fromIntegral row.rowSeq))
-    <*> parse "event id" row.rowEventId
+    <$> parse "event id" row.rowEventId
     <*> parse "event" row.rowEvent
 
 applyUser :: UserId -> Maybe UserInfo -> StoredEvent -> Maybe UserInfo
@@ -184,9 +188,6 @@ applyMessage message current stored =
     RetractMessage _ retractedMessage
       | retractedMessage == message -> Nothing
     _ -> current
-
-timelineSeqInt :: TimelineSeq -> Int64
-timelineSeqInt (TimelineSeq seq_) = fromIntegral seq_
 
 renderRead :: Show a => a -> Text
 renderRead = Text.pack . show

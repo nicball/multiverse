@@ -1,14 +1,14 @@
-module Types where
+module Agent where
 
 import Data.ByteString (ByteString)
 import Data.List.NonEmpty (NonEmpty)
 import Data.Text (Text)
 
-type EventId = Int
-type UserId = EventId
-type RoomId = EventId
-type MessageId = EventId
-type BlobId = EventId
+newtype EventId = EventId Text
+newtype UserId = UserId EventId
+newtype RoomId = RoomId EventId
+newtype MessageId = MessageId EventId
+newtype BlobId = BlobId EventId
 
 data PlatformKey = PlatformKey
   { platform :: Text
@@ -74,16 +74,79 @@ data EventContent
   | ModifyRoom RoomId RoomInfo
   | ChangeRoomNick UserId RoomId Text
 
-data Timeline
+class Timeline timeline where
+  submit :: timeline -> Event -> IO (Either SubmitError EventId)
+  getEvent :: timeline -> EventId -> IO (Maybe StoredEvent)
+  getEventsAfter :: timeline -> Maybe EventId -> IO [StoredEvent]
+  getUserInfo :: timeline -> UserId -> Maybe RoomId -> IO (Maybe UserInfo)
+  getRoomInfo :: timeline -> RoomId -> IO (Maybe RoomInfo)
+  getMessage :: timeline -> MessageId -> IO (Maybe Message)
 
-sendEvent :: Timeline -> Event -> IO EventId
-sendEvent = undefined
+data StoredEvent = StoredEvent
+  { storedId :: EventId
+  , storedEvent :: Event
+  }
 
-getEventsAfter :: Timeline -> EventId -> IO [(EventId, Event)]
-getEventsAfter = undefined
+data SubmitError
+  = ConflictingPlatformKey PlatformKey EventId
+  | MissingReferences [EventId]
 
-getEvent :: Timeline -> EventId -> IO Event
-getEvent = undefined
+data Bridge timeline = Bridge
+  { bridgeName :: Text
+  , observe :: BridgeContext timeline -> IO ()
+  , reflect :: BridgeContext timeline -> IO ()
+  }
 
-getUserInfo :: Timeline -> UserId -> Maybe RoomId -> IO UserInfo
-getUserInfo = undefined
+data BridgeContext timeline = BridgeContext
+  { timeline :: timeline
+  , mappingStore :: MappingStore
+  , logger :: Logger
+  }
+
+data MappingStore = MappingStore
+  { lookupTimelineId :: PlatformKey -> IO (Maybe EventId)
+  , lookupPlatformKeys :: EventId -> IO [PlatformKey]
+  , insertMapping :: PlatformKey -> EventId -> IO ()
+  , lookupState :: Text -> IO (Maybe Text)
+  , setState :: Text -> Text -> IO ()
+  }
+
+data InitialRoomMapping = InitialRoomMapping
+  { platformKey :: PlatformKey
+  , timelineRoom :: Maybe RoomId
+  }
+
+data Logger
+
+-- Bridge room config is an allow list. Observers ignore platform rooms not
+-- listed in config. If an initial room lacks a timelineRoom, the bridge creates
+-- a timeline room and writes the generated id back to TOML config.
+ensureInitialRooms ::
+  Timeline timeline =>
+  [InitialRoomMapping] ->
+  BridgeContext timeline ->
+  IO ()
+ensureInitialRooms = undefined
+
+-- Observers use this path for idempotent platform event/entity submission:
+-- submit to timeline, accept existing events on platform-key conflicts, and
+-- persist the bridge mapping.
+submitMapped ::
+  Timeline timeline =>
+  BridgeContext timeline ->
+  Event ->
+  IO (Either SubmitError EventId)
+submitMapped = undefined
+
+-- Reflectors must skip events whose origin platform is the same as the bridge,
+-- even when the platform user is not known in the timeline yet.
+shouldReflectToPlatform :: Text -> StoredEvent -> Bool
+shouldReflectToPlatform bridgePlatform stored =
+  platform (platformKey (storedEvent stored)) /= bridgePlatform
+
+-- HTTP requests made by bridges are logged at debug level with credentials
+-- redacted and retried on network exceptions with exponential backoff.
+data HttpLogOptions = HttpLogOptions
+  { redactUrl :: Text -> Text
+  , requestSuffix :: Text
+  }
