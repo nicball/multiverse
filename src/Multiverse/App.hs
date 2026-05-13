@@ -8,7 +8,7 @@ import Control.Exception (SomeException, try)
 import Control.Monad (forever, void)
 import Data.IORef
 import Data.Text (Text)
-import qualified Data.Text as Text
+import Data.Text qualified as Text
 import System.Environment (getArgs)
 import Multiverse.Bridge
 import Multiverse.Config

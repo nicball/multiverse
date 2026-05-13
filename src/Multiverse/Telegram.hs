@@ -5,17 +5,18 @@ module Multiverse.Telegram
 where
 
 import Control.Concurrent (threadDelay)
+import Control.Exception (try)
 import Control.Monad (forever, unless)
 import Data.Aeson
-import qualified Data.ByteString.Char8 as ByteString.Char8
-import qualified Data.ByteString.Lazy as LByteString
+import Data.ByteString.Char8 qualified as ByteString.Char8
+import Data.ByteString.Lazy qualified as LByteString
 import Data.Text.Encoding.Error (lenientDecode)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.List.NonEmpty (toList)
 import Data.Maybe (catMaybes)
 import Data.Text (Text)
-import qualified Data.Text as Text
-import qualified Data.Text.Encoding as Text
+import Data.Text qualified as Text
+import Data.Text.Encoding qualified as Text
 import Network.HTTP.Client
 import Network.HTTP.Client.TLS
 import Network.HTTP.Types (statusCode)
@@ -227,9 +228,31 @@ telegramGetChat logger manager config chatId = do
 loggedHttp :: Logger -> Request -> Manager -> IO (Response LByteString.ByteString)
 loggedHttp logger request manager = do
   logDebug logger ("http request " <> requestSummary request)
-  response <- httpLbs request manager
+  response <- httpLbsWithBackoff logger request manager
   logDebug logger ("http response " <> responseSummary request response)
   pure response
+
+httpLbsWithBackoff :: Logger -> Request -> Manager -> IO (Response LByteString.ByteString)
+httpLbsWithBackoff logger request manager =
+  go initialHttpBackoffMicros
+ where
+  go delayMicros = do
+    result <- try (httpLbs request manager)
+    case result of
+      Right response -> pure response
+      Left (err :: HttpException) -> do
+        logWarn logger ("http request failed, retrying in " <> delayText delayMicros <> ": " <> Text.pack (show err))
+        threadDelay delayMicros
+        go (min maxHttpBackoffMicros (delayMicros * 2))
+
+initialHttpBackoffMicros :: Int
+initialHttpBackoffMicros = 1000000
+
+maxHttpBackoffMicros :: Int
+maxHttpBackoffMicros = 60000000
+
+delayText :: Int -> Text
+delayText micros = Text.pack (show (micros `div` 1000000)) <> "s"
 
 requestSummary :: Request -> Text
 requestSummary request =

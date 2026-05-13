@@ -14,13 +14,13 @@ module Multiverse.Event
 where
 
 import Data.ByteString (ByteString)
-import qualified Data.ByteString as ByteString
-import qualified Crypto.Hash.SHA256 as SHA256
+import Data.ByteString qualified as ByteString
+import Crypto.Hash.SHA256 qualified as SHA256
 import Data.Char (intToDigit)
 import Data.List.NonEmpty (NonEmpty, toList)
 import Data.Text (Text)
-import qualified Data.Text as Text
-import qualified Data.Text.Encoding as Text
+import Data.Text qualified as Text
+import Data.Text.Encoding qualified as Text
 import Data.Word (Word8)
 import Multiverse.Types
 

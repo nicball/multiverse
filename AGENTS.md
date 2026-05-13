@@ -24,7 +24,21 @@ Puppeting is not supported. A relaying account must be provided for the platform
 
 The interaction between bridges and timeline is made robust through idempotency and persistency so no messages are lost upon error or restart.
 
+When reflecting from the timeline to a platform, absence from that bridge's mapping database means the timeline event is new to that bridge. However, when observing platform-side entities or events, the platform item may be absent from both the bridge mapping and the timeline, for example because the relaying account was added to platform groups later. In that case the observer should submit the platform item to the timeline and persist the mapping.
+
 Each bridge provides options to specify initial room mappings. It can create timeline rooms if not already exists for convenience.
+
+Bridge room configuration is an allow list. A bridge must only observe messages from rooms listed in its configured `rooms`; messages from other rooms must be ignored.
+
+Initial room mappings are configured under `rooms`. The platform room id is required. The timeline room id is optional; when omitted, the bridge creates the timeline room, persists the bridge mapping, and writes the generated timeline room id back to the TOML config. Room metadata such as display name/topic/title is not configured manually; it is fetched from the platform when needed.
+
+Use TOML for runtime configuration. Use `tomland` bidirectional codecs for reading and writing config.
+
+Use a proper logging library. HTTP traffic should be logged at debug level with credentials redacted.
+
+Network errors should not permanently kill bridge components. HTTP requests should retry with exponential backoff on network exceptions. Observers and reflectors should run under supervision so unexpected exceptions are logged and the component restarts.
+
+Bridges must avoid reflecting events originating from their own platform, even if the platform user that emitted the event is not registered in the timeline yet. This should be enforced from the event origin platform, not only by checking bridge mappings, because mapping insertion can race with reflection.
 
 The telegram bridge uses bot api. The QQ bridge is not planned for now.
 

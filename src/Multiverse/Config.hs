@@ -9,10 +9,10 @@ module Multiverse.Config
 where
 
 import Data.Text (Text)
-import qualified Data.Text as Text
+import Data.Text qualified as Text
 import System.Directory (doesFileExist)
 import Toml (TomlCodec, (.=))
-import qualified Toml
+import Toml qualified
 import Multiverse.Bridge
 import Multiverse.Log
 import Multiverse.Types
