@@ -1,6 +1,6 @@
 { mkDerivation, aeson, base, bytestring, cryptohash-sha256
 , directory, http-client, http-client-tls, http-types, katip, lib
-, sqlite-simple, text, tomland
+, sqlite-simple, tagsoup, text, tomland
 }:
 mkDerivation {
   pname = "multiverse";
@@ -10,7 +10,7 @@ mkDerivation {
   isExecutable = true;
   libraryHaskellDepends = [
     aeson base bytestring cryptohash-sha256 directory http-client
-    http-client-tls http-types katip sqlite-simple text tomland
+    http-client-tls http-types katip sqlite-simple tagsoup text tomland
   ];
   executableHaskellDepends = [ base ];
   license = lib.licensesSpdx."AGPL-3.0-or-later";

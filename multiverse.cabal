@@ -84,6 +84,7 @@ library
                     , http-types
                     , katip
                     , sqlite-simple
+                    , tagsoup
                     , text
                     , tomland
     hs-source-dirs:   src

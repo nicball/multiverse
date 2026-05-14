@@ -9,7 +9,8 @@ import Control.Monad (forever, unless)
 import Data.Aeson
 import Data.ByteString.Char8 qualified as ByteString.Char8
 import Data.ByteString.Lazy qualified as LByteString
-import Data.List.NonEmpty (NonEmpty ((:|)))
+import Data.List (sortOn)
+import Data.List.NonEmpty (NonEmpty ((:|)), nonEmpty)
 import Data.Maybe (catMaybes, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as Text
@@ -74,7 +75,7 @@ reflectTelegram config context = do
 
 observeUpdate :: Timeline timeline => TelegramConfig -> BridgeContext timeline -> TelegramUpdate -> IO ()
 observeUpdate config context update =
-  case update.message >>= telegramMessageText of
+  case update.message >>= telegramMessageBody of
     Nothing -> pure ()
     Just (message, body) -> do
       room <- configuredRoom config context message.chat
@@ -94,7 +95,7 @@ observeUpdate config context update =
                           , room = roomId
                           , replyTo
                           , forwardOf = Nothing
-                          , body = plainMessage body
+                          , body
                           }
                   }
           submitted <- submitMessageMapped context event
@@ -212,19 +213,46 @@ telegramGetUpdates logger manager config offset = do
   response <- loggedHttp logger request manager
   pure (decodeResponse response)
 
-telegramSendMessage :: Logger -> Manager -> TelegramConfig -> Integer -> Maybe Int -> Text -> IO (Either String TelegramMessage)
+telegramSendMessage :: Logger -> Manager -> TelegramConfig -> Integer -> Maybe Int -> RenderedMessage -> IO (Either String TelegramMessage)
 telegramSendMessage logger manager config chatId replyTo text = do
   request0 <- parseRequest (Text.unpack ("https://api.telegram.org/bot" <> config.botToken <> "/sendMessage"))
   let request =
         urlEncodedBody
           ( [ ("chat_id", ByteString.Char8.pack (show chatId))
-            , ("text", Text.encodeUtf8 text)
+            , ("text", Text.encodeUtf8 (telegramHtml text))
+            , ("parse_mode", "HTML")
             ]
               <> maybe [] (\messageId -> [("reply_to_message_id", ByteString.Char8.pack (show messageId))]) replyTo
           )
           request0
   response <- loggedHttp logger request manager
   pure (decodeResponse response)
+
+telegramHtml :: RenderedMessage -> Text
+telegramHtml message =
+  telegramSupportedHtml message.htmlText
+
+telegramSupportedHtml :: Text -> Text
+telegramSupportedHtml =
+  Text.replace "<strong>" "<b>"
+    . Text.replace "</strong>" "</b>"
+    . Text.replace "<ul>" ""
+    . Text.replace "</ul>" ""
+    . Text.replace "<li>" "- "
+    . Text.replace "</li>" "\n"
+    . replaceHeading 1
+    . replaceHeading 2
+    . replaceHeading 3
+    . replaceHeading 4
+    . replaceHeading 5
+    . replaceHeading 6
+
+replaceHeading :: Int -> Text -> Text
+replaceHeading level =
+  Text.replace ("<h" <> label <> ">") "<b>"
+    . Text.replace ("</h" <> label <> ">") "</b>"
+ where
+  label = Text.pack (show level)
 
 telegramDeleteMessage :: Logger -> Manager -> TelegramConfig -> Integer -> Int -> IO (Either String ())
 telegramDeleteMessage logger manager config chatId messageId = do
@@ -313,8 +341,52 @@ telegramUserName user =
 telegramChatName :: TelegramChat -> Text
 telegramChatName chat = maybe (Text.pack (show chat.chatId)) id chat.title
 
-telegramMessageText :: TelegramMessage -> Maybe (TelegramMessage, Text)
-telegramMessageText message = fmap (\body -> (message, body)) message.text
+telegramMessageBody :: TelegramMessage -> Maybe (TelegramMessage, Message)
+telegramMessageBody message = fmap (\body -> (message, telegramMessageFromEntities body message.entities)) message.text
+
+telegramMessageFromEntities :: Text -> [TelegramEntity] -> Message
+telegramMessageFromEntities text entities =
+  case wholeBlockQuote text entities of
+    Just quote -> BlockQuote (Text quote :| []) :| []
+    Nothing -> Text (telegramInline text entities) :| []
+
+wholeBlockQuote :: Text -> [TelegramEntity] -> Maybe InlineText
+wholeBlockQuote text entities =
+  case [entity | entity <- entities, entity.entityType == "blockquote", entity.offset == 0, entity.length >= Text.length text] of
+    _ : _ -> Just (telegramInline text (filter ((/= "blockquote") . (.entityType)) entities))
+    [] -> Nothing
+
+telegramInline :: Text -> [TelegramEntity] -> InlineText
+telegramInline text entities =
+  case nonEmpty (go 0 (filter supportedInlineEntity (sortTelegramEntities entities))) of
+    Just inline -> inline
+    Nothing -> Plain text :| []
+ where
+  go index [] =
+    [Plain (Text.drop index text) | index < Text.length text]
+  go index (entity : rest) =
+    let before = Text.take (entity.offset - index) (Text.drop index text)
+        body = Text.take entity.length (Text.drop entity.offset text)
+        afterIndex = entity.offset + entity.length
+        beforePart = [Plain before | not (Text.null before)]
+     in beforePart <> entityPart entity body <> go afterIndex rest
+
+supportedInlineEntity :: TelegramEntity -> Bool
+supportedInlineEntity entity = entity.entityType `elem` ["bold", "italic", "code", "text_link", "url"]
+
+sortTelegramEntities :: [TelegramEntity] -> [TelegramEntity]
+sortTelegramEntities = sortOn (.offset)
+
+entityPart :: TelegramEntity -> Text -> [InlineTextPart]
+entityPart entity body =
+  let inline = Plain body :| []
+   in case entity.entityType of
+        "bold" -> [Bold inline]
+        "italic" -> [Italic inline]
+        "code" -> [InlineQuote inline]
+        "text_link" -> [Link inline (maybe body id entity.url)]
+        "url" -> [Link inline body]
+        _ -> [Plain body]
 
 plainMessage :: Text -> Message
 plainMessage text = Text (Plain text :| []) :| []
@@ -351,6 +423,7 @@ data TelegramMessage = TelegramMessage
   , from :: TelegramUser
   , chat :: TelegramChat
   , text :: Maybe Text
+  , entities :: [TelegramEntity]
   , replyToMessage :: Maybe TelegramMessageRef
   }
 
@@ -361,7 +434,23 @@ instance FromJSON TelegramMessage where
       <*> obj .: "from"
       <*> obj .: "chat"
       <*> obj .:? "text"
+      <*> obj .:? "entities" .!= []
       <*> obj .:? "reply_to_message"
+
+data TelegramEntity = TelegramEntity
+  { entityType :: Text
+  , offset :: Int
+  , length :: Int
+  , url :: Maybe Text
+  }
+
+instance FromJSON TelegramEntity where
+  parseJSON = withObject "TelegramEntity" \obj ->
+    TelegramEntity
+      <$> obj .: "type"
+      <*> obj .: "offset"
+      <*> obj .: "length"
+      <*> obj .:? "url"
 
 data TelegramMessageRef = TelegramMessageRef
   { messageId :: Int

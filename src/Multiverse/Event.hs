@@ -36,6 +36,7 @@ data MessagePart
   | Emote InlineText
   | List (NonEmpty Message)
   | BlockQuote Message
+  | Heading Int InlineText
   deriving (Eq, Ord, Read, Show)
 
 data InlineTextPart
@@ -123,6 +124,7 @@ messagePartReferences = \case
   Emote inline -> inlineReferences inline
   List messages -> concatMap messageReferences (toList messages)
   BlockQuote message -> messageReferences message
+  Heading _ inline -> inlineReferences inline
 
 inlineReferences :: InlineText -> [EventId]
 inlineReferences = concatMap inlinePartReferences . toList

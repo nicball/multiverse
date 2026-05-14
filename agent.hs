@@ -27,12 +27,14 @@ data MessagePart
   | Emote InlineText
   | List (NonEmpty Message)
   | BlockQuote Message
+  | Heading Int InlineText
 
 data InlineTextPart
   = Bold InlineText
   | Italic InlineText
   | Link InlineText Text
   | Mention InlineText UserId
+  -- Monospace/code span.
   | InlineQuote InlineText
   | Plain Text
 

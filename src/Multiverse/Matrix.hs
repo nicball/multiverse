@@ -5,14 +5,14 @@ module Multiverse.Matrix
 where
 
 import Control.Concurrent (threadDelay)
-import Control.Applicative ((<|>))
+import Control.Applicative (asum, (<|>))
 import Control.Monad (forever, unless)
 import Data.Aeson
 import Data.Aeson.Types (Parser)
 import Data.Aeson.Key qualified as Aeson.Key
 import Data.Aeson.KeyMap qualified as Aeson.KeyMap
 import Data.ByteString.Lazy qualified as LByteString
-import Data.List.NonEmpty (NonEmpty ((:|)))
+import Data.List.NonEmpty (NonEmpty ((:|)), nonEmpty)
 import Data.Maybe (mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as Text
@@ -20,6 +20,7 @@ import Data.Text.Encoding qualified as Text
 import Network.HTTP.Client
 import Network.HTTP.Client.TLS
 import Network.HTTP.Types.URI (urlEncode)
+import Text.HTML.TagSoup
 import Multiverse.Bridge
 import Multiverse.Event hiding (eventId)
 import Multiverse.HTTP (HttpLogOptions (..), defaultHttpLogOptions)
@@ -108,7 +109,7 @@ observeEvent manager context config ownUserId room event
                           , room
                           , replyTo
                           , forwardOf = Nothing
-                          , body = plainMessage body
+                          , body
                           }
                   }
           submitted <- submitMessageMapped context timelineEvent
@@ -203,9 +204,10 @@ reflectEvent manager config context stored =
           Right matrixEventId -> context.mappingStore.insertMapping (matrixEventKey matrixEventId) stored.storedId
       Right redactionEventId -> context.mappingStore.insertMapping (matrixRedactionKey redactionEventId) stored.storedId
 
-retractionFailureMessage :: String -> Text
+retractionFailureMessage :: String -> RenderedMessage
 retractionFailureMessage err =
-  "Failed to retract a bridged message: " <> Text.pack err
+  let text = "Failed to retract a bridged message: " <> Text.pack err
+   in RenderedMessage text text
 
 matrixRetractTargets :: Timeline timeline => BridgeContext timeline -> MessageId -> IO [(Text, Text)]
 matrixRetractTargets context message = do
@@ -265,7 +267,7 @@ matrixGetDisplayName logger manager config matrixUserId = do
   response <- loggedHttp logger request manager
   pure (decodeMatrix response)
 
-matrixSendMessage :: Logger -> Manager -> MatrixConfig -> Text -> EventId -> Maybe Text -> Text -> IO (Either String Text)
+matrixSendMessage :: Logger -> Manager -> MatrixConfig -> Text -> EventId -> Maybe Text -> RenderedMessage -> IO (Either String Text)
 matrixSendMessage logger manager config roomId eventId_ replyTo body = do
   request0 <-
     authorizedRequest
@@ -311,11 +313,13 @@ matrixRedactMessage logger manager config roomId eventId_ redactedEventId = do
     Left err -> Left err
     Right sent -> Right sent.eventId
 
-matrixMessageContent :: Maybe Text -> Text -> Value
+matrixMessageContent :: Maybe Text -> RenderedMessage -> Value
 matrixMessageContent replyTo body =
   object
     ( [ "msgtype" .= ("m.text" :: Text)
-      , "body" .= body
+      , "body" .= body.plainText
+      , "format" .= ("org.matrix.custom.html" :: Text)
+      , "formatted_body" .= body.htmlText
       ]
         <> maybe
           []
@@ -462,7 +466,7 @@ data MatrixEvent = MatrixEvent
   }
 
 data MatrixEventContent
-  = MatrixMessage Text (Maybe Text)
+  = MatrixMessage Message (Maybe Text)
   | MatrixRedaction Text
 
 usableEvent :: Value -> Maybe MatrixEvent
@@ -477,6 +481,7 @@ usableEvent value = do
       msgtype <- Aeson.KeyMap.lookup "msgtype" content >>= asText
       guardMaybe (msgtype == "m.text")
       body <- Aeson.KeyMap.lookup "body" content >>= asText
+      let messageBody = matrixMessageBody content body
       let replyToEvent =
             Aeson.KeyMap.lookup "m.relates_to" content
               >>= asObject
@@ -484,7 +489,7 @@ usableEvent value = do
               >>= asObject
               >>= Aeson.KeyMap.lookup "event_id"
               >>= asText
-      pure MatrixEvent {eventId = matrixEventId, sender, content = MatrixMessage body replyToEvent}
+      pure MatrixEvent {eventId = matrixEventId, sender, content = MatrixMessage messageBody replyToEvent}
     "m.room.redaction" -> do
       let redactedEvent =
             (Aeson.KeyMap.lookup "redacts" obj >>= asText)
@@ -505,6 +510,148 @@ asText = \case
 guardMaybe :: Bool -> Maybe ()
 guardMaybe True = Just ()
 guardMaybe False = Nothing
+
+matrixMessageBody :: Object -> Text -> Message
+matrixMessageBody content fallback =
+  case (Aeson.KeyMap.lookup "format" content >>= asText, Aeson.KeyMap.lookup "formatted_body" content >>= asText) of
+    (Just "org.matrix.custom.html", Just html) -> matrixHtmlMessage html
+    _ -> plainMessage fallback
+
+matrixHtmlMessage :: Text -> Message
+matrixHtmlMessage html =
+  case parseMessageParts (parseTags html) of
+    part : parts -> part :| parts
+    [] -> plainMessage (innerText (parseTags html))
+
+parseMessageParts :: [Tag Text] -> [MessagePart]
+parseMessageParts = go []
+ where
+  go acc [] = reverse acc
+  go acc tags =
+    case break blockStart tags of
+      (inlineTags, []) ->
+        reverse (appendInline acc inlineTags)
+      (inlineTags, start : rest) ->
+        let accWithInline = appendInline acc inlineTags
+            (part, afterBlock) = parseBlock start rest
+         in go (part : accWithInline) afterBlock
+
+appendInline :: [MessagePart] -> [Tag Text] -> [MessagePart]
+appendInline parts tags =
+  case matrixInlineFromTags tags of
+    Just inline -> Text inline : parts
+    Nothing -> parts
+
+blockStart :: Tag Text -> Bool
+blockStart tag =
+  any (tagOpenNameLit tag) ["blockquote", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6"]
+
+parseBlock :: Tag Text -> [Tag Text] -> (MessagePart, [Tag Text])
+parseBlock start rest
+  | tagOpenNameLit start "blockquote" =
+      let (inside, after) = takeUntilClose "blockquote" rest
+       in (BlockQuote (messageFromTags inside), after)
+  | tagOpenNameLit start "ul" || tagOpenNameLit start "ol" =
+      let closeTag = if tagOpenNameLit start "ul" then "ul" else "ol"
+          (inside, after) = takeUntilClose closeTag rest
+          items = parseListItems inside
+       in case nonEmpty items of
+            Just nonEmptyItems -> (List nonEmptyItems, after)
+            Nothing -> (Text (Plain "" :| []), after)
+  | otherwise =
+      case headingLevel start of
+        Just level ->
+          let tagName = "h" <> Text.pack (show level)
+              (inside, after) = takeUntilClose tagName rest
+           in (Heading level (matrixInlineFromTagsOrPlain inside), after)
+        Nothing -> (Text (Plain (innerText [start]) :| []), rest)
+
+messageFromTags :: [Tag Text] -> Message
+messageFromTags tags =
+  case parseMessageParts tags of
+    part : parts -> part :| parts
+    [] -> Text (Plain (innerText tags) :| []) :| []
+
+parseListItems :: [Tag Text] -> [Message]
+parseListItems [] = []
+parseListItems (tag : rest)
+  | tagOpenNameLit tag "li" =
+      let (inside, after) = takeUntilClose "li" rest
+       in messageFromTags inside : parseListItems after
+  | otherwise = parseListItems rest
+
+headingLevel :: Tag Text -> Maybe Int
+headingLevel tag =
+  asum [level <$ guardMaybe (tagOpenNameLit tag ("h" <> Text.pack (show level))) | level <- [1 .. 6]]
+
+takeUntilClose :: Text -> [Tag Text] -> ([Tag Text], [Tag Text])
+takeUntilClose name = go 0 []
+ where
+  go _ acc [] = (reverse acc, [])
+  go depth acc (tag : rest)
+    | tagOpenNameLit tag name = go (depth + 1) (tag : acc) rest
+    | tagCloseNameLit tag name && depth == 0 = (reverse acc, rest)
+    | tagCloseNameLit tag name = go (depth - 1) (tag : acc) rest
+    | otherwise = go depth (tag : acc) rest
+
+matrixHtmlInline :: Text -> InlineText
+matrixHtmlInline = matrixInlineFromTagsOrPlain . parseTags
+
+matrixInlineFromTagsOrPlain :: [Tag Text] -> InlineText
+matrixInlineFromTagsOrPlain tags =
+  case matrixInlineFromTags tags of
+    Just inline -> inline
+    Nothing -> Plain (innerText tags) :| []
+
+matrixInlineFromTags :: [Tag Text] -> Maybe InlineText
+matrixInlineFromTags tags =
+  nonEmpty (parseInlineTags tags)
+
+parseInlineTags :: [Tag Text] -> [InlineTextPart]
+parseInlineTags = \case
+  [] -> []
+  TagText text : rest -> [Plain text | not (Text.null text)] <> parseInlineTags rest
+  tag : rest
+    | tagOpenNameLit tag "strong" || tagOpenNameLit tag "b" ->
+        wrapped Bold tag rest
+    | tagOpenNameLit tag "em" || tagOpenNameLit tag "i" ->
+        wrapped Italic tag rest
+    | tagOpenNameLit tag "code" ->
+        wrapped InlineQuote tag rest
+    | tagOpenNameLit tag "a" ->
+        let (inside, after) = takeUntilClose "a" rest
+            url = maybe (innerText inside) id (lookup "href" (tagAttributes tag))
+         in Link (matrixInlineFromTagsOrPlain inside) url : parseInlineTags after
+    | tagOpenNameLit tag "br" -> Plain "\n" : parseInlineTags rest
+    | otherwise -> parseInlineTags rest
+ where
+  wrapped constructor tag rest =
+    let name = tagNameText tag
+        (inside, after) = takeUntilClose name rest
+     in constructor (matrixInlineFromTagsOrPlain inside) : parseInlineTags after
+
+tagOpenNameLit :: Tag Text -> Text -> Bool
+tagOpenNameLit tag name =
+  case tag of
+    TagOpen tagName _ -> Text.toLower tagName == name
+    _ -> False
+
+tagCloseNameLit :: Tag Text -> Text -> Bool
+tagCloseNameLit tag name =
+  case tag of
+    TagClose tagName -> Text.toLower tagName == name
+    _ -> False
+
+tagNameText :: Tag Text -> Text
+tagNameText = \case
+  TagOpen name _ -> Text.toLower name
+  TagClose name -> Text.toLower name
+  _ -> ""
+
+tagAttributes :: Tag Text -> [(Text, Text)]
+tagAttributes = \case
+  TagOpen _ attrs -> attrs
+  _ -> []
 
 data MatrixSendResponse = MatrixSendResponse
   { eventId :: Text

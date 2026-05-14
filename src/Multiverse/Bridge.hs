@@ -3,6 +3,7 @@ module Multiverse.Bridge
   , BridgeContext (..)
   , InitialRoomMapping (..)
   , MappingStore (..)
+  , RenderedMessage (..)
   , hasPlatformMapping
   , renderRelayedMessage
   , submitMapped
@@ -50,37 +51,104 @@ data InitialRoomMapping = InitialRoomMapping
   }
   deriving (Eq, Show)
 
+data RenderedMessage = RenderedMessage
+  { plainText :: Text
+  , htmlText :: Text
+  }
+
 hasPlatformMapping :: MappingStore -> Text -> EventId -> IO Bool
 hasPlatformMapping store platform eventId = any ((== platform) . (.platform)) <$> store.lookupPlatformKeys eventId
 
-renderRelayedMessage :: Timeline timeline => BridgeContext timeline -> SendMessageInfo -> IO Text
+renderRelayedMessage :: Timeline timeline => BridgeContext timeline -> SendMessageInfo -> IO RenderedMessage
 renderRelayedMessage context info = do
   user <- getUserInfo context.timeline info.sender (Just info.room)
   let sender = maybe "unknown" (.name) user
-  pure (sender <> ": " <> renderMessageText info.body)
+      body = renderMessage info.body
+  pure
+    RenderedMessage
+      { plainText = sender <> ": " <> body.plainText
+      , htmlText = htmlEscape sender <> ": " <> body.htmlText
+      }
 
-renderMessageText :: Message -> Text
-renderMessageText = Text.intercalate "\n" . map renderMessagePart . toList
+renderMessage :: Message -> RenderedMessage
+renderMessage message =
+  let parts = map renderMessagePart (toList message)
+   in RenderedMessage
+        { plainText = Text.intercalate "\n" (map (.plainText) parts)
+        , htmlText = Text.intercalate "\n" (map (.htmlText) parts)
+        }
 
-renderMessagePart :: MessagePart -> Text
+renderMessagePart :: MessagePart -> RenderedMessage
 renderMessagePart = \case
   Text inline -> renderInline inline
-  Emote inline -> "_ " <> renderInline inline
-  Blob _ _ -> "[blob]"
-  List items -> Text.intercalate "\n" (map renderMessageText (toList items))
-  BlockQuote message -> "> " <> Text.replace "\n" "\n> " (renderMessageText message)
+  Emote inline ->
+    let rendered = renderInline inline
+     in RenderedMessage
+          { plainText = "_ " <> rendered.plainText
+          , htmlText = "<em>" <> rendered.htmlText <> "</em>"
+          }
+  Blob _ _ -> RenderedMessage "[blob]" "[blob]"
+  List items ->
+    let rendered = map renderMessage (toList items)
+     in RenderedMessage
+          { plainText = Text.intercalate "\n" (map (("- " <>) . (.plainText)) rendered)
+          , htmlText = "<ul>" <> Text.concat (map (("<li>" <>) . (<> "</li>") . (.htmlText)) rendered) <> "</ul>"
+          }
+  BlockQuote message ->
+    let rendered = renderMessage message
+     in RenderedMessage
+          { plainText = "> " <> Text.replace "\n" "\n> " rendered.plainText
+          , htmlText = "<blockquote>" <> rendered.htmlText <> "</blockquote>"
+          }
+  Heading level inline ->
+    let rendered = renderInline inline
+        clampedLevel = max 1 (min 6 level)
+        tag = "h" <> Text.pack (show clampedLevel)
+     in RenderedMessage
+          { plainText = Text.replicate clampedLevel "#" <> " " <> rendered.plainText
+          , htmlText = "<" <> tag <> ">" <> rendered.htmlText <> "</" <> tag <> ">"
+          }
 
-renderInline :: InlineText -> Text
-renderInline = Text.concat . map renderInlinePart . toList
+renderInline :: InlineText -> RenderedMessage
+renderInline inline =
+  let parts = map renderInlinePart (toList inline)
+   in RenderedMessage
+        { plainText = Text.concat (map (.plainText) parts)
+        , htmlText = Text.concat (map (.htmlText) parts)
+        }
 
-renderInlinePart :: InlineTextPart -> Text
+renderInlinePart :: InlineTextPart -> RenderedMessage
 renderInlinePart = \case
-  Bold inline -> renderInline inline
-  Italic inline -> renderInline inline
-  Link inline url -> renderInline inline <> " (" <> url <> ")"
+  Bold inline ->
+    let rendered = renderInline inline
+     in RenderedMessage rendered.plainText ("<strong>" <> rendered.htmlText <> "</strong>")
+  Italic inline ->
+    let rendered = renderInline inline
+     in RenderedMessage rendered.plainText ("<em>" <> rendered.htmlText <> "</em>")
+  Link inline url ->
+    let rendered = renderInline inline
+     in RenderedMessage
+          { plainText = rendered.plainText <> " (" <> url <> ")"
+          , htmlText = "<a href=\"" <> htmlAttributeEscape url <> "\">" <> rendered.htmlText <> "</a>"
+          }
   Mention inline _ -> renderInline inline
-  InlineQuote inline -> "\"" <> renderInline inline <> "\""
-  Plain text -> text
+  InlineQuote inline ->
+    let rendered = renderInline inline
+     in RenderedMessage ("\"" <> rendered.plainText <> "\"") ("<code>" <> rendered.htmlText <> "</code>")
+  Plain text -> RenderedMessage text (htmlEscape text)
+
+htmlEscape :: Text -> Text
+htmlEscape =
+  Text.concatMap \case
+    '&' -> "&amp;"
+    '<' -> "&lt;"
+    '>' -> "&gt;"
+    '"' -> "&quot;"
+    '\'' -> "&#39;"
+    char -> Text.singleton char
+
+htmlAttributeEscape :: Text -> Text
+htmlAttributeEscape = htmlEscape
 
 submitMapped :: Timeline timeline => BridgeContext timeline -> Event -> IO (Either SubmitError EventId)
 submitMapped context event = do
