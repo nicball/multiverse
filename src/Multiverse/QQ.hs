@@ -313,10 +313,10 @@ sendToQQRoom manager config context stored info roomKey =
             params = object ["group_id" .= groupId, "message" .= segments]
         response <- qqApiCall context.logger manager config "send_group_msg" params
         case response of
-          Left err -> fail ("qq send_group_msg failed: " <> err)
+          Left err -> logError context.logger ("qq send_group_msg failed: " <> Text.pack err)
           Right result ->
             case valueTextField "message_id" result of
-              Nothing -> fail "qq send_group_msg response lacked message_id"
+              Nothing -> logError context.logger "qq send_group_msg response lacked message_id"
               Just messageId ->
                 context.mappingStore.insertMapping (qqMessageKey roomKey.key messageId) stored.storedId
 

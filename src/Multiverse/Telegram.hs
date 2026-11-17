@@ -188,7 +188,8 @@ reflectEvent manager config context stored =
                     Nothing -> do
                       result <- telegramEditText context.logger manager config chatId messageId text
                       case result of
-                        Left err | not ("message is not modified" `Text.isInfixOf` Text.toLower (Text.pack err)) -> fail ("telegram edit failed: " <> err)
+                        Left err | not ("message is not modified" `Text.isInfixOf` Text.toLower (Text.pack err)) ->
+                          logError context.logger ("telegram edit reflect error: " <> Text.pack err)
                         _ -> context.mappingStore.setState editKey "done"
             _ -> pure ()
       | otherwise -> pure ()
@@ -215,15 +216,17 @@ reflectEvent manager config context stored =
                 Just _ -> pure ()
                 Nothing -> do
                   result <- action
-                  message <- either (fail . ("telegram reflect error: " <>)) pure result
-                  context.mappingStore.insertMapping (telegramMessageKey message) stored.storedId
-                  context.mappingStore.setState (stateKey index) (Text.pack (show message.messageId))
+                  case result of
+                    Left err -> logError context.logger ("telegram reflect error: " <> Text.pack err)
+                    Right message -> do
+                      context.mappingStore.insertMapping (telegramMessageKey message) stored.storedId
+                      context.mappingStore.setState (stateKey index) (Text.pack (show message.messageId))
         sendPart (0 :: Int) (telegramSendMessage context.logger manager config chatId replyTo text)
         forM_ (zip [1 ..] (messageBlobs info.body)) \(index, (kind, blobId)) -> do
           blob <- getEvent context.timeline (blobEventId blobId)
           case fmap (.storedEvent.content) blob of
             Just (CreateBlob bytes) -> sendPart index (sendMappedMedia context manager config chatId replyTo kind blobId bytes)
-            _ -> fail "telegram media blob is missing"
+            _ -> logError context.logger "telegram media blob is missing"
   deleteInChat (chatId, messageId) = do
     result <- telegramDeleteMessage context.logger manager config chatId messageId
     case result of
