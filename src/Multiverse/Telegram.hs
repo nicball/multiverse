@@ -277,23 +277,6 @@ whenTextTarget target messageId action =
     Just value | readMaybe (Text.unpack value) /= Just messageId -> pure ()
     _ -> action
 
-textBody :: Message -> Message
-textBody body = case nonEmpty (filter isText (NonEmpty.toList body)) of
-  Just parts -> parts
-  Nothing -> plainMessage ""
- where
-  isText (Blob _ _) = False
-  isText _ = True
-
-messageBlobs :: Message -> [(BlobType, BlobId)]
-messageBlobs = concatMap collect . NonEmpty.toList
- where
-  collect = \case
-    Blob kind blob -> [(kind, blob)]
-    BlockQuote body -> messageBlobs body
-    List items -> concatMap messageBlobs (NonEmpty.toList items)
-    _ -> []
-
 enabledTelegramTarget :: TelegramConfig -> (Integer, Int) -> Bool
 enabledTelegramTarget config (chatId, _) =
   enabledRoom config.initialRooms (PlatformKey "telegram" "room" (Text.pack (show chatId)))
@@ -624,9 +607,6 @@ entityPart entity body =
         "text_link" -> [Link inline (maybe body id entity.url)]
         "url" -> [Link inline body]
         _ -> [Plain body]
-
-plainMessage :: Text -> Message
-plainMessage text = Text (Plain text :| []) :| []
 
 readTextInt :: Text -> Int
 readTextInt = maybe 0 id . readMaybe . Text.unpack

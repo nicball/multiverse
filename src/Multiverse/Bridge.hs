@@ -15,13 +15,20 @@ module Multiverse.Bridge
   , openMappingStore
   , ensureInitialRooms
   , ensureInitialRoomsWith
+  , textBody
+  , messageBlobs
+  , hasTextContent
+  , sniffExtension
+  , sniffMimeType
   )
 where
 
+import Data.ByteString (ByteString)
+import Data.ByteString qualified as ByteString
+import Data.List.NonEmpty (NonEmpty ((:|)), nonEmpty, toList)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Database.SQLite.Simple
-import Data.List.NonEmpty (toList)
 import Text.Read (readMaybe)
 import Multiverse.Event hiding (eventId)
 import Multiverse.Log
@@ -167,6 +174,58 @@ htmlEscape =
 
 htmlAttributeEscape :: Text -> Text
 htmlAttributeEscape = htmlEscape
+
+textBody :: Message -> Message
+textBody body = case nonEmpty (filter isText (toList body)) of
+  Just parts -> parts
+  Nothing -> plainMessage ""
+ where
+  isText (Blob _ _) = False
+  isText _ = True
+
+messageBlobs :: Message -> [(BlobType, BlobId)]
+messageBlobs = concatMap collect . toList
+ where
+  collect = \case
+    Blob kind blob -> [(kind, blob)]
+    BlockQuote body -> messageBlobs body
+    List items -> concatMap messageBlobs (toList items)
+    _ -> []
+
+hasTextContent :: Message -> Bool
+hasTextContent = any isText . toList
+ where
+  isText (Blob _ _) = False
+  isText _ = True
+
+plainMessage :: Text -> Message
+plainMessage text = Text (Plain text :| []) :| []
+
+sniffExtension :: ByteString -> Text
+sniffExtension = fst . sniffType
+
+sniffMimeType :: ByteString -> Text
+sniffMimeType = snd . sniffType
+
+sniffType :: ByteString -> (Text, Text)
+sniffType bytes
+  | "\137PNG" `ByteString.isPrefixOf` bytes = (".png", "image/png")
+  | "\255\216\255" `ByteString.isPrefixOf` bytes = (".jpg", "image/jpeg")
+  | "GIF8" `ByteString.isPrefixOf` bytes = (".gif", "image/gif")
+  | "BM" `ByteString.isPrefixOf` bytes = (".bmp", "image/bmp")
+  | "RIFF" `ByteString.isPrefixOf` bytes && ByteString.take 4 (ByteString.drop 8 bytes) == "WEBP" = (".webp", "image/webp")
+  | "RIFF" `ByteString.isPrefixOf` bytes && ByteString.take 4 (ByteString.drop 8 bytes) == "WAVE" = (".wav", "audio/wav")
+  | "ID3" `ByteString.isPrefixOf` bytes = (".mp3", "audio/mpeg")
+  | "OggS" `ByteString.isPrefixOf` bytes = (".ogg", "audio/ogg")
+  | "fLaC" `ByteString.isPrefixOf` bytes = (".flac", "audio/flac")
+  | "#!AMR" `ByteString.isPrefixOf` bytes = (".amr", "audio/amr")
+  | "\2#!SILK_V3" `ByteString.isPrefixOf` bytes = (".silk", "audio/silk")
+  | "%PDF" `ByteString.isPrefixOf` bytes = (".pdf", "application/pdf")
+  | "PK\3\4" `ByteString.isPrefixOf` bytes = (".zip", "application/zip")
+  | "\31\139" `ByteString.isPrefixOf` bytes = (".gz", "application/gzip")
+  | "ftyp" `ByteString.isPrefixOf` ByteString.drop 4 bytes = (".mp4", "video/mp4")
+  | "\26\69\223\163" `ByteString.isPrefixOf` bytes = (".webm", "video/webm")
+  | otherwise = ("", "application/octet-stream")
 
 -- | Bridges learn about users lazily, so the first sighting of a user in a
 -- room also establishes their membership. The key is derived from the referenced

@@ -13,7 +13,6 @@ import Data.Aeson.Key qualified as Aeson.Key
 import Data.Aeson.KeyMap qualified as Aeson.KeyMap
 import Data.Aeson.Types (parseMaybe)
 import Data.ByteString (ByteString)
-import Data.ByteString qualified as ByteString
 import Data.ByteString.Base64 qualified as Base64
 import Data.ByteString.Lazy qualified as LByteString
 import Data.Foldable (toList)
@@ -756,25 +755,6 @@ uploadQQFile context blobId bytes = do
       logError context.bridge.logger ("qq upload_group_file failed: " <> Text.pack err)
       pure [qqTextSegment "[file]"]
 
-sniffExtension :: ByteString -> Text
-sniffExtension bytes
-  | "\137PNG" `ByteString.isPrefixOf` bytes = ".png"
-  | "\255\216\255" `ByteString.isPrefixOf` bytes = ".jpg"
-  | "GIF8" `ByteString.isPrefixOf` bytes = ".gif"
-  | "BM" `ByteString.isPrefixOf` bytes = ".bmp"
-  | "RIFF" `ByteString.isPrefixOf` bytes && ByteString.take 4 (ByteString.drop 8 bytes) == "WEBP" = ".webp"
-  | "RIFF" `ByteString.isPrefixOf` bytes && ByteString.take 4 (ByteString.drop 8 bytes) == "WAVE" = ".wav"
-  | "ID3" `ByteString.isPrefixOf` bytes = ".mp3"
-  | "OggS" `ByteString.isPrefixOf` bytes = ".ogg"
-  | "fLaC" `ByteString.isPrefixOf` bytes = ".flac"
-  | "#!AMR" `ByteString.isPrefixOf` bytes = ".amr"
-  | "\2#!SILK_V3" `ByteString.isPrefixOf` bytes = ".silk"
-  | "%PDF" `ByteString.isPrefixOf` bytes = ".pdf"
-  | "PK\3\4" `ByteString.isPrefixOf` bytes = ".zip"
-  | "\31\139" `ByteString.isPrefixOf` bytes = ".gz"
-  | "ftyp" `ByteString.isPrefixOf` ByteString.drop 4 bytes = ".mp4"
-  | "\26\69\223\163" `ByteString.isPrefixOf` bytes = ".webm"
-  | otherwise = ""
 fetchInitialRoomInfo :: Logger -> Manager -> QQConfig -> InitialRoomMapping -> IO RoomInfo
 fetchInitialRoomInfo logger manager config mapping = do
   response <- qqApiCall logger manager config "get_group_info" (object ["group_id" .= qqIdJson mapping.platformKey.key])

@@ -6,20 +6,23 @@ where
 
 import Control.Concurrent (threadDelay)
 import Control.Applicative (asum, (<|>))
-import Control.Monad (forM_, forever, unless)
+import Control.Exception (try)
+import Control.Monad (forM, forM_, forever, unless)
 import Data.Aeson
 import Data.Aeson.Types (Parser)
 import Data.Aeson.Key qualified as Aeson.Key
 import Data.Aeson.KeyMap qualified as Aeson.KeyMap
+import Data.ByteString (ByteString)
 import Data.ByteString qualified as ByteString
 import Data.ByteString.Lazy qualified as LByteString
 import Data.List.NonEmpty (NonEmpty ((:|)), nonEmpty)
-import Data.Maybe (mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text
 import Network.HTTP.Client
 import Network.HTTP.Client.TLS
+import Network.HTTP.Types.Status (statusCode)
 import Network.HTTP.Types.URI (urlEncode)
 import Text.HTML.TagSoup
 import Multiverse.Bridge
@@ -96,28 +99,8 @@ observeEvent manager context config ownUserId room event
       logDebug context.logger ("matrix ignoring own event " <> event.eventId)
   | otherwise =
       case event.content of
-        MatrixMessage body replyToEvent -> do
-          userId <- ensureUser manager context config event.sender
-          ensureRoomMembership context "matrix" room userId
-          replyTo <- matrixReplyTo context replyToEvent
-          let platformKey = matrixEventKey event.eventId
-              timelineEvent =
-                Event
-                  { platformKey
-                  , content =
-                      SendMessage
-                        SendMessageInfo
-                          { sender = userId
-                          , room
-                          , replyTo
-                          , forwardOf = Nothing
-                          , body
-                          }
-                  }
-          submitted <- submitMessageMapped context timelineEvent
-          case submitted of
-            Right _ -> pure ()
-            Left err -> logError context.logger ("matrix submit error: " <> Text.pack (show err))
+        MatrixMessage messageContent -> observeMatrixMessage manager context config event room messageContent
+        MatrixMedia mediaContent -> observeMatrixMedia manager context config event room mediaContent
         MatrixRedaction redactedEvent -> do
           target <- context.mappingStore.lookupTimelineId (matrixEventKey redactedEvent)
           case target of
@@ -136,6 +119,104 @@ observeEvent manager context config ownUserId room event
                       logDebug context.logger ("matrix ignoring redaction for missing timeline event " <> renderEventId targetEventId)
                 Left err -> logError context.logger ("matrix retraction submit error: " <> Text.pack (show err))
         MatrixMember member -> observeMatrixMember manager context config ownUserId room event member
+        MatrixIgnored reason
+          | reason == "m.room.encrypted" ->
+              logWarn context.logger ("matrix cannot decrypt event " <> event.eventId <> ": encrypted rooms are not supported")
+          | otherwise -> logDebug context.logger ("matrix ignoring " <> reason <> " event " <> event.eventId)
+
+observeMatrixMessage :: Timeline timeline => Manager -> BridgeContext timeline -> MatrixConfig -> MatrixEvent -> RoomId -> MatrixMessageContent -> IO ()
+observeMatrixMessage manager context config event room messageContent = do
+  userId <- ensureUser manager context config event.sender
+  ensureRoomMembership context "matrix" room userId
+  case messageContent.messageEditOf of
+    Just targetEventId -> do
+      target <- context.mappingStore.lookupTimelineId (matrixEventKey targetEventId)
+      case target of
+        Nothing -> logDebug context.logger ("matrix ignoring edit for unknown event " <> targetEventId)
+        Just targetMessage -> do
+          let timelineEvent =
+                Event
+                  { platformKey = PlatformKey "matrix" "edit" event.eventId
+                  , content = EditMessage (MessageId targetMessage) messageContent.messageBody
+                  }
+          submitted <- submitMapped context timelineEvent
+          case submitted of
+            Right _ -> pure ()
+            Left err -> logError context.logger ("matrix edit submit error: " <> Text.pack (show err))
+    Nothing -> do
+      replyTo <- matrixReplyTo context messageContent.messageReplyTo
+      let timelineEvent =
+            Event
+              { platformKey = matrixEventKey event.eventId
+              , content =
+                  SendMessage
+                    SendMessageInfo
+                      { sender = userId
+                      , room
+                      , replyTo
+                      , forwardOf = Nothing
+                      , body = messageContent.messageBody
+                      }
+              }
+      submitted <- submitMessageMapped context timelineEvent
+      case submitted of
+        Right _ -> pure ()
+        Left err -> logError context.logger ("matrix submit error: " <> Text.pack (show err))
+
+observeMatrixMedia :: Timeline timeline => Manager -> BridgeContext timeline -> MatrixConfig -> MatrixEvent -> RoomId -> MatrixMediaContent -> IO ()
+observeMatrixMedia manager context config event room mediaContent = do
+  userId <- ensureUser manager context config event.sender
+  ensureRoomMembership context "matrix" room userId
+  let blobKey = PlatformKey "matrix" "blob" event.eventId
+  existing <- context.mappingStore.lookupTimelineId blobKey
+  blobId <- case existing of
+    Just blobEvent -> pure (Just (BlobId blobEvent))
+    Nothing -> do
+      downloaded <- matrixDownloadMedia context.logger manager config mediaContent.mediaUri
+      case downloaded of
+        Nothing -> pure Nothing
+        Just bytes -> do
+          submitted <- submitMapped context Event {platformKey = blobKey, content = CreateBlob bytes}
+          case submitted of
+            Right blobEvent -> pure (Just (BlobId blobEvent))
+            Left err -> do
+              logError context.logger ("matrix media submit error: " <> Text.pack (show err))
+              pure Nothing
+  let label = fromMaybe (matrixMediaLabel mediaContent.mediaKind) mediaContent.mediaName
+      parts = case blobId of
+        Just blob
+          | mediaContent.mediaKind == FileBlob -> [Text (Plain label :| []), Blob FileBlob blob]
+          | otherwise -> [Blob mediaContent.mediaKind blob]
+        Nothing -> [Text (Plain ("[" <> label <> "]") :| [])]
+  case nonEmpty parts of
+    Nothing -> pure ()
+    Just body -> do
+      replyTo <- matrixReplyTo context mediaContent.mediaReplyTo
+      let timelineEvent =
+            Event
+              { platformKey = matrixEventKey event.eventId
+              , content =
+                  SendMessage
+                    SendMessageInfo
+                      { sender = userId
+                      , room
+                      , replyTo
+                      , forwardOf = Nothing
+                      , body
+                      }
+              }
+      submitted <- submitMessageMapped context timelineEvent
+      case submitted of
+        Right _ -> pure ()
+        Left err -> logError context.logger ("matrix media message submit error: " <> Text.pack (show err))
+
+matrixMediaLabel :: BlobType -> Text
+matrixMediaLabel = \case
+  ImageBlob -> "image"
+  VideoBlob -> "video"
+  AudioBlob -> "audio"
+  FileBlob -> "file"
+
 
 isMemberEvent :: MatrixEventContent -> Bool
 isMemberEvent content = case content of
@@ -214,9 +295,25 @@ reflectEvent manager config context stored =
           unless alreadyMapped do
             roomKeys <- context.mappingStore.lookupPlatformKeys (roomEventId info.room)
             let matrixRooms = filter (enabledRoom config.initialRooms) roomKeys
-            (profile, body) <- renderMatrixRelayMessage context info
+            (profile, body) <- renderMatrixRelayMessage context info {body = textBody info.body}
             replyTo <- matrixReplyEventId context info.replyTo
-            mapM_ (sendToRoom profile body replyTo) matrixRooms
+            mapM_ (sendToRoom info profile body replyTo) matrixRooms
+    EditMessage message body
+      | stored.storedEvent.platformKey.platform /= "matrix" -> do
+          original <- getEvent context.timeline (messageEventId message)
+          case fmap (.storedEvent.content) original of
+            Just (SendMessage info) -> do
+              unless (messageBlobs info.body == messageBlobs body) do
+                logWarn context.logger "matrix cannot reflect changes to message attachments"
+              text <- renderRelayedMessage context info {body = textBody body}
+              targets <- matrixEditTargets config context message
+              forM_ targets \(roomId, matrixEventId) -> do
+                let txnId = matrixTransactionId stored "edit" roomId
+                result <- matrixSendEdit context.logger manager config roomId txnId matrixEventId text
+                case result of
+                  Left err -> logError context.logger ("matrix edit reflect error: " <> Text.pack err)
+                  Right editEventId -> context.mappingStore.insertMapping (matrixEventKey editEventId) stored.storedId
+            _ -> pure ()
     RetractMessage message
       | stored.storedEvent.platformKey.platform == "matrix" ->
           logDebug context.logger ("matrix not reflecting own-origin event " <> renderEventId stored.storedId)
@@ -237,7 +334,8 @@ reflectEvent manager config context stored =
             case done of
               Just _ -> pure ()
               Nothing -> do
-                result <- matrixSendMessage context.logger manager config roomKey.key stored.storedId Nothing Nothing body
+                let txnId = matrixTransactionId stored "nick" roomKey.key
+                result <- matrixSendMessage context.logger manager config roomKey.key txnId Nothing Nothing body
                 case result of
                   Left err -> logError context.logger ("matrix nick reflect error: " <> Text.pack err)
                   Right matrixEventId -> do
@@ -245,26 +343,95 @@ reflectEvent manager config context stored =
                     context.mappingStore.setState stateKey "done"
     _ -> pure ()
  where
-  sendToRoom profile body replyTo roomKey = do
-    result <- matrixSendMessage context.logger manager config roomKey.key stored.storedId replyTo (Just profile) body
-    case result of
-      Left err -> logError context.logger ("matrix reflect error: " <> Text.pack err)
-      Right matrixEventId -> context.mappingStore.insertMapping (matrixEventKey matrixEventId) stored.storedId
+  sendToRoom info profile body replyTo roomKey = do
+    let roomId = roomKey.key
+        blobs = messageBlobs info.body
+        sendText = do
+          let txnId = matrixTransactionId stored "text" roomId
+          result <- matrixSendMessage context.logger manager config roomId txnId replyTo (Just profile) body
+          case result of
+            Left err -> pure (Left err)
+            Right matrixEventId -> do
+              context.mappingStore.setState ("matrix.text." <> renderEventId stored.storedId <> "." <> roomId) matrixEventId
+              pure (Right matrixEventId)
+        sendBlob index (kind, blobId) = do
+          blob <- getEvent context.timeline (blobEventId blobId)
+          case fmap (.storedEvent.content) blob of
+            Just (CreateBlob bytes) -> do
+              let name = "file-" <> Text.take 12 (renderEventId (blobEventId blobId)) <> sniffExtension bytes
+                  mimeType = sniffMimeType bytes
+              uploaded <- matrixUploadMedia context.logger manager config name mimeType bytes
+              case uploaded of
+                Left err -> pure (Left err)
+                Right mediaUrl -> do
+                  let blobReplyTo = if index == 1 && not (hasTextContent info.body) then replyTo else Nothing
+                      content = matrixMediaContent kind name mimeType (ByteString.length bytes) mediaUrl
+                      txnId = matrixTransactionId stored ("part" <> Text.pack (show index)) roomId
+                  result <- matrixSendMedia context.logger manager config roomId txnId blobReplyTo content
+                  case result of
+                    Left err -> pure (Left err)
+                    Right matrixEventId -> do
+                      context.mappingStore.setState ("matrix.room." <> matrixEventId) roomId
+                      pure (Right matrixEventId)
+            _ -> pure (Left "matrix media blob is missing")
+    textResults <-
+      if hasTextContent info.body
+        then (: []) <$> sendText
+        else pure []
+    blobResults <- mapM (uncurry sendBlob) (zip [1 :: Int ..] blobs)
+    let results = textResults <> blobResults
+        errors = [err | Left err <- results]
+    if null errors
+      then forM_ [matrixEventId | Right matrixEventId <- results] \matrixEventId ->
+        context.mappingStore.insertMapping (matrixEventKey matrixEventId) stored.storedId
+      else mapM_ (\err -> logError context.logger ("matrix reflect error: " <> Text.pack err)) errors
   redactInRoom (roomId, eventId_) = do
-    result <- matrixRedactMessage context.logger manager config roomId stored.storedId eventId_
+    let txnId = matrixTransactionId stored "redact" roomId
+    result <- matrixRedactMessage context.logger manager config roomId txnId eventId_
     case result of
       Left err -> do
         logError context.logger ("matrix retract reflect error: " <> Text.pack err)
-        fallback <- matrixSendMessage context.logger manager config roomId stored.storedId Nothing Nothing (retractionFailureMessage err)
+        let fallbackTxnId = matrixTransactionId stored "redact-failure" roomId
+        fallback <- matrixSendMessage context.logger manager config roomId fallbackTxnId Nothing Nothing (retractionFailureMessage err)
         case fallback of
           Left fallbackErr -> logError context.logger ("matrix retract failure notice error: " <> Text.pack fallbackErr)
           Right matrixEventId -> context.mappingStore.insertMapping (matrixEventKey matrixEventId) stored.storedId
       Right redactionEventId -> context.mappingStore.insertMapping (matrixRedactionKey redactionEventId) stored.storedId
 
+-- | Transaction ids are idempotency keys scoped to the access token, so they
+-- must be unique per room and per part.
+matrixTransactionId :: StoredEvent -> Text -> Text -> Text
+matrixTransactionId stored suffix roomId =
+  escapePathSegment (renderEventId stored.storedId <> "-" <> suffix <> "-" <> roomId)
+
 retractionFailureMessage :: String -> RenderedMessage
 retractionFailureMessage err =
   let text = "Failed to retract a bridged message: " <> Text.pack err
    in RenderedMessage text text
+
+matrixEditTargets :: Timeline timeline => MatrixConfig -> BridgeContext timeline -> MessageId -> IO [(Text, Text)]
+matrixEditTargets config context message = do
+  original <- getEvent context.timeline (messageEventId message)
+  case fmap (.storedEvent.content) original of
+    Just (SendMessage info) -> do
+      roomKeys <- context.mappingStore.lookupPlatformKeys (roomEventId info.room)
+      let matrixRooms = filter (enabledRoom config.initialRooms) roomKeys
+      sent <- forM matrixRooms \roomKey -> do
+        sentEvent <- context.mappingStore.lookupState ("matrix.text." <> renderEventId (messageEventId message) <> "." <> roomKey.key)
+        pure (fmap (\matrixEventId -> (roomKey.key, matrixEventId)) sentEvent)
+      case catMaybes sent of
+        [] -> do
+          -- The message was observed, not sent, so its event id is mapped directly.
+          messageKeys <- context.mappingStore.lookupPlatformKeys (messageEventId message)
+          let matrixEvents =
+                [ platformKey.key
+                | platformKey <- messageKeys
+                , platformKey.platform == "matrix"
+                , platformKey.entityType == "message"
+                ]
+          pure [(roomKey.key, matrixEventId) | roomKey <- matrixRooms, matrixEventId <- matrixEvents]
+        targets -> pure targets
+    _ -> pure []
 
 matrixRetractTargets :: Timeline timeline => BridgeContext timeline -> MessageId -> IO [(Text, Text)]
 matrixRetractTargets context message = do
@@ -272,16 +439,25 @@ matrixRetractTargets context message = do
   case fmap (.storedEvent.content) original of
     Just (SendMessage info) -> do
       messageKeys <- context.mappingStore.lookupPlatformKeys (messageEventId message)
-      roomKeys <- context.mappingStore.lookupPlatformKeys (roomEventId info.room)
-      pure
-        [ (roomKey.key, messageKey.key)
-        | messageKey <- messageKeys
-        , messageKey.platform == "matrix"
-        , messageKey.entityType == "message"
-        , roomKey <- roomKeys
-        , roomKey.platform == "matrix"
-        , roomKey.entityType == "room"
-        ]
+      let matrixEvents =
+            [ platformKey.key
+            | platformKey <- messageKeys
+            , platformKey.platform == "matrix"
+            , platformKey.entityType == "message"
+            ]
+      targets <- forM matrixEvents \matrixEventId -> do
+        recordedRoom <- context.mappingStore.lookupState ("matrix.room." <> matrixEventId)
+        case recordedRoom of
+          Just roomId -> pure [(roomId, matrixEventId)]
+          Nothing -> do
+            roomKeys <- context.mappingStore.lookupPlatformKeys (roomEventId info.room)
+            pure
+              [ (roomKey.key, matrixEventId)
+              | roomKey <- roomKeys
+              , roomKey.platform == "matrix"
+              , roomKey.entityType == "room"
+              ]
+      pure (concat targets)
     _ -> pure []
 
 matrixReplyEventId :: BridgeContext timeline -> Maybe MessageId -> IO (Maybe Text)
@@ -373,8 +549,8 @@ matrixHtmlEscape =
     char -> Text.singleton char
 
 matrixSendMessage ::
-  Logger -> Manager -> MatrixConfig -> Text -> EventId -> Maybe Text -> Maybe Value -> RenderedMessage -> IO (Either String Text)
-matrixSendMessage logger manager config roomId eventId_ replyTo profile body = do
+  Logger -> Manager -> MatrixConfig -> Text -> Text -> Maybe Text -> Maybe Value -> RenderedMessage -> IO (Either String Text)
+matrixSendMessage logger manager config roomId txnId replyTo profile body = do
   request0 <-
     authorizedRequest
       config
@@ -382,7 +558,7 @@ matrixSendMessage logger manager config roomId eventId_ replyTo profile body = d
           <> "/_matrix/client/v3/rooms/"
           <> roomId
           <> "/send/m.room.message/"
-          <> transactionId eventId_
+          <> txnId
       )
   let request =
         request0
@@ -395,8 +571,75 @@ matrixSendMessage logger manager config roomId eventId_ replyTo profile body = d
     Left err -> Left err
     Right sent -> Right sent.eventId
 
-matrixRedactMessage :: Logger -> Manager -> MatrixConfig -> Text -> EventId -> Text -> IO (Either String Text)
-matrixRedactMessage logger manager config roomId eventId_ redactedEventId = do
+matrixSendEdit :: Logger -> Manager -> MatrixConfig -> Text -> Text -> Text -> RenderedMessage -> IO (Either String Text)
+matrixSendEdit logger manager config roomId txnId targetEventId body = do
+  request0 <-
+    authorizedRequest
+      config
+      ( config.homeserver
+          <> "/_matrix/client/v3/rooms/"
+          <> roomId
+          <> "/send/m.room.message/"
+          <> txnId
+      )
+  let request =
+        request0
+          { method = "PUT"
+          , requestBody = RequestBodyLBS (encode (matrixEditContent targetEventId body))
+          , requestHeaders = ("Content-Type", "application/json") : request0.requestHeaders
+          }
+  response <- loggedHttp logger request manager
+  pure case eitherDecode response.responseBody :: Either String MatrixSendResponse of
+    Left err -> Left err
+    Right sent -> Right sent.eventId
+
+matrixSendMedia :: Logger -> Manager -> MatrixConfig -> Text -> Text -> Maybe Text -> Value -> IO (Either String Text)
+matrixSendMedia logger manager config roomId txnId replyTo content = do
+  request0 <-
+    authorizedRequest
+      config
+      ( config.homeserver
+          <> "/_matrix/client/v3/rooms/"
+          <> roomId
+          <> "/send/m.room.message/"
+          <> txnId
+      )
+  let request =
+        request0
+          { method = "PUT"
+          , requestBody = RequestBodyLBS (encode (matrixWithReply replyTo content))
+          , requestHeaders = ("Content-Type", "application/json") : request0.requestHeaders
+          }
+  response <- loggedHttp logger request manager
+  pure case eitherDecode response.responseBody :: Either String MatrixSendResponse of
+    Left err -> Left err
+    Right sent -> Right sent.eventId
+
+matrixUploadMedia :: Logger -> Manager -> MatrixConfig -> Text -> Text -> ByteString -> IO (Either String Text)
+matrixUploadMedia logger manager config fileName mimeType bytes = go uploadEndpoints
+ where
+  uploadEndpoints =
+    [ config.homeserver <> "/_matrix/client/v1/media/upload?filename=" <> escapePathSegment fileName
+    , config.homeserver <> "/_matrix/media/v3/upload?filename=" <> escapePathSegment fileName
+    ]
+
+  go = \case
+    [] -> pure (Left "matrix media upload failed")
+    url : rest -> do
+      request0 <- authorizedRequest config url
+      let request =
+            request0
+              { method = "POST"
+              , requestBody = RequestBodyBS bytes
+              , requestHeaders = ("Content-Type", Text.encodeUtf8 mimeType) : request0.requestHeaders
+              }
+      response <- loggedHttp logger request manager
+      case eitherDecode response.responseBody :: Either String MatrixUploadResponse of
+        Right uploaded -> pure (Right uploaded.contentUri)
+        Left _ -> go rest
+
+matrixRedactMessage :: Logger -> Manager -> MatrixConfig -> Text -> Text -> Text -> IO (Either String Text)
+matrixRedactMessage logger manager config roomId txnId redactedEventId = do
   request0 <-
     authorizedRequest
       config
@@ -406,7 +649,7 @@ matrixRedactMessage logger manager config roomId eventId_ redactedEventId = do
           <> "/redact/"
           <> escapePathSegment redactedEventId
           <> "/"
-          <> transactionId eventId_
+          <> txnId
       )
   let request =
         request0
@@ -418,6 +661,38 @@ matrixRedactMessage logger manager config roomId eventId_ redactedEventId = do
   pure case eitherDecode response.responseBody :: Either String MatrixSendResponse of
     Left err -> Left err
     Right sent -> Right sent.eventId
+
+matrixDownloadMedia :: Logger -> Manager -> MatrixConfig -> Text -> IO (Maybe ByteString)
+matrixDownloadMedia logger manager config uri =
+  case Text.stripPrefix "mxc://" uri of
+    Nothing -> do
+      logDebug logger ("matrix ignoring unsupported media uri " <> uri)
+      pure Nothing
+    Just rest -> do
+      let (serverName, mediaId) = Text.breakOn "/" rest
+      if Text.null serverName || Text.length mediaId < 2
+        then do
+          logDebug logger ("matrix ignoring malformed media uri " <> uri)
+          pure Nothing
+        else do
+          let mediaPath = escapePathSegment serverName <> "/" <> escapePathSegment (Text.drop 1 mediaId)
+          tryPaths
+            [ config.homeserver <> "/_matrix/client/v1/media/download/" <> mediaPath
+            , config.homeserver <> "/_matrix/media/v3/download/" <> mediaPath
+            ]
+ where
+  tryPaths = \case
+    [] -> do
+      logWarn logger ("matrix media download failed for " <> uri)
+      pure Nothing
+    url : rest -> do
+      request <- authorizedRequest config url
+      result <- try (loggedHttp logger request manager) :: IO (Either HttpException (Response LByteString.ByteString))
+      case result of
+        Right response
+          | statusCode response.responseStatus == 200 ->
+              pure (Just (LByteString.toStrict response.responseBody))
+        _ -> tryPaths rest
 
 matrixMessageContent :: Maybe Text -> Maybe Value -> RenderedMessage -> Value
 matrixMessageContent replyTo profile body =
@@ -434,6 +709,60 @@ matrixMessageContent replyTo profile body =
         -- MSC4144 specifies this unstable prefix until the proposal is accepted.
         <> maybe [] (\profile_ -> ["com.beeper.per_message_profile" .= profile_]) profile
     )
+
+matrixEditContent :: Text -> RenderedMessage -> Value
+matrixEditContent targetEventId body =
+  object
+    [ "msgtype" .= ("m.text" :: Text)
+    , "body" .= ("* " <> body.plainText)
+    , "format" .= ("org.matrix.custom.html" :: Text)
+    , "formatted_body" .= ("* " <> body.htmlText)
+    , "m.new_content"
+        .= object
+          [ "msgtype" .= ("m.text" :: Text)
+          , "body" .= body.plainText
+          , "format" .= ("org.matrix.custom.html" :: Text)
+          , "formatted_body" .= body.htmlText
+          ]
+    , "m.relates_to" .= object ["rel_type" .= ("m.replace" :: Text), "event_id" .= targetEventId]
+    ]
+
+matrixMediaContent :: BlobType -> Text -> Text -> Int -> Text -> Value
+matrixMediaContent kind fileName mimeType size mediaUrl =
+  object
+    [ "msgtype" .= matrixMsgType kind
+    , "body" .= fileName
+    , "url" .= mediaUrl
+    , "info" .= object ["mimetype" .= mimeType, "size" .= size]
+    ]
+
+matrixMsgType :: BlobType -> Text
+matrixMsgType = \case
+  ImageBlob -> "m.image"
+  VideoBlob -> "m.video"
+  AudioBlob -> "m.audio"
+  FileBlob -> "m.file"
+
+matrixWithReply :: Maybe Text -> Value -> Value
+matrixWithReply Nothing content = content
+matrixWithReply (Just eventId_) content =
+  case content of
+    Object obj ->
+      Object
+        ( Aeson.KeyMap.insert
+            "m.relates_to"
+            (object ["m.in_reply_to" .= object ["event_id" .= eventId_]])
+            obj
+        )
+    other -> other
+
+data MatrixUploadResponse = MatrixUploadResponse
+  { contentUri :: Text
+  }
+
+instance FromJSON MatrixUploadResponse where
+  parseJSON = withObject "MatrixUploadResponse" \obj ->
+    MatrixUploadResponse <$> obj .: "content_uri"
 
 fetchInitialRoomInfo :: Logger -> Manager -> MatrixConfig -> InitialRoomMapping -> IO RoomInfo
 fetchInitialRoomInfo logger manager config mapping = do
@@ -528,9 +857,6 @@ matrixEventKey matrixEventId = PlatformKey "matrix" "message" matrixEventId
 matrixRedactionKey :: Text -> PlatformKey
 matrixRedactionKey matrixEventId = PlatformKey "matrix" "redaction" matrixEventId
 
-transactionId :: EventId -> Text
-transactionId (EventId eventId_) = eventId_
-
 renderEventId :: EventId -> Text
 renderEventId (EventId eventId_) = eventId_
 
@@ -574,9 +900,24 @@ data MatrixEvent = MatrixEvent
   }
 
 data MatrixEventContent
-  = MatrixMessage Message (Maybe Text)
+  = MatrixMessage MatrixMessageContent
+  | MatrixMedia MatrixMediaContent
   | MatrixRedaction Text
   | MatrixMember MatrixMembership
+  | MatrixIgnored Text
+
+data MatrixMessageContent = MatrixMessageContent
+  { messageBody :: Message
+  , messageReplyTo :: Maybe Text
+  , messageEditOf :: Maybe Text
+  }
+
+data MatrixMediaContent = MatrixMediaContent
+  { mediaKind :: BlobType
+  , mediaUri :: Text
+  , mediaName :: Maybe Text
+  , mediaReplyTo :: Maybe Text
+  }
 
 data MatrixMembership = MatrixMembership
   { membership :: Text
@@ -591,28 +932,35 @@ usableEvent value = do
   eventType <- Aeson.KeyMap.lookup "type" obj >>= asText
   matrixEventId <- Aeson.KeyMap.lookup "event_id" obj >>= asText
   sender <- Aeson.KeyMap.lookup "sender" obj >>= asText
+  let event content = Just MatrixEvent {eventId = matrixEventId, sender, content}
+      ignored reason = event (MatrixIgnored reason)
+      eventContent = Aeson.KeyMap.lookup "content" obj >>= asObject
   case eventType of
-    "m.room.message" -> do
-      content <- Aeson.KeyMap.lookup "content" obj >>= asObject
-      msgtype <- Aeson.KeyMap.lookup "msgtype" content >>= asText
-      guardMaybe (msgtype == "m.text")
-      body <- Aeson.KeyMap.lookup "body" content >>= asText
-      let messageBody = matrixMessageBody content body
-      let replyToEvent =
-            Aeson.KeyMap.lookup "m.relates_to" content
-              >>= asObject
-              >>= Aeson.KeyMap.lookup "m.in_reply_to"
-              >>= asObject
-              >>= Aeson.KeyMap.lookup "event_id"
-              >>= asText
-      pure MatrixEvent {eventId = matrixEventId, sender, content = MatrixMessage messageBody replyToEvent}
+    "m.room.message" -> case eventContent of
+      Nothing -> ignored "contentless m.room.message"
+      Just content -> messageEvent event content
+    "m.sticker" -> case eventContent of
+      Nothing -> ignored "contentless m.sticker"
+      Just content -> do
+        mediaUrl <- Aeson.KeyMap.lookup "url" content >>= asText
+        event
+          ( MatrixMedia
+              MatrixMediaContent
+                { mediaKind = ImageBlob
+                , mediaUri = mediaUrl
+                , mediaName = Aeson.KeyMap.lookup "body" content >>= asText
+                , mediaReplyTo = Nothing
+                }
+          )
+    "m.reaction" -> ignored "m.reaction"
+    "m.room.encrypted" -> ignored "m.room.encrypted"
     "m.room.redaction" -> do
       let redactedEvent =
             (Aeson.KeyMap.lookup "redacts" obj >>= asText)
               <|> (Aeson.KeyMap.lookup "content" obj >>= asObject >>= Aeson.KeyMap.lookup "redacts" >>= asText)
       MatrixEvent matrixEventId sender . MatrixRedaction <$> redactedEvent
     "m.room.member" -> do
-      content <- Aeson.KeyMap.lookup "content" obj >>= asObject
+      content <- eventContent
       membership <- Aeson.KeyMap.lookup "membership" content >>= asText
       memberUserId <- Aeson.KeyMap.lookup "state_key" obj >>= asText
       let previousContent =
@@ -621,20 +969,88 @@ usableEvent value = do
               >>= Aeson.KeyMap.lookup "prev_content"
               >>= asObject
           previousDisplayName = previousContent >>= Aeson.KeyMap.lookup "displayname" >>= asText
-      pure
-        MatrixEvent
-          { eventId = matrixEventId
-          , sender
-          , content =
-              MatrixMember
-                MatrixMembership
-                  { membership
-                  , memberUserId
-                  , memberDisplayName = Aeson.KeyMap.lookup "displayname" content >>= asText
-                  , memberPreviousDisplayName = previousDisplayName
+      event
+        ( MatrixMember
+            MatrixMembership
+              { membership
+              , memberUserId
+              , memberDisplayName = Aeson.KeyMap.lookup "displayname" content >>= asText
+              , memberPreviousDisplayName = previousDisplayName
+              }
+        )
+    _ -> ignored eventType
+
+messageEvent :: (MatrixEventContent -> Maybe MatrixEvent) -> Object -> Maybe MatrixEvent
+messageEvent event content = do
+  let relatesTo = Aeson.KeyMap.lookup "m.relates_to" content >>= asObject
+      replyTo =
+        relatesTo
+          >>= Aeson.KeyMap.lookup "m.in_reply_to"
+          >>= asObject
+          >>= Aeson.KeyMap.lookup "event_id"
+          >>= asText
+      editOf = do
+        relates <- relatesTo
+        relType <- Aeson.KeyMap.lookup "rel_type" relates >>= asText
+        guardMaybe (relType == "m.replace")
+        Aeson.KeyMap.lookup "event_id" relates >>= asText
+      replacement = Aeson.KeyMap.lookup "m.new_content" content >>= asObject
+      effective = fromMaybe content replacement
+  msgtype <- Aeson.KeyMap.lookup "msgtype" effective >>= asText
+  body <- Aeson.KeyMap.lookup "body" effective >>= asText
+  let delivered messageBody =
+        event
+          ( MatrixMessage
+              MatrixMessageContent
+                { messageBody
+                , messageReplyTo = replyTo
+                , messageEditOf = editOf
+                }
+          )
+      media kind = case Aeson.KeyMap.lookup "url" effective >>= asText of
+        Nothing -> event (MatrixIgnored ("contentless " <> msgtype))
+        Just mediaUrl ->
+          event
+            ( MatrixMedia
+                MatrixMediaContent
+                  { mediaKind = kind
+                  , mediaUri = mediaUrl
+                  , mediaName = Just body
+                  , mediaReplyTo = replyTo
                   }
-          }
-    _ -> Nothing
+            )
+  case msgtype of
+    "m.text" -> delivered (matrixMessageBody effective body)
+    "m.notice" -> delivered (matrixMessageBody effective body)
+    "m.emote" -> delivered (matrixEmoteBody effective body)
+    "m.location" -> delivered (matrixLocationBody effective body)
+    "m.image" -> media ImageBlob
+    "m.video" -> media VideoBlob
+    "m.audio" -> media AudioBlob
+    "m.file" -> media FileBlob
+    _ -> event (MatrixIgnored ("msgtype " <> msgtype))
+
+matrixEmoteBody :: Object -> Text -> Message
+matrixEmoteBody content fallback =
+  case matrixMessageBody content fallback of
+    Text inline :| [] -> Emote inline :| []
+    body -> body
+
+matrixLocationBody :: Object -> Text -> Message
+matrixLocationBody content fallback =
+  let label = if Text.null fallback then "location" else fallback
+      inline = case Aeson.KeyMap.lookup "geo_uri" content >>= asText >>= geoMapLink of
+        Just url -> Link (Plain label :| []) url
+        Nothing -> Plain label
+   in Text (inline :| []) :| []
+
+geoMapLink :: Text -> Maybe Text
+geoMapLink uri = do
+  rest <- Text.stripPrefix "geo:" uri
+  let (coordinates, _) = Text.breakOn ";" rest
+      (latitude, longitude) = Text.breakOn "," coordinates
+  guardMaybe (not (Text.null latitude) && Text.length longitude > 1)
+  pure ("https://www.openstreetmap.org/?mlat=" <> latitude <> "&mlon=" <> Text.drop 1 longitude)
 
 asObject :: Value -> Maybe Object
 asObject = \case
