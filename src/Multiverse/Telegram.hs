@@ -155,7 +155,7 @@ ensureUser context user = do
 configuredRoom :: TelegramConfig -> BridgeContext timeline -> TelegramChat -> IO (Maybe RoomId)
 configuredRoom config context chat = do
   let platformKey = telegramRoomKey chat
-  if platformKey `elem` map (.platformKey) config.initialRooms
+  if enabledRoom config.initialRooms platformKey
     then fmap RoomId <$> context.mappingStore.lookupTimelineId platformKey
     else pure Nothing
 
@@ -167,7 +167,7 @@ reflectEvent manager config context stored =
           logDebug context.logger ("telegram not reflecting own-origin event " <> renderEventId stored.storedId)
       | otherwise -> do
           roomKeys <- context.mappingStore.lookupPlatformKeys (roomEventId info.room)
-          let telegramRooms = filter ((== "telegram") . (.platform)) roomKeys
+          let telegramRooms = filter (enabledRoom config.initialRooms) roomKeys
           mapM_ (sendToRoom info) telegramRooms
     EditMessage message body
       | stored.storedEvent.platformKey.platform /= "telegram" -> do
@@ -178,7 +178,7 @@ reflectEvent manager config context stored =
                 logWarn context.logger "telegram cannot reflect changes to message attachments"
               targets <- telegramRetractTargets context message
               text <- renderRelayedMessage context info {body = textBody body}
-              forM_ targets \(chatId, messageId) -> do
+              forM_ (filter (enabledTelegramTarget config) targets) \(chatId, messageId) -> do
                 textId <- context.mappingStore.lookupState ("telegram.send." <> renderEventId (messageEventId message) <> "." <> Text.pack (show chatId) <> ".0")
                 whenTextTarget textId messageId do
                   let editKey = "telegram.edit." <> renderEventId stored.storedId <> "." <> Text.pack (show chatId) <> "." <> Text.pack (show messageId)
@@ -199,7 +199,7 @@ reflectEvent manager config context stored =
           alreadyMapped <- hasPlatformMapping context.mappingStore "telegram" stored.storedId
           unless alreadyMapped do
             targets <- telegramRetractTargets context message
-            mapM_ deleteInChat targets
+            mapM_ deleteInChat (filter (enabledTelegramTarget config) targets)
     _ -> pure ()
  where
   sendToRoom info roomKey =
@@ -252,6 +252,10 @@ messageBlobs = concatMap collect . NonEmpty.toList
     BlockQuote body -> messageBlobs body
     List items -> concatMap messageBlobs (NonEmpty.toList items)
     _ -> []
+
+enabledTelegramTarget :: TelegramConfig -> (Integer, Int) -> Bool
+enabledTelegramTarget config (chatId, _) =
+  enabledRoom config.initialRooms (PlatformKey "telegram" "room" (Text.pack (show chatId)))
 
 telegramRetractTargets :: BridgeContext timeline -> MessageId -> IO [(Integer, Int)]
 telegramRetractTargets context message = do

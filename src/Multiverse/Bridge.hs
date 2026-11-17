@@ -2,6 +2,7 @@ module Multiverse.Bridge
   ( Bridge (..)
   , BridgeContext (..)
   , InitialRoomMapping (..)
+  , enabledRoom
   , MappingStore (..)
   , RenderedMessage (..)
   , hasPlatformMapping
@@ -49,8 +50,12 @@ data MappingStore = MappingStore
 data InitialRoomMapping = InitialRoomMapping
   { platformKey :: PlatformKey
   , timelineRoom :: Maybe RoomId
+  , enable :: Bool
   }
   deriving (Eq, Show)
+
+enabledRoom :: [InitialRoomMapping] -> PlatformKey -> Bool
+enabledRoom mappings key = any (\mapping -> mapping.enable && mapping.platformKey == key) mappings
 
 data RenderedMessage = RenderedMessage
   { plainText :: Text
@@ -207,7 +212,7 @@ ensureInitialRoomsWith ::
   IO ()
 ensureInitialRoomsWith mappings context fetchRoomInfo writeBack = do
   logInfo context.logger ("ensuring " <> Text.pack (show (length mappings)) <> " initial room mappings")
-  mapM_ (ensureInitialRoom context fetchRoomInfo writeBack) mappings
+  mapM_ (ensureInitialRoom context fetchRoomInfo writeBack) (filter (.enable) mappings)
 
 ensureInitialRoom ::
   Timeline timeline =>

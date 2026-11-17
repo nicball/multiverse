@@ -140,6 +140,7 @@ initialRoomCodec platform =
   InitialRoomMapping
     <$> platformKeyCodec platform .= (.platformKey)
     <*> Toml.dioptional roomIdCodec .= (.timelineRoom)
+    <*> optionalWithDefault True (Toml.bool "enable") .= (.enable)
 
 platformKeyCodec :: Text -> TomlCodec PlatformKey
 platformKeyCodec platform =

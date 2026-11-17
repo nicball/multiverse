@@ -160,7 +160,7 @@ ensureUser manager context config matrixUserId = do
 configuredRoom :: MatrixConfig -> BridgeContext timeline -> Text -> IO (Maybe RoomId)
 configuredRoom config context matrixRoomId = do
   let platformKey = matrixRoomKey matrixRoomId
-  if platformKey `elem` map (.platformKey) config.initialRooms
+  if enabledRoom config.initialRooms platformKey
     then fmap RoomId <$> context.mappingStore.lookupTimelineId platformKey
     else pure Nothing
 
@@ -174,7 +174,7 @@ reflectEvent manager config context stored =
           alreadyMapped <- hasPlatformMapping context.mappingStore "matrix" stored.storedId
           unless alreadyMapped do
             roomKeys <- context.mappingStore.lookupPlatformKeys (roomEventId info.room)
-            let matrixRooms = filter ((== "matrix") . (.platform)) roomKeys
+            let matrixRooms = filter (enabledRoom config.initialRooms) roomKeys
             (profile, body) <- renderMatrixRelayMessage context info
             replyTo <- matrixReplyEventId context info.replyTo
             mapM_ (sendToRoom profile body replyTo) matrixRooms
@@ -185,7 +185,7 @@ reflectEvent manager config context stored =
           alreadyMapped <- hasPlatformMapping context.mappingStore "matrix" stored.storedId
           unless alreadyMapped do
             targets <- matrixRetractTargets context message
-            mapM_ redactInRoom targets
+            mapM_ redactInRoom (filter (enabledRoom config.initialRooms . matrixRoomKey . fst) targets)
     _ -> pure ()
  where
   sendToRoom profile body replyTo roomKey = do

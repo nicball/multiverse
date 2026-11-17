@@ -10,6 +10,7 @@ poll_timeout_seconds = 30
 
 [[telegram.rooms]]
 platform_key = "-1001234567890"
+enable = true
 # timeline_room = "existing-timeline-room-event-id"
 
 [matrix]
@@ -20,6 +21,7 @@ sync_timeout_ms = 30000
 
 [[matrix.rooms]]
 platform_key = "!roomid:matrix.example.org"
+enable = true
 # timeline_room = "existing-timeline-room-event-id"
 
 [qq]
@@ -30,4 +32,5 @@ mapping_db = "qq-mapping.sqlite3"
 
 [[qq.rooms]]
 platform_key = "123456789"
+enable = true
 # timeline_room = "existing-timeline-room-event-id"

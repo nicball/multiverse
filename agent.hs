@@ -116,6 +116,7 @@ data MappingStore = MappingStore
 data InitialRoomMapping = InitialRoomMapping
   { platformKey :: PlatformKey
   , timelineRoom :: Maybe RoomId
+  , enable :: Bool
   }
 
 data Logger

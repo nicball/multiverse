@@ -164,7 +164,7 @@ observeQQRetraction config context event =
 configuredRoom :: QQConfig -> BridgeContext timeline -> Text -> IO (Maybe RoomId)
 configuredRoom config context groupId = do
   let key = qqRoomKey groupId
-  if key `elem` map (.platformKey) config.initialRooms
+  if enabledRoom config.initialRooms key
     then fmap RoomId <$> context.mappingStore.lookupTimelineId key
     else pure Nothing
 
@@ -302,14 +302,12 @@ reflectQQEvent manager config context stored =
           logDebug context.logger ("qq not reflecting own-origin event " <> renderEventId stored.storedId)
       | otherwise -> do
           roomKeys <- context.mappingStore.lookupPlatformKeys (roomEventId info.room)
-          mapM_ (sendToQQRoom manager config context stored info) (filter isQQRoom roomKeys)
+          mapM_ (sendToQQRoom manager config context stored info) (filter (enabledRoom config.initialRooms) roomKeys)
     RetractMessage message
       | stored.storedEvent.platformKey.platform == "qq" ->
           logDebug context.logger ("qq not reflecting own-origin retraction " <> renderEventId stored.storedId)
       | otherwise -> retractQQMessages manager config context stored message
     _ -> pure ()
- where
-  isQQRoom key = key.platform == "qq" && key.entityType == "room"
 
 sendToQQRoom :: Timeline timeline => Manager -> QQConfig -> BridgeContext timeline -> StoredEvent -> SendMessageInfo -> PlatformKey -> IO ()
 sendToQQRoom manager config context stored info roomKey =
@@ -355,7 +353,7 @@ retractQQMessages manager config context stored message = do
   case fmap (.storedEvent.content) original of
     Just (SendMessage _) -> do
       keys <- context.mappingStore.lookupPlatformKeys (messageEventId message)
-      mapM_ (deleteQQMessage manager config context stored) (mapMaybe qqMessageTarget keys)
+      mapM_ (deleteQQMessage manager config context stored) (filter (enabledRoom config.initialRooms . qqRoomKey . fst) (mapMaybe qqMessageTarget keys))
     _ -> pure ()
 
 qqMessageTarget :: PlatformKey -> Maybe (Text, Text)
