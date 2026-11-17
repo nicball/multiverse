@@ -21,3 +21,13 @@ sync_timeout_ms = 30000
 [[matrix.rooms]]
 platform_key = "!roomid:matrix.example.org"
 # timeline_room = "existing-timeline-room-event-id"
+
+[qq]
+api_url = "http://127.0.0.1:3000"
+websocket_url = "ws://127.0.0.1:6700/event"
+access_token = "replace-me"
+mapping_db = "qq-mapping.sqlite3"
+
+[[qq.rooms]]
+platform_key = "123456789"
+# timeline_room = "existing-timeline-room-event-id"

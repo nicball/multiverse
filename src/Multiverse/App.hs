@@ -14,6 +14,7 @@ import Multiverse.Bridge
 import Multiverse.Config
 import Multiverse.Log
 import Multiverse.Matrix
+import Multiverse.QQ
 import Multiverse.SQLite qualified as SQLite
 import Multiverse.Telegram
 import Multiverse.Types
@@ -29,7 +30,8 @@ run = do
   logInfo logger ("timeline opened " <> Text.pack config.timelineDb)
   telegramStarted <- maybeStartTelegram configPath configRef logger timeline config.telegram
   matrixStarted <- maybeStartMatrix configPath configRef logger timeline config.matrix
-  if telegramStarted || matrixStarted
+  qqStarted <- maybeStartQQ configPath configRef logger timeline config.qq
+  if telegramStarted || matrixStarted || qqStarted
     then forever (threadDelay maxBound)
     else logWarn logger "no bridges configured"
 
@@ -71,6 +73,27 @@ maybeStartMatrix configPath configRef logger timeline matrixConfig =
       startComponent logger "matrix observer" (bridge.observe context)
       startComponent logger "matrix reflector" (bridge.reflect context)
       logInfo logger ("matrix bridge started with mapping db " <> Text.pack bridgeConfig.mappingDb)
+      pure True
+    Nothing -> pure False
+
+maybeStartQQ :: FilePath -> IORef AppConfig -> Logger -> SQLite.SQLiteTimeline -> Maybe QQBridgeConfig -> IO Bool
+maybeStartQQ configPath configRef logger timeline qqConfig =
+  case qqConfig of
+    Just bridgeConfig -> do
+      mappingStore <- openMappingStore bridgeConfig.mappingDb
+      let qqRuntimeConfig =
+            QQConfig
+              { apiUrl = bridgeConfig.apiUrl
+              , websocketUrl = bridgeConfig.websocketUrl
+              , accessToken = bridgeConfig.accessToken
+              , initialRooms = bridgeConfig.initialRooms
+              , noteInitialRoom = writeInitialRoom configPath configRef "qq"
+              }
+          bridge = qqBridge qqRuntimeConfig
+          context = BridgeContext {timeline, mappingStore, logger}
+      startComponent logger "qq observer" (bridge.observe context)
+      startComponent logger "qq reflector" (bridge.reflect context)
+      logInfo logger ("qq bridge started with mapping db " <> Text.pack bridgeConfig.mappingDb)
       pure True
     Nothing -> pure False
 

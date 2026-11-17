@@ -2,6 +2,7 @@ module Multiverse.Config
   ( AppConfig (..)
   , MatrixBridgeConfig (..)
   , TelegramBridgeConfig (..)
+  , QQBridgeConfig (..)
   , loadConfig
   , writeConfig
   , setInitialRoom
@@ -22,6 +23,7 @@ data AppConfig = AppConfig
   , logLevel :: LogLevel
   , telegram :: Maybe TelegramBridgeConfig
   , matrix :: Maybe MatrixBridgeConfig
+  , qq :: Maybe QQBridgeConfig
   }
   deriving (Show)
 
@@ -38,6 +40,15 @@ data MatrixBridgeConfig = MatrixBridgeConfig
   , accessToken :: Text
   , mappingDb :: FilePath
   , syncTimeoutMs :: Int
+  , initialRooms :: [InitialRoomMapping]
+  }
+  deriving (Eq, Show)
+
+data QQBridgeConfig = QQBridgeConfig
+  { apiUrl :: Text
+  , websocketUrl :: Text
+  , accessToken :: Text
+  , mappingDb :: FilePath
   , initialRooms :: [InitialRoomMapping]
   }
   deriving (Eq, Show)
@@ -65,6 +76,7 @@ defaultConfig =
     , logLevel = InfoS
     , telegram = Nothing
     , matrix = Nothing
+    , qq = Nothing
     }
 
 setInitialRoom :: Text -> PlatformKey -> RoomId -> AppConfig -> AppConfig
@@ -72,6 +84,7 @@ setInitialRoom bridgeName platformKey room config =
   case bridgeName of
     "telegram" -> config {telegram = updateTelegram <$> config.telegram}
     "matrix" -> config {matrix = updateMatrix <$> config.matrix}
+    "qq" -> config {qq = updateQQ <$> config.qq}
     _ -> config
  where
   updateTelegram :: TelegramBridgeConfig -> TelegramBridgeConfig
@@ -80,6 +93,9 @@ setInitialRoom bridgeName platformKey room config =
   updateMatrix :: MatrixBridgeConfig -> MatrixBridgeConfig
   updateMatrix (MatrixBridgeConfig homeserver accessToken mappingDb syncTimeoutMs initialRooms) =
     MatrixBridgeConfig homeserver accessToken mappingDb syncTimeoutMs (map updateRoom initialRooms)
+  updateQQ :: QQBridgeConfig -> QQBridgeConfig
+  updateQQ (QQBridgeConfig apiUrl websocketUrl accessToken mappingDb initialRooms) =
+    QQBridgeConfig apiUrl websocketUrl accessToken mappingDb (map updateRoom initialRooms)
   updateRoom mapping
     | mapping.platformKey == platformKey = mapping {timelineRoom = Just room}
     | otherwise = mapping
@@ -91,6 +107,7 @@ appConfigCodec =
     <*> optionalWithDefault InfoS (Toml.table logLevelCodec "logging") .= (.logLevel)
     <*> Toml.dioptional (Toml.table telegramConfigCodec "telegram") .= (.telegram)
     <*> Toml.dioptional (Toml.table matrixConfigCodec "matrix") .= (.matrix)
+    <*> Toml.dioptional (Toml.table qqConfigCodec "qq") .= (.qq)
 
 telegramConfigCodec :: TomlCodec TelegramBridgeConfig
 telegramConfigCodec =
@@ -108,6 +125,15 @@ matrixConfigCodec =
     <*> optionalWithDefault "matrix-mapping.sqlite3" (filePathCodec "mapping_db") .= (.mappingDb)
     <*> optionalWithDefault 30000 (Toml.int "sync_timeout_ms") .= (.syncTimeoutMs)
     <*> optionalWithDefault [] (Toml.list (initialRoomCodec "matrix") "rooms") .= (.initialRooms)
+
+qqConfigCodec :: TomlCodec QQBridgeConfig
+qqConfigCodec =
+  QQBridgeConfig
+    <$> Toml.text "api_url" .= (.apiUrl)
+    <*> Toml.text "websocket_url" .= (.websocketUrl)
+    <*> Toml.text "access_token" .= (.accessToken)
+    <*> optionalWithDefault "qq-mapping.sqlite3" (filePathCodec "mapping_db") .= (.mappingDb)
+    <*> optionalWithDefault [] (Toml.list (initialRoomCodec "qq") "rooms") .= (.initialRooms)
 
 initialRoomCodec :: Text -> TomlCodec InitialRoomMapping
 initialRoomCodec platform =

@@ -43,7 +43,7 @@ data InlineTextPart
   = Bold InlineText
   | Italic InlineText
   | Link InlineText Text
-  | Mention InlineText UserId
+  | Mention InlineText (Either UserId RoomId)
   | InlineQuote InlineText
   | Plain Text
   deriving (Eq, Ord, Read, Show)
@@ -134,7 +134,12 @@ inlinePartReferences = \case
   Bold inline -> inlineReferences inline
   Italic inline -> inlineReferences inline
   Link inline _ -> inlineReferences inline
-  Mention inline user -> userEventId user : inlineReferences inline
+  Mention inline target ->
+    (case target of
+      Left user -> [userEventId user]
+      Right room -> [roomEventId room]
+    )
+      <> inlineReferences inline
   InlineQuote inline -> inlineReferences inline
   Plain _ -> []
 
