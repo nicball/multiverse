@@ -9,12 +9,14 @@ import Control.Concurrent (threadDelay)
 import Control.Exception (try)
 import Data.ByteString.Char8 qualified as ByteString.Char8
 import Data.ByteString.Lazy qualified as LByteString
+import Data.Char (toLower)
+import Data.Int (Int64)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text
 import Data.Text.Encoding.Error (lenientDecode)
 import Network.HTTP.Client
-import Network.HTTP.Types (statusCode)
+import Network.HTTP.Types (hContentType, statusCode)
 import Multiverse.Log
 
 data HttpLogOptions = HttpLogOptions
@@ -64,7 +66,7 @@ requestSummary options request =
     <> " "
     <> requestUrl options request
     <> " request_body="
-    <> requestBodyPreview request.requestBody
+    <> requestBodyPreview request
     <> options.requestSuffix
 
 responseSummary :: HttpLogOptions -> Request -> Response LByteString.ByteString -> Text
@@ -75,21 +77,60 @@ responseSummary options request response =
     <> " status="
     <> Text.pack (show (statusCode response.responseStatus))
     <> " response_body="
-    <> truncateBody response.responseBody
+    <> bodyPreview (lookup hContentType response.responseHeaders) response.responseBody
 
-requestBodyPreview :: RequestBody -> Text
-requestBodyPreview = \case
-  RequestBodyLBS body -> truncateBody body
-  RequestBodyBS body -> truncateBody (LByteString.fromStrict body)
-  RequestBodyBuilder size _ -> "builder:" <> Text.pack (show size) <> " bytes"
-  RequestBodyStream size _ -> "stream:" <> Text.pack (show size) <> " bytes"
-  RequestBodyStreamChunked _ -> "chunked"
-  RequestBodyIO _ -> "io"
+requestBodyPreview :: Request -> Text
+requestBodyPreview request =
+  case request.requestBody of
+    RequestBodyLBS body -> bodyPreview contentType body
+    RequestBodyBS body -> bodyPreview contentType (LByteString.fromStrict body)
+    RequestBodyBuilder size _ -> "builder:" <> Text.pack (show size) <> " bytes"
+    RequestBodyStream size _ -> "stream:" <> Text.pack (show size) <> " bytes"
+    RequestBodyStreamChunked _ -> "chunked"
+    RequestBodyIO _ -> "io"
+ where
+  contentType = lookup hContentType request.requestHeaders
 
-truncateBody :: LByteString.ByteString -> Text
-truncateBody body =
-  let text = Text.decodeUtf8With lenientDecode (LByteString.toStrict (LByteString.take 512 body))
-   in if LByteString.length body > 512 then text <> "...<truncated>" else text
+-- | Never render binary payloads. Textual payloads are truncated and any
+-- embedded base64 blob data (for example OneBot's @base64://@ file fields)
+-- is redacted before it reaches the logs.
+bodyPreview :: Maybe ByteString.Char8.ByteString -> LByteString.ByteString -> Text
+bodyPreview contentType body
+  | LByteString.null body = "empty"
+  | not (isTextualContentType contentType) = binarySummary body
+  | looksBinary text = binarySummary body
+  | otherwise =
+      redactBlobData text
+        <> if LByteString.length body > previewLimit then "...<truncated>" else ""
+ where
+  text = Text.decodeUtf8With lenientDecode (LByteString.toStrict (LByteString.take previewLimit body))
+
+previewLimit :: Int64
+previewLimit = 512
+
+binarySummary :: LByteString.ByteString -> Text
+binarySummary body = "binary:" <> Text.pack (show (LByteString.length body)) <> " bytes"
+
+isTextualContentType :: Maybe ByteString.Char8.ByteString -> Bool
+isTextualContentType Nothing = False
+isTextualContentType (Just raw) =
+  let contentType = ByteString.Char8.map toLower raw
+   in "text/" `ByteString.Char8.isPrefixOf` contentType
+        || "application/json" `ByteString.Char8.isInfixOf` contentType
+        || "application/xml" `ByteString.Char8.isInfixOf` contentType
+        || "application/x-www-form-urlencoded" `ByteString.Char8.isPrefixOf` contentType
+
+looksBinary :: Text -> Bool
+looksBinary = Text.any (== '\NUL')
+
+redactBlobData :: Text -> Text
+redactBlobData text = redactAfter "base64://" (redactAfter "base64," text)
+ where
+  redactAfter marker value =
+    let (before, rest) = Text.breakOn marker value
+     in if Text.null rest
+          then value
+          else before <> marker <> "<redacted>"
 
 requestUrl :: HttpLogOptions -> Request -> Text
 requestUrl options request =
