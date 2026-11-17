@@ -20,6 +20,7 @@ module Multiverse.Bridge
   , hasTextContent
   , sniffExtension
   , sniffMimeType
+  , isAnimatedImage
   )
 where
 
@@ -206,6 +207,12 @@ sniffExtension = fst . sniffType
 
 sniffMimeType :: ByteString -> Text
 sniffMimeType = snd . sniffType
+
+-- | GIF always animates; WebP only when it carries an @ANIM@ chunk.
+isAnimatedImage :: ByteString -> Bool
+isAnimatedImage bytes =
+  "GIF8" `ByteString.isPrefixOf` bytes
+    || ("RIFF" `ByteString.isPrefixOf` bytes && "ANIM" `ByteString.isInfixOf` ByteString.take 512 bytes)
 
 sniffType :: ByteString -> (Text, Text)
 sniffType bytes

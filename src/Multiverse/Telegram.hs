@@ -354,13 +354,14 @@ telegramEditText logger manager config chatId messageId text = do
 
 sendMappedMedia :: BridgeContext timeline -> Manager -> TelegramConfig -> Integer -> Maybe Int -> BlobType -> BlobId -> ByteString.ByteString -> IO (Either String TelegramMessage)
 sendMappedMedia context manager config chatId replyTo kind blobId bytes = do
-  let stateKey = telegramBlobStateKey kind blobId
-      upload = telegramSendMedia context.logger manager config chatId replyTo kind bytes
+  let method = telegramMediaMethod kind bytes
+      stateKey = telegramBlobStateKey method blobId
+      upload = telegramSendMedia context.logger manager config chatId replyTo method bytes
   existing <- context.mappingStore.lookupState stateKey
   result <- case existing of
     Nothing -> upload
     Just fileId -> do
-      sent <- telegramSendMediaId context.logger manager config chatId replyTo kind fileId
+      sent <- telegramSendMediaId context.logger manager config chatId replyTo method fileId
       case sent of
         Right message -> pure (Right message)
         Left err -> do
@@ -375,20 +376,23 @@ sendMappedMedia context manager config chatId replyTo kind blobId bytes = do
     Left _ -> pure ()
   pure result
 
-telegramBlobStateKey :: BlobType -> BlobId -> Text
-telegramBlobStateKey kind blobId =
-  "telegram.blob." <> renderEventId (blobEventId blobId) <> "." <> Text.pack (show kind)
+telegramBlobStateKey :: (Text, ByteString.ByteString) -> BlobId -> Text
+telegramBlobStateKey (methodName, _) blobId =
+  "telegram.blob." <> renderEventId (blobEventId blobId) <> "." <> methodName
 
-telegramMediaMethod :: BlobType -> (Text, ByteString.ByteString)
-telegramMediaMethod = \case
-  ImageBlob -> ("sendPhoto", "photo")
+-- | Animated images have to go through @sendAnimation@; @sendPhoto@ would
+-- flatten them to a still frame.
+telegramMediaMethod :: BlobType -> ByteString.ByteString -> (Text, ByteString.ByteString)
+telegramMediaMethod kind bytes = case kind of
+  ImageBlob
+    | isAnimatedImage bytes -> ("sendAnimation", "animation")
+    | otherwise -> ("sendPhoto", "photo")
   VideoBlob -> ("sendVideo", "video")
   AudioBlob -> ("sendAudio", "audio")
   FileBlob -> ("sendDocument", "document")
 
-telegramSendMediaId :: Logger -> Manager -> TelegramConfig -> Integer -> Maybe Int -> BlobType -> Text -> IO (Either String TelegramMessage)
-telegramSendMediaId logger manager config chatId replyTo kind fileId = do
-  let (methodName, fieldName) = telegramMediaMethod kind
+telegramSendMediaId :: Logger -> Manager -> TelegramConfig -> Integer -> Maybe Int -> (Text, ByteString.ByteString) -> Text -> IO (Either String TelegramMessage)
+telegramSendMediaId logger manager config chatId replyTo (methodName, fieldName) fileId = do
   request0 <- parseRequest (Text.unpack ("https://api.telegram.org/bot" <> config.botToken <> "/" <> methodName))
   let request = urlEncodedBody
         ([("chat_id", ByteString.Char8.pack (show chatId)), (fieldName, Text.encodeUtf8 fileId)]
@@ -397,10 +401,9 @@ telegramSendMediaId logger manager config chatId replyTo kind fileId = do
   response <- loggedHttp logger request manager
   pure (decodeResponse response)
 
-telegramSendMedia :: Logger -> Manager -> TelegramConfig -> Integer -> Maybe Int -> BlobType -> ByteString.ByteString -> IO (Either String TelegramMessage)
-telegramSendMedia logger manager config chatId replyTo kind bytes = do
-  let (methodName, fieldName) = telegramMediaMethod kind
-      boundary = chooseBoundary "multiverse-telegram" bytes
+telegramSendMedia :: Logger -> Manager -> TelegramConfig -> Integer -> Maybe Int -> (Text, ByteString.ByteString) -> ByteString.ByteString -> IO (Either String TelegramMessage)
+telegramSendMedia logger manager config chatId replyTo (methodName, fieldName) bytes = do
+  let boundary = chooseBoundary "multiverse-telegram" bytes
       field name value = "--" <> boundary <> "\r\nContent-Disposition: form-data; name=\"" <> name <> "\"\r\n\r\n" <> value <> "\r\n"
       body = ByteString.concat
         ( [field "chat_id" (ByteString.Char8.pack (show chatId))]
@@ -539,14 +542,21 @@ telegramMessageBody manager config context message = do
   importMedia (kind, fileId) = do
     let key = PlatformKey "telegram" "blob" fileId
     existing <- context.mappingStore.lookupTimelineId key
+    content <- case existing of
+      Just blobEvent -> do
+        stored <- getEvent context.timeline blobEvent
+        case fmap (.storedEvent.content) stored of
+          Just (CreateBlob bytes) -> pure bytes
+          _ -> telegramDownloadFile context.logger manager config fileId
+      Nothing -> telegramDownloadFile context.logger manager config fileId
     blobId <- case existing of
       Just value -> pure value
       Nothing -> do
-        bytes <- telegramDownloadFile context.logger manager config fileId
-        submitted <- submitMapped context Event {platformKey = key, content = CreateBlob bytes}
+        submitted <- submitMapped context Event {platformKey = key, content = CreateBlob content}
         either (fail . show) pure submitted
     let blob = BlobId blobId
-    context.mappingStore.setState (telegramBlobStateKey kind blob) fileId
+        method = telegramMediaMethod kind content
+    context.mappingStore.setState (telegramBlobStateKey method blob) fileId
     pure (kind, blob)
 
 telegramDownloadFile :: Logger -> Manager -> TelegramConfig -> Text -> IO ByteString.ByteString
@@ -660,7 +670,12 @@ instance FromJSON TelegramMessage where
     voice <- obj .:? "voice"
     document <- obj .:? "document"
     sticker <- obj .:? "sticker"
-    let fileId (TelegramMedia value) = value
+    let fileId (TelegramMedia value _) = value
+        animationIsImage = case animation of
+          Just (TelegramMedia _ (Just mimeType)) -> "image/" `Text.isPrefixOf` mimeType
+          _ -> False
+        imageAnimation = if animationIsImage then animation else Nothing
+        videoAnimation = if animationIsImage then Nothing else animation
     TelegramMessage
       <$> obj .: "message_id"
       <*> obj .: "from"
@@ -668,14 +683,15 @@ instance FromJSON TelegramMessage where
       <*> ((<|>) <$> obj .:? "text" <*> obj .:? "caption")
       <*> ((maybe [] id) <$> ((<|>) <$> obj .:? "entities" <*> obj .:? "caption_entities"))
       <*> obj .:? "reply_to_message"
-      <*> pure ((ImageBlob,) . fileId <$> (photo <|> sticker) <|> (VideoBlob,) . fileId <$> (video <|> videoNote <|> animation) <|> (AudioBlob,) . fileId <$> (audio <|> voice) <|> (FileBlob,) . fileId <$> document)
+      <*> pure ((ImageBlob,) . fileId <$> (photo <|> sticker <|> imageAnimation) <|> (VideoBlob,) . fileId <$> (video <|> videoNote <|> videoAnimation) <|> (AudioBlob,) . fileId <$> (audio <|> voice) <|> (FileBlob,) . fileId <$> document)
       <*> obj .:? "new_chat_members" .!= []
       <*> obj .:? "left_chat_member"
 
-newtype TelegramMedia = TelegramMedia Text
+data TelegramMedia = TelegramMedia Text (Maybe Text)
 
 instance FromJSON TelegramMedia where
-  parseJSON = withObject "TelegramMedia" \obj -> TelegramMedia <$> obj .: "file_id"
+  parseJSON = withObject "TelegramMedia" \obj ->
+    TelegramMedia <$> obj .: "file_id" <*> obj .:? "mime_type"
 
 data TelegramEntity = TelegramEntity
   { entityType :: Text

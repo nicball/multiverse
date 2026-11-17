@@ -295,19 +295,19 @@ decodeQQSegment context index segment = do
     Just "at" -> (, Nothing) <$> decodeQQMention context segmentData
     Just "reply" -> pure ([], valueTextField "id" segmentData)
     Just "image" -> do
-      blob <- importQQSegmentBlob context index segmentData
+      blob <- importQQSegmentBlob context index (segmentMediaUrl segmentData)
       let flash = valueTextField "type" segmentData == Just "flash"
           parts = qqBlobParts ImageBlob blob "image"
       pure ((if flash then oneTextPart "[flash]" else []) <> parts, Nothing)
     Just "mface" -> do
-      blob <- importQQSegmentBlob context index segmentData
+      blob <- importQQSegmentBlob context index (mfaceUrl segmentData)
       let label = fromMaybe "mface" (valueTextField "summary" segmentData)
       pure (qqBlobParts ImageBlob blob label, Nothing)
     Just "record" -> decodeQQTypedBlob context index AudioBlob "record" segmentData
     Just "video" -> decodeQQTypedBlob context index VideoBlob "video" segmentData
     Just "cardimage" -> decodeQQTypedBlob context index ImageBlob "cardimage" segmentData
     Just "file" -> do
-      blob <- importQQSegmentBlob context index segmentData
+      blob <- importQQSegmentBlob context index (segmentMediaUrl segmentData)
       let label =
             fromMaybe
               "file"
@@ -337,7 +337,7 @@ decodeQQSegment context index segment = do
 
 decodeQQTypedBlob :: Timeline timeline => QQContext timeline -> Int -> BlobType -> Text -> Value -> IO ([MessagePart], Maybe Text)
 decodeQQTypedBlob context index blobType label segmentData = do
-  blob <- importQQSegmentBlob context index segmentData
+  blob <- importQQSegmentBlob context index (segmentMediaUrl segmentData)
   pure (qqBlobParts blobType blob label, Nothing)
 
 qqBlobParts :: BlobType -> Maybe BlobId -> Text -> [MessagePart]
@@ -354,17 +354,17 @@ decodeQQMention context segmentData =
       pure (oneInlinePart (Mention (Plain ("@" <> name) :| []) (Left user)))
     Nothing -> pure (oneTextPart "[mention]")
 
-importQQSegmentBlob :: Timeline timeline => QQContext timeline -> Int -> Value -> IO (Maybe BlobId)
-importQQSegmentBlob context index segmentData =
-  case firstHttpUrl [valueTextField "url" segmentData, valueTextField "file" segmentData, valueTextField "path" segmentData] of
+importQQSegmentBlob :: Timeline timeline => QQContext timeline -> Int -> Maybe Text -> IO (Maybe BlobId)
+importQQSegmentBlob context index mediaUrl =
+  case mediaUrl of
     Nothing -> pure Nothing
-    Just mediaUrl -> do
+    Just url -> do
       let blobKey = qqBlobKey context.blobPrefix index
       existing <- context.bridge.mappingStore.lookupTimelineId blobKey
       case existing of
         Just eventId -> pure (Just (BlobId eventId))
         Nothing -> do
-          bytes <- downloadQQMedia context.manager context.bridge.logger mediaUrl
+          bytes <- downloadQQMedia context.manager context.bridge.logger url
           case bytes of
             Nothing -> pure Nothing
             Just content -> do
@@ -375,6 +375,32 @@ importQQSegmentBlob context index segmentData =
                 Left err -> do
                   logError context.bridge.logger ("qq media submit error: " <> Text.pack (show err))
                   pure Nothing
+
+segmentMediaUrl :: Value -> Maybe Text
+segmentMediaUrl segmentData =
+  firstHttpUrl
+    [ valueTextField "url" segmentData
+    , valueTextField "file" segmentData
+    , valueTextField "path" segmentData
+    ]
+
+-- | Market stickers usually arrive without a url, but the emoji id addresses
+-- the animated asset on the QQ sticker CDN directly.
+mfaceUrl :: Value -> Maybe Text
+mfaceUrl segmentData =
+  case segmentMediaUrl segmentData of
+    Just url -> Just url
+    Nothing -> case valueTextField "emoji_id" segmentData of
+      Just emojiId
+        | Text.length emojiId > 2 ->
+            Just
+              ( "https://gxh.vip.qq.com/club/item/parcel/item/"
+                  <> Text.take 2 emojiId
+                  <> "/"
+                  <> emojiId
+                  <> "/raw300.gif"
+              )
+      _ -> Nothing
 
 firstHttpUrl :: [Maybe Text] -> Maybe Text
 firstHttpUrl = firstJust . map (>>= httpUrl)
