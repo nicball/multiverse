@@ -40,7 +40,7 @@ Network errors should not permanently kill bridge components. HTTP requests shou
 
 Bridges must avoid reflecting events originating from their own platform, even if the platform user that emitted the event is not registered in the timeline yet. This should be enforced from the event origin platform, not only by checking bridge mappings, because mapping insertion can race with reflection.
 
-The telegram bridge uses bot api. The QQ bridge is not planned for now.
+The telegram bridge uses bot api. The QQ bridge is supported and connects to an externally managed NapCat server via OneBot 11. Multiverse does not install, configure, or supervise NapCat; configure its HTTP server and forward WebSocket server separately.
 
 # Project Rules
 

@@ -10,6 +10,7 @@ module Multiverse.Event
   , RoomInfo (..)
   , eventId
   , eventReferences
+  , blobPlatformKey
   )
 where
 
@@ -143,21 +144,23 @@ inlinePartReferences = \case
   InlineQuote inline -> inlineReferences inline
   Plain _ -> []
 
+blobPlatformKey :: ByteString -> PlatformKey
+blobPlatformKey bytes = PlatformKey "multiverse" "blob" (sha256HexBytes bytes)
+
 showContent :: EventContent -> Text
 showContent = \case
-  CreateBlob bytes -> "CreateBlob:" <> bytesText bytes
+  CreateBlob bytes -> "CreateBlob:" <> sha256HexBytes bytes
   other -> Text.pack (show other)
 
-bytesText :: ByteString -> Text
-bytesText = Text.pack . show . ByteString.unpack
-
 sha256Hex :: Text -> Text
-sha256Hex =
+sha256Hex = sha256HexBytes . Text.encodeUtf8
+
+sha256HexBytes :: ByteString -> Text
+sha256HexBytes =
   Text.pack
     . concatMap byteHex
     . ByteString.unpack
     . SHA256.hash
-    . Text.encodeUtf8
 
 byteHex :: Word8 -> String
 byteHex byte =

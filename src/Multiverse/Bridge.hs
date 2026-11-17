@@ -1,7 +1,6 @@
 module Multiverse.Bridge
   ( Bridge (..)
-  , BridgeContext (..)
-  , InitialRoomMapping (..)
+  , BridgeRuntime (..)
   , enabledRoom
   , MappingStore (..)
   , RenderedMessage (..)
@@ -12,9 +11,10 @@ module Multiverse.Bridge
   , ensureRoomMembership
   , submitMapped
   , submitMessageMapped
+  , submitBlob
   , openMappingStore
   , ensureInitialRooms
-  , ensureInitialRoomsWith
+  , startBridge
   , textBody
   , messageBlobs
   , hasTextContent
@@ -24,6 +24,9 @@ module Multiverse.Bridge
   )
 where
 
+import Control.Concurrent (forkIO, threadDelay)
+import Control.Exception (SomeException, try)
+import Control.Monad (forever, void)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as ByteString
 import Data.List.NonEmpty (NonEmpty ((:|)), nonEmpty, toList)
@@ -31,22 +34,38 @@ import Data.Text (Text)
 import Data.Text qualified as Text
 import Database.SQLite.Simple
 import Text.Read (readMaybe)
+import Multiverse.Config (InitialRoomMapping (..))
 import Multiverse.Event hiding (eventId)
 import Multiverse.Log
 import Multiverse.Timeline
 import Multiverse.Types
 
-data Bridge timeline = Bridge
+data Bridge = Bridge
   { bridgeName :: Text
-  , observe :: BridgeContext timeline -> IO ()
-  , reflect :: BridgeContext timeline -> IO ()
+  , observe :: IO ()
+  , reflect :: IO ()
   }
 
-data BridgeContext timeline = BridgeContext
+data BridgeRuntime timeline = BridgeRuntime
   { timeline :: timeline
-  , mappingStore :: MappingStore
   , logger :: Logger
   }
+
+startBridge :: Logger -> Bridge -> IO ()
+startBridge logger bridge = do
+  startComponent logger (bridge.bridgeName <> " observer") bridge.observe
+  startComponent logger (bridge.bridgeName <> " reflector") bridge.reflect
+
+startComponent :: Logger -> Text -> IO () -> IO ()
+startComponent logger name component =
+  void (forkIO (forever runOnce))
+ where
+  runOnce = do
+    result <- try component :: IO (Either SomeException ())
+    case result of
+      Left err -> logError logger (name <> " crashed, restarting: " <> Text.pack (show err))
+      Right () -> logWarn logger (name <> " stopped, restarting")
+    threadDelay 5000000
 
 data MappingStore = MappingStore
   { lookupTimelineId :: PlatformKey -> IO (Maybe EventId)
@@ -56,13 +75,6 @@ data MappingStore = MappingStore
   , setState :: Text -> Text -> IO ()
   , closeMappingStore :: IO ()
   }
-
-data InitialRoomMapping = InitialRoomMapping
-  { platformKey :: PlatformKey
-  , timelineRoom :: Maybe RoomId
-  , enable :: Bool
-  }
-  deriving (Eq, Show)
 
 enabledRoom :: [InitialRoomMapping] -> PlatformKey -> Bool
 enabledRoom mappings key = any (\mapping -> mapping.enable && mapping.platformKey == key) mappings
@@ -75,9 +87,9 @@ data RenderedMessage = RenderedMessage
 hasPlatformMapping :: MappingStore -> Text -> EventId -> IO Bool
 hasPlatformMapping store platform eventId = any ((== platform) . (.platform)) <$> store.lookupPlatformKeys eventId
 
-renderRelayedMessage :: Timeline timeline => BridgeContext timeline -> SendMessageInfo -> IO RenderedMessage
-renderRelayedMessage context info = do
-  user <- getUserInfo context.timeline info.sender (Just info.room)
+renderRelayedMessage :: Timeline timeline => timeline -> SendMessageInfo -> IO RenderedMessage
+renderRelayedMessage timeline info = do
+  user <- getUserInfo timeline info.sender (Just info.room)
   let sender = maybe "unknown" (.name) user
       body = renderMessageBody info.body
   pure
@@ -94,9 +106,9 @@ renderMessageBody message =
         , htmlText = Text.intercalate "\n" (map (.htmlText) parts)
         }
 
-renderNickChange :: Timeline timeline => BridgeContext timeline -> UserId -> Text -> IO RenderedMessage
-renderNickChange context user nick = do
-  userInfo <- getUserInfo context.timeline user Nothing
+renderNickChange :: Timeline timeline => timeline -> UserId -> Text -> IO RenderedMessage
+renderNickChange timeline user nick = do
+  userInfo <- getUserInfo timeline user Nothing
   let previous = maybe "unknown" (.name) userInfo
   pure
     RenderedMessage
@@ -237,44 +249,58 @@ sniffType bytes
 -- | Bridges learn about users lazily, so the first sighting of a user in a
 -- room also establishes their membership. The key is derived from the referenced
 -- events, so repeated sightings dedupe to the same event.
-ensureRoomMembership :: Timeline timeline => BridgeContext timeline -> Text -> RoomId -> UserId -> IO ()
-ensureRoomMembership context platform room user = do
+ensureRoomMembership :: Timeline timeline => Logger -> timeline -> MappingStore -> Text -> RoomId -> UserId -> IO ()
+ensureRoomMembership logger timeline mappingStore platform room user = do
   let platformKey =
         PlatformKey
           platform
           "join"
           (renderId (roomEventId room) <> "/" <> renderId (userEventId user))
-  result <- submitMapped context Event {platformKey, content = JoinRoom user room}
+  result <- submitMapped timeline mappingStore Event {platformKey, content = JoinRoom user room}
   case result of
-    Left err -> logError context.logger ("membership submit error: " <> Text.pack (show err))
+    Left err -> logError logger ("membership submit error: " <> Text.pack (show err))
     Right _ -> pure ()
  where
   renderId (EventId value) = value
 
-submitMapped :: Timeline timeline => BridgeContext timeline -> Event -> IO (Either SubmitError EventId)
-submitMapped context event = do
-  submitted <- submit context.timeline event
+submitMapped :: Timeline timeline => timeline -> MappingStore -> Event -> IO (Either SubmitError EventId)
+submitMapped timeline mappingStore event = do
+  submitted <- submit timeline event
   case submitted of
     Right eventId -> record eventId
     Left (ConflictingPlatformKey _ eventId) -> record eventId
     Left err -> pure (Left err)
  where
   record eventId = do
-    context.mappingStore.insertMapping event.platformKey eventId
+    mappingStore.insertMapping event.platformKey eventId
     pure (Right eventId)
 
-submitMessageMapped :: Timeline timeline => BridgeContext timeline -> Event -> IO (Either SubmitError EventId)
-submitMessageMapped context event =
+submitMessageMapped :: Timeline timeline => timeline -> MappingStore -> Event -> IO (Either SubmitError EventId)
+submitMessageMapped timeline mappingStore event =
   case event.content of
     SendMessage info -> do
-      submitted <- submitMapped context event
+      submitted <- submitMapped timeline mappingStore event
       case submitted of
         Left (MissingReferences missing)
           | Just repliedMessage <- info.replyTo
           , messageEventId repliedMessage `elem` missing ->
-              submitMapped context event {content = SendMessage info {replyTo = Nothing}}
+              submitMapped timeline mappingStore event {content = SendMessage info {replyTo = Nothing}}
         other -> pure other
-    _ -> submitMapped context event
+    _ -> submitMapped timeline mappingStore event
+
+-- | Blobs are timeline-owned: their event platform key is derived from the
+-- content, while the bridge mapping records the platform-local source key.
+submitBlob :: Timeline timeline => timeline -> MappingStore -> PlatformKey -> ByteString -> IO (Either SubmitError BlobId)
+submitBlob timeline mappingStore sourceKey bytes = do
+  submitted <- submit timeline Event {platformKey = blobPlatformKey bytes, content = CreateBlob bytes}
+  case submitted of
+    Right eventId -> record eventId
+    Left (ConflictingPlatformKey _ eventId) -> record eventId
+    Left err -> pure (Left err)
+ where
+  record eventId = do
+    mappingStore.insertMapping sourceKey eventId
+    pure (Right (BlobId eventId))
 
 openMappingStore :: FilePath -> IO MappingStore
 openMappingStore path = do
@@ -290,64 +316,57 @@ openMappingStore path = do
       , closeMappingStore = close connection
       }
 
-ensureInitialRooms :: Timeline timeline => [InitialRoomMapping] -> BridgeContext timeline -> IO ()
-ensureInitialRooms mappings context =
-  ensureInitialRoomsWith
-    mappings
-    context
-    (\mapping -> pure RoomInfo {name = mapping.platformKey.key, description = "", avatar = Nothing})
-    (\_ _ -> pure ())
-
-ensureInitialRoomsWith ::
+ensureInitialRooms ::
   Timeline timeline =>
-  [InitialRoomMapping] ->
-  BridgeContext timeline ->
+  Logger ->
+  timeline ->
+  MappingStore ->
   (InitialRoomMapping -> IO RoomInfo) ->
-  (InitialRoomMapping -> RoomId -> IO ()) ->
-  IO ()
-ensureInitialRoomsWith mappings context fetchRoomInfo writeBack = do
-  logInfo context.logger ("ensuring " <> Text.pack (show (length mappings)) <> " initial room mappings")
-  mapM_ (ensureInitialRoom context fetchRoomInfo writeBack) (filter (.enable) mappings)
+  [InitialRoomMapping] ->
+  IO [InitialRoomMapping]
+ensureInitialRooms logger timeline mappingStore fetchRoomInfo mappings = do
+  logInfo logger ("ensuring " <> Text.pack (show (length mappings)) <> " initial room mappings")
+  mapM ensureOne mappings
+ where
+  ensureOne mapping
+    | mapping.enable = ensureInitialRoom logger timeline mappingStore fetchRoomInfo mapping
+    | otherwise = pure mapping
 
 ensureInitialRoom ::
   Timeline timeline =>
-  BridgeContext timeline ->
+  Logger ->
+  timeline ->
+  MappingStore ->
   (InitialRoomMapping -> IO RoomInfo) ->
-  (InitialRoomMapping -> RoomId -> IO ()) ->
   InitialRoomMapping ->
-  IO ()
-ensureInitialRoom context fetchRoomInfo writeBack mapping = do
-  existing <- context.mappingStore.lookupTimelineId mapping.platformKey
+  IO InitialRoomMapping
+ensureInitialRoom logger timeline mappingStore fetchRoomInfo mapping = do
+  existing <- mappingStore.lookupTimelineId mapping.platformKey
   case existing of
-    Just _ ->
-      logDebug context.logger ("initial room already mapped " <> renderPlatformKey mapping.platformKey)
+    Just _ -> do
+      logDebug logger ("initial room already mapped " <> renderPlatformKey mapping.platformKey)
+      pure mapping
     Nothing ->
       case mapping.timelineRoom of
         Just room -> do
-          context.mappingStore.insertMapping mapping.platformKey (roomEventId room)
-          logInfo context.logger ("mapped initial room " <> renderPlatformKey mapping.platformKey)
+          mappingStore.insertMapping mapping.platformKey (roomEventId room)
+          logInfo logger ("mapped initial room " <> renderPlatformKey mapping.platformKey)
+          pure mapping
         Nothing -> do
           roomInfo <- fetchRoomInfo mapping
-          submitted <- submit context.timeline Event {platformKey = mapping.platformKey, content = CreateRoom roomInfo}
+          submitted <- submit timeline Event {platformKey = mapping.platformKey, content = CreateRoom roomInfo}
           case submitted of
             Right createdEventId -> do
-              recordInitialRoom context writeBack mapping createdEventId
-              logInfo context.logger ("created initial room " <> renderPlatformKey mapping.platformKey)
+              logInfo logger ("created initial room " <> renderPlatformKey mapping.platformKey)
+              record createdEventId
             Left (ConflictingPlatformKey _ existingEventId) -> do
-              recordInitialRoom context writeBack mapping existingEventId
-              logInfo context.logger ("recovered initial room mapping " <> renderPlatformKey mapping.platformKey)
+              logInfo logger ("recovered initial room mapping " <> renderPlatformKey mapping.platformKey)
+              record existingEventId
             Left err -> ioError (userError ("could not create initial room mapping: " <> show err))
-
-recordInitialRoom ::
-  BridgeContext timeline ->
-  (InitialRoomMapping -> RoomId -> IO ()) ->
-  InitialRoomMapping ->
-  EventId ->
-  IO ()
-recordInitialRoom context writeBack mapping mappedEventId = do
-  let room = RoomId mappedEventId
-  context.mappingStore.insertMapping mapping.platformKey mappedEventId
-  writeBack mapping room
+ where
+  record mappedEventId = do
+    mappingStore.insertMapping mapping.platformKey mappedEventId
+    pure mapping {timelineRoom = Just (RoomId mappedEventId)}
 
 renderPlatformKey :: PlatformKey -> Text
 renderPlatformKey platformKey =

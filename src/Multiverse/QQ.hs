@@ -1,6 +1,5 @@
 module Multiverse.QQ
-  ( QQConfig (..)
-  , qqBridge
+  ( qqBridge
   )
 where
 
@@ -27,6 +26,7 @@ import Network.HTTP.Types.Status (statusCode)
 import Network.WebSockets qualified as WebSockets
 import Text.Read (readMaybe)
 import Multiverse.Bridge
+import Multiverse.Config (InitialRoomMapping (..), QQBridgeConfig (..))
 import Multiverse.Event hiding (eventId)
 import Multiverse.HTTP (HttpLogOptions (..), defaultHttpLogOptions)
 import Multiverse.HTTP qualified as HTTP
@@ -34,45 +34,71 @@ import Multiverse.Log
 import Multiverse.Timeline
 import Multiverse.Types
 
-data QQConfig = QQConfig
-  { apiUrl :: Text
-  , websocketUrl :: Text
-  , accessToken :: Text
-  , initialRooms :: [InitialRoomMapping]
-  , noteInitialRoom :: InitialRoomMapping -> RoomId -> IO ()
+data Context timeline = Context
+  { timeline :: timeline
+  , mappingStore :: MappingStore
+  , logger :: Logger
+  , manager :: Manager
+  , config :: QQBridgeConfig
+  , endpoint :: QQEndpoint
   }
 
-qqBridge :: Timeline timeline => QQConfig -> Bridge timeline
-qqBridge config =
-  Bridge
-    { bridgeName = "qq"
-    , observe = observeQQ config
-    , reflect = reflectQQ config
-    }
+data QQEndpoint = QQEndpoint
+  { host :: String
+  , port :: Int
+  , path :: String
+  , headers :: WebSockets.Headers
+  }
 
-observeQQ :: Timeline timeline => QQConfig -> BridgeContext timeline -> IO ()
-observeQQ config context = do
+qqBridge :: Timeline timeline => BridgeRuntime timeline -> QQBridgeConfig -> IO (Bridge, QQBridgeConfig)
+qqBridge runtime initialConfig = do
+  mappingStore <- openMappingStore initialConfig.mappingDb
   manager <- newManager tlsManagerSettings
-  ensureInitialRoomsWith
-    config.initialRooms
-    context
-    (fetchInitialRoomInfo context.logger manager config)
-    config.noteInitialRoom
-  (host, port, path) <- parseWebSocketUrl config.websocketUrl
+  (host, port, path) <- parseWebSocketUrl initialConfig.websocketUrl
   let headers =
-        if Text.null config.accessToken
+        if Text.null initialConfig.accessToken
           then []
-          else [("Authorization", "Bearer " <> Text.Encoding.encodeUtf8 config.accessToken)]
+          else [("Authorization", "Bearer " <> Text.Encoding.encodeUtf8 initialConfig.accessToken)]
+      provisionalContext =
+        Context
+          { timeline = runtime.timeline
+          , mappingStore
+          , logger = runtime.logger
+          , manager
+          , config = initialConfig
+          , endpoint = QQEndpoint {host, port, path, headers}
+          }
+  initialRooms <-
+    ensureInitialRooms
+      runtime.logger
+      runtime.timeline
+      mappingStore
+      (fetchInitialRoomInfo provisionalContext)
+      initialConfig.initialRooms
+  let config = initialConfig {initialRooms}
+      context = provisionalContext {config}
+  logInfo runtime.logger ("qq bridge started with mapping db " <> Text.pack config.mappingDb)
+  pure
+    ( Bridge
+        { bridgeName = "qq"
+        , observe = observeQQ context
+        , reflect = reflectQQ context
+        }
+    , config
+    )
+
+observeQQ :: Timeline timeline => Context timeline -> IO ()
+observeQQ context =
   forever do
-    result <- try (runQQWebSocket host port path headers manager config context) :: IO (Either SomeException ())
+    result <- try (runQQWebSocket context) :: IO (Either SomeException ())
     case result of
       Left err -> logError context.logger ("qq observer disconnected: " <> Text.pack (show err))
       Right () -> logWarn context.logger "qq observer websocket closed"
     threadDelay 5000000
 
-runQQWebSocket :: Timeline timeline => String -> Int -> String -> WebSockets.Headers -> Manager -> QQConfig -> BridgeContext timeline -> IO ()
-runQQWebSocket host port path headers manager config context =
-  WebSockets.runClientWith host port path WebSockets.defaultConnectionOptions headers \connection -> do
+runQQWebSocket :: Timeline timeline => Context timeline -> IO ()
+runQQWebSocket context =
+  WebSockets.runClientWith context.endpoint.host context.endpoint.port context.endpoint.path WebSockets.defaultConnectionOptions context.endpoint.headers \connection -> do
     logInfo context.logger "qq observer connected"
     forever do
       payload <- WebSockets.receiveData connection :: IO LByteString.ByteString
@@ -81,7 +107,7 @@ runQQWebSocket host port path headers manager config context =
         Right value ->
           case parseMaybe parseJSON value of
             Nothing -> logDebug context.logger "qq observer ignored unrecognized event"
-            Just event -> observeQQEvent manager config context event
+            Just event -> observeQQEvent context event
 
 parseWebSocketUrl :: Text -> IO (String, Int, String)
 parseWebSocketUrl url
@@ -92,29 +118,29 @@ parseWebSocketUrl url
           path = Text.Encoding.decodeUtf8 request.path <> Text.Encoding.decodeUtf8 request.queryString
       pure (Text.unpack host, request.port, Text.unpack path)
 
-observeQQEvent :: Timeline timeline => Manager -> QQConfig -> BridgeContext timeline -> QQEvent -> IO ()
-observeQQEvent manager config context event =
+observeQQEvent :: Timeline timeline => Context timeline -> QQEvent -> IO ()
+observeQQEvent context event =
   case (event.qqPostType, event.qqNoticeType, event.qqMessageType) of
-    (Just "message", _, Just "group") -> observeQQMessage manager config context event
+    (Just "message", _, Just "group") -> observeQQMessage context event
     (Just "message", _, Just "private") -> logDebug context.logger "qq ignoring private message"
     (Just "message_sent", _, _) -> logDebug context.logger "qq ignoring echoed message"
-    (Just "notice", Just "group_recall", _) -> observeQQRetraction config context event
-    (Just "notice", Just "group_increase", _) -> observeQQMembership manager config context event True
-    (Just "notice", Just "group_decrease", _) -> observeQQMembership manager config context event False
-    (Just "notice", Just "group_kick", _) -> observeQQMembership manager config context event False
-    (Just "notice", Just "group_card", _) -> observeQQCard config context event
+    (Just "notice", Just "group_recall", _) -> observeQQRetraction context event
+    (Just "notice", Just "group_increase", _) -> observeQQMembership context event True
+    (Just "notice", Just "group_decrease", _) -> observeQQMembership context event False
+    (Just "notice", Just "group_kick", _) -> observeQQMembership context event False
+    (Just "notice", Just "group_card", _) -> observeQQCard context event
     (Just postType, Just noticeType, _) ->
       logDebug context.logger ("qq ignoring notice " <> postType <> "/" <> noticeType)
     _ -> logDebug context.logger "qq ignoring unrecognized event"
 
-observeQQMessage :: Timeline timeline => Manager -> QQConfig -> BridgeContext timeline -> QQEvent -> IO ()
-observeQQMessage manager config context event =
+observeQQMessage :: Timeline timeline => Context timeline -> QQEvent -> IO ()
+observeQQMessage context event =
   case (event.qqGroupId, event.qqUserId, event.qqMessageId) of
     (Just groupId, Just userId, Just messageId)
       | event.qqSelfId == Just userId ->
           logDebug context.logger ("qq ignoring own message " <> messageId)
       | otherwise -> do
-          room <- configuredRoom config context groupId
+          room <- configuredRoom context groupId
           case room of
             Nothing -> logDebug context.logger ("qq ignoring unconfigured group " <> groupId)
             Just roomId -> do
@@ -125,12 +151,10 @@ observeQQMessage manager config context event =
                 Nothing -> do
                   let senderName = qqSenderName userId event.qqSender
                   sender <- ensureQQUser context userId senderName
-                  ensureRoomMembership context "qq" roomId sender
+                  ensureRoomMembership context.logger context.timeline context.mappingStore "qq" roomId sender
                   let messageContext =
                         QQContext
-                          { manager
-                          , config
-                          , bridge = context
+                          { bridge = context
                           , room = roomId
                           , groupId
                           , blobPrefix = messageKey.key
@@ -151,48 +175,48 @@ observeQQMessage manager config context event =
                                   , body
                                   }
                           }
-                  submitted <- submitMessageMapped context timelineEvent
+                  submitted <- submitMessageMapped context.timeline context.mappingStore timelineEvent
                   case submitted of
                     Right _ -> pure ()
                     Left err -> logError context.logger ("qq message submit error: " <> Text.pack (show err))
     _ -> logDebug context.logger "qq ignored group message with incomplete identifiers"
 
-observeQQMembership :: Timeline timeline => Manager -> QQConfig -> BridgeContext timeline -> QQEvent -> Bool -> IO ()
-observeQQMembership manager config context event joined =
+observeQQMembership :: Timeline timeline => Context timeline -> QQEvent -> Bool -> IO ()
+observeQQMembership context event joined =
   case (event.qqGroupId, event.qqUserId) of
     (Just groupId, Just userId)
       | event.qqSelfId == Just userId ->
           logDebug context.logger ("qq ignoring own membership " <> userId)
       | otherwise -> do
-          room <- configuredRoom config context groupId
+          room <- configuredRoom context groupId
           case room of
             Nothing -> pure ()
             Just roomId -> do
-              name <- qqGroupMemberName manager config context.logger groupId userId (qqSenderName userId event.qqSender)
+              name <- qqGroupMemberName context groupId userId (qqSenderName userId event.qqSender)
               user <- ensureQQUser context userId name
               let key = PlatformKey "qq" (if joined then "join" else "leave") (noticeKey groupId userId event.qqTime)
                   content = if joined then JoinRoom user roomId else LeaveRoom user roomId
-              result <- submitMapped context Event {platformKey = key, content}
+              result <- submitMapped context.timeline context.mappingStore Event {platformKey = key, content}
               case result of
                 Left err -> logError context.logger ("qq membership submit error: " <> Text.pack (show err))
                 Right _ -> pure ()
     _ -> logDebug context.logger "qq ignored membership notice with incomplete identifiers"
 
-observeQQCard :: Timeline timeline => QQConfig -> BridgeContext timeline -> QQEvent -> IO ()
-observeQQCard config context event =
+observeQQCard :: Timeline timeline => Context timeline -> QQEvent -> IO ()
+observeQQCard context event =
   case (event.qqGroupId, event.qqUserId, event.qqCardNew) of
     (Just groupId, Just userId, Just card)
       | event.qqSelfId == Just userId ->
           logDebug context.logger ("qq ignoring own nickname change " <> userId)
       | not (Text.null card) -> do
-          room <- configuredRoom config context groupId
+          room <- configuredRoom context groupId
           case room of
             Nothing -> pure ()
             Just roomId -> do
               let senderName = qqSenderName userId event.qqSender
               user <- ensureQQUser context userId (if senderName == userId then card else senderName)
               let key = PlatformKey "qq" "nick" (noticeKey groupId userId event.qqTime)
-              result <- submitMapped context Event {platformKey = key, content = ChangeRoomNick user roomId card}
+              result <- submitMapped context.timeline context.mappingStore Event {platformKey = key, content = ChangeRoomNick user roomId card}
               case result of
                 Left err -> logError context.logger ("qq nickname submit error: " <> Text.pack (show err))
                 Right _ -> pure ()
@@ -205,29 +229,27 @@ noticeKey groupId userId time =
     Nothing -> groupId <> "/" <> userId
 
 -- | Notices often carry no sender, so ask the platform for a display name.
-qqGroupMemberName :: Manager -> QQConfig -> Logger -> Text -> Text -> Text -> IO Text
-qqGroupMemberName manager config logger groupId userId fallback
+qqGroupMemberName :: Context timeline -> Text -> Text -> Text -> IO Text
+qqGroupMemberName context groupId userId fallback
   | fallback /= userId = pure fallback
   | otherwise = do
       response <-
         qqApiCall
-          logger
-          manager
-          config
+          context
           "get_group_member_info"
           (object ["group_id" .= qqIdJson groupId, "user_id" .= qqIdJson userId])
       case response of
         Left err -> do
-          logDebug logger ("qq get_group_member_info failed: " <> Text.pack err)
+          logDebug context.logger ("qq get_group_member_info failed: " <> Text.pack err)
           pure fallback
         Right info ->
           pure (fromMaybe fallback (firstNonempty [valueTextField "card" info, valueTextField "nickname" info]))
 
-observeQQRetraction :: Timeline timeline => QQConfig -> BridgeContext timeline -> QQEvent -> IO ()
-observeQQRetraction config context event =
+observeQQRetraction :: Timeline timeline => Context timeline -> QQEvent -> IO ()
+observeQQRetraction context event =
   case (event.qqGroupId, event.qqMessageId) of
     (Just groupId, Just targetMessageId) -> do
-      room <- configuredRoom config context groupId
+      room <- configuredRoom context groupId
       case room of
         Nothing -> pure ()
         Just _ -> do
@@ -237,26 +259,26 @@ observeQQRetraction config context event =
             Just targetId -> do
               let key = PlatformKey "qq" "retraction" (groupId <> "/" <> targetMessageId)
                   eventToSubmit = Event {platformKey = key, content = RetractMessage (MessageId targetId)}
-              result <- submitMapped context eventToSubmit
+              result <- submitMapped context.timeline context.mappingStore eventToSubmit
               case result of
                 Left err -> logError context.logger ("qq retraction submit error: " <> Text.pack (show err))
                 Right _ -> pure ()
     _ -> logDebug context.logger "qq ignored recall event with incomplete identifiers"
 
-configuredRoom :: QQConfig -> BridgeContext timeline -> Text -> IO (Maybe RoomId)
-configuredRoom config context groupId = do
+configuredRoom :: Context timeline -> Text -> IO (Maybe RoomId)
+configuredRoom context groupId = do
   let key = qqRoomKey groupId
-  if enabledRoom config.initialRooms key
+  if enabledRoom context.config.initialRooms key
     then fmap RoomId <$> context.mappingStore.lookupTimelineId key
     else pure Nothing
 
-qqReplyTo :: BridgeContext timeline -> Text -> Maybe Text -> IO (Maybe MessageId)
+qqReplyTo :: Context timeline -> Text -> Maybe Text -> IO (Maybe MessageId)
 qqReplyTo _ _ Nothing = pure Nothing
 qqReplyTo context groupId (Just messageId) = do
   mapped <- context.mappingStore.lookupTimelineId (qqMessageKey groupId messageId)
   pure (MessageId <$> mapped)
 
-ensureQQUser :: Timeline timeline => BridgeContext timeline -> Text -> Text -> IO UserId
+ensureQQUser :: Timeline timeline => Context timeline -> Text -> Text -> IO UserId
 ensureQQUser context qqUserId displayName = do
   let key = qqUserKey qqUserId
   existing <- context.mappingStore.lookupTimelineId key
@@ -265,15 +287,13 @@ ensureQQUser context qqUserId displayName = do
     Nothing -> do
       let userName = if Text.null displayName then qqUserId else displayName
           event = Event {platformKey = key, content = CreateUser UserInfo {name = userName, avatar = Nothing}}
-      mapped <- submitMapped context event
+      mapped <- submitMapped context.timeline context.mappingStore event
       case mapped of
         Right eventId -> pure (UserId eventId)
         Left err -> fail ("could not create qq user: " <> show err)
 
 data QQContext timeline = QQContext
-  { manager :: Manager
-  , config :: QQConfig
-  , bridge :: BridgeContext timeline
+  { bridge :: Context timeline
   , room :: RoomId
   , groupId :: Text
   , blobPrefix :: Text
@@ -364,14 +384,13 @@ importQQSegmentBlob context index mediaUrl =
       case existing of
         Just eventId -> pure (Just (BlobId eventId))
         Nothing -> do
-          bytes <- downloadQQMedia context.manager context.bridge.logger url
+          bytes <- downloadQQMedia context.bridge url
           case bytes of
             Nothing -> pure Nothing
             Just content -> do
-              let event = Event {platformKey = blobKey, content = CreateBlob content}
-              result <- submitMapped context.bridge event
+              result <- submitBlob context.bridge.timeline context.bridge.mappingStore blobKey content
               case result of
-                Right eventId -> pure (Just (BlobId eventId))
+                Right blob -> pure (Just blob)
                 Left err -> do
                   logError context.bridge.logger ("qq media submit error: " <> Text.pack (show err))
                   pure Nothing
@@ -416,7 +435,7 @@ decodeQQForward context index segmentData =
   case valueTextField "id" segmentData of
     Just forwardId -> do
       let params = object ["id" .= qqIdJson forwardId, "message_id" .= qqIdJson forwardId]
-      response <- qqApiCall context.bridge.logger context.manager context.config "get_forward_msg" params
+      response <- qqApiCall context.bridge "get_forward_msg" params
       case response of
         Right value -> decodeQQNodes context (forwardPrefix context index) value
         Left err -> do
@@ -540,78 +559,77 @@ decodeJsonText raw =
     Right payload -> Just payload
     Left _ -> Nothing
 
-downloadQQMedia :: Manager -> Logger -> Text -> IO (Maybe ByteString)
-downloadQQMedia manager logger mediaUrl = do
+downloadQQMedia :: Context timeline -> Text -> IO (Maybe ByteString)
+downloadQQMedia context mediaUrl = do
   parsed <- try (parseRequest (Text.unpack mediaUrl)) :: IO (Either HttpException Request)
   case parsed of
-    Left err -> logWarn logger ("qq media URL rejected: " <> Text.pack (show err)) >> pure Nothing
+    Left err -> logWarn context.logger ("qq media URL rejected: " <> Text.pack (show err)) >> pure Nothing
     Right request0 -> do
       let host = Text.toLower (Text.Encoding.decodeUtf8 request0.host)
       download 1 host request0 {redirectCount = 0}
  where
   download attempt host request = do
-    logDebug logger ("qq media GET host=" <> host)
-    result <- try (httpLbs request manager) :: IO (Either HttpException (Response LByteString.ByteString))
+    logDebug context.logger ("qq media GET host=" <> host)
+    result <- try (httpLbs request context.manager) :: IO (Either HttpException (Response LByteString.ByteString))
     case result of
       Left err
         | attempt < 3 -> do
-            logWarn logger ("qq media request failed; retrying: " <> Text.pack (show err))
+            logWarn context.logger ("qq media request failed; retrying: " <> Text.pack (show err))
             threadDelay (attempt * 1000000)
             download (attempt + 1) host request
-        | otherwise -> logError logger ("qq media request failed: " <> Text.pack (show err)) >> pure Nothing
+        | otherwise -> logError context.logger ("qq media request failed: " <> Text.pack (show err)) >> pure Nothing
       Right response -> do
         let bytes = response.responseBody
             size = LByteString.length bytes
             status = statusCode response.responseStatus
-        logDebug logger ("qq media response status=" <> Text.pack (show status) <> " bytes=" <> Text.pack (show size))
+        logDebug context.logger ("qq media response status=" <> Text.pack (show status) <> " bytes=" <> Text.pack (show size))
         if status >= 200 && status < 300 && size <= 8000000
           then pure (Just (LByteString.toStrict bytes))
           else do
-            logWarn logger "qq media response rejected (status or size limit)"
+            logWarn context.logger "qq media response rejected (status or size limit)"
             pure Nothing
 
-reflectQQ :: Timeline timeline => QQConfig -> BridgeContext timeline -> IO ()
-reflectQQ config context = do
-  manager <- newManager tlsManagerSettings
+reflectQQ :: Timeline timeline => Context timeline -> IO ()
+reflectQQ context =
   forever do
     afterEventId <- fmap (fmap EventId) (context.mappingStore.lookupState "qq.reflect_event")
     storedEvents <- getEventsAfter context.timeline afterEventId
-    mapM_ (reflectQQEvent manager config context) storedEvents
+    mapM_ (reflectQQEvent context) storedEvents
     case storedEvents of
       [] -> threadDelay 2000000
       _ -> context.mappingStore.setState "qq.reflect_event" (renderEventId ((last storedEvents).storedId))
 
-reflectQQEvent :: Timeline timeline => Manager -> QQConfig -> BridgeContext timeline -> StoredEvent -> IO ()
-reflectQQEvent manager config context stored =
+reflectQQEvent :: Timeline timeline => Context timeline -> StoredEvent -> IO ()
+reflectQQEvent context stored =
   case stored.storedEvent.content of
     SendMessage info
       | stored.storedEvent.platformKey.platform == "qq" ->
           logDebug context.logger ("qq not reflecting own-origin event " <> renderEventId stored.storedId)
       | otherwise -> do
           roomKeys <- context.mappingStore.lookupPlatformKeys (roomEventId info.room)
-          mapM_ (sendToQQRoom manager config context stored info) (filter (enabledRoom config.initialRooms) roomKeys)
+          mapM_ (sendToQQRoom context stored info) (filter (enabledRoom context.config.initialRooms) roomKeys)
     RetractMessage message
       | stored.storedEvent.platformKey.platform == "qq" ->
           logDebug context.logger ("qq not reflecting own-origin retraction " <> renderEventId stored.storedId)
-      | otherwise -> retractQQMessages manager config context stored message
+      | otherwise -> retractQQMessages context stored message
     ChangeRoomNick user room nick
       | stored.storedEvent.platformKey.platform == "qq" ->
           logDebug context.logger ("qq not reflecting own-origin nick change " <> renderEventId stored.storedId)
       | otherwise -> do
           roomKeys <- context.mappingStore.lookupPlatformKeys (roomEventId room)
-          mapM_ (sendQQNickChange manager config context stored user nick) (filter (enabledRoom config.initialRooms) roomKeys)
+          mapM_ (sendQQNickChange context stored user nick) (filter (enabledRoom context.config.initialRooms) roomKeys)
     _ -> pure ()
 
-sendQQNickChange :: Timeline timeline => Manager -> QQConfig -> BridgeContext timeline -> StoredEvent -> UserId -> Text -> PlatformKey -> IO ()
-sendQQNickChange manager config context stored user nick roomKey =
+sendQQNickChange :: Timeline timeline => Context timeline -> StoredEvent -> UserId -> Text -> PlatformKey -> IO ()
+sendQQNickChange context stored user nick roomKey =
   case readMaybe (Text.unpack roomKey.key) :: Maybe Integer of
     Nothing -> logWarn context.logger ("qq ignoring invalid group id " <> roomKey.key)
     Just groupId -> do
       alreadySent <- qqMessageMappedToGroup context stored.storedId roomKey.key
       unless alreadySent do
-        text <- renderNickChange context user nick
+        text <- renderNickChange context.timeline user nick
         let params = object ["group_id" .= groupId, "message" .= [qqTextSegment text.plainText]]
-        response <- qqApiCall context.logger manager config "send_group_msg" params
+        response <- qqApiCall context "send_group_msg" params
         case response of
           Left err -> logError context.logger ("qq nick send_group_msg failed: " <> Text.pack err)
           Right result ->
@@ -620,8 +638,8 @@ sendQQNickChange manager config context stored user nick roomKey =
               Just messageId ->
                 context.mappingStore.insertMapping (qqMessageKey roomKey.key messageId) stored.storedId
 
-sendToQQRoom :: Timeline timeline => Manager -> QQConfig -> BridgeContext timeline -> StoredEvent -> SendMessageInfo -> PlatformKey -> IO ()
-sendToQQRoom manager config context stored info roomKey =
+sendToQQRoom :: Timeline timeline => Context timeline -> StoredEvent -> SendMessageInfo -> PlatformKey -> IO ()
+sendToQQRoom context stored info roomKey =
   case readMaybe (Text.unpack roomKey.key) :: Maybe Integer of
     Nothing -> logWarn context.logger ("qq ignoring invalid group id " <> roomKey.key)
     Just groupId -> do
@@ -629,9 +647,7 @@ sendToQQRoom manager config context stored info roomKey =
       unless alreadySent do
         let qqContext =
               QQContext
-                { manager
-                , config
-                , bridge = context
+                { bridge = context
                 , room = info.room
                 , groupId = roomKey.key
                 , blobPrefix = ""
@@ -640,7 +656,7 @@ sendToQQRoom manager config context stored info roomKey =
         replyTo <- qqReplyMessageId context roomKey.key info.replyTo
         let segments = maybe body (\messageId -> qqReplySegment messageId : body) replyTo
             params = object ["group_id" .= groupId, "message" .= segments]
-        response <- qqApiCall context.logger manager config "send_group_msg" params
+        response <- qqApiCall context "send_group_msg" params
         case response of
           Left err -> logError context.logger ("qq send_group_msg failed: " <> Text.pack err)
           Right result ->
@@ -649,12 +665,12 @@ sendToQQRoom manager config context stored info roomKey =
               Just messageId ->
                 context.mappingStore.insertMapping (qqMessageKey roomKey.key messageId) stored.storedId
 
-qqMessageMappedToGroup :: BridgeContext timeline -> EventId -> Text -> IO Bool
+qqMessageMappedToGroup :: Context timeline -> EventId -> Text -> IO Bool
 qqMessageMappedToGroup context eventId groupId = do
   keys <- context.mappingStore.lookupPlatformKeys eventId
   pure (any (\key -> key.platform == "qq" && key.entityType == "message" && messageGroupId key == Just groupId) keys)
 
-qqReplyMessageId :: BridgeContext timeline -> Text -> Maybe MessageId -> IO (Maybe Text)
+qqReplyMessageId :: Context timeline -> Text -> Maybe MessageId -> IO (Maybe Text)
 qqReplyMessageId _ _ Nothing = pure Nothing
 qqReplyMessageId context groupId (Just message) = do
   keys <- context.mappingStore.lookupPlatformKeys (messageEventId message)
@@ -667,13 +683,13 @@ qqMessageIdForGroup groupId key =
       | key.platform == "qq" && key.entityType == "message" && mappedGroupId == groupId -> Just messageId
     _ -> Nothing
 
-retractQQMessages :: Timeline timeline => Manager -> QQConfig -> BridgeContext timeline -> StoredEvent -> MessageId -> IO ()
-retractQQMessages manager config context stored message = do
+retractQQMessages :: Timeline timeline => Context timeline -> StoredEvent -> MessageId -> IO ()
+retractQQMessages context stored message = do
   original <- getEvent context.timeline (messageEventId message)
   case fmap (.storedEvent.content) original of
     Just (SendMessage _) -> do
       keys <- context.mappingStore.lookupPlatformKeys (messageEventId message)
-      mapM_ (deleteQQMessage manager config context stored) (filter (enabledRoom config.initialRooms . qqRoomKey . fst) (mapMaybe qqMessageTarget keys))
+      mapM_ (deleteQQMessage context stored) (filter (enabledRoom context.config.initialRooms . qqRoomKey . fst) (mapMaybe qqMessageTarget keys))
     _ -> pure ()
 
 qqMessageTarget :: PlatformKey -> Maybe (Text, Text)
@@ -684,14 +700,14 @@ qqMessageTarget key
         [groupId, messageId] -> Just (groupId, messageId)
         _ -> Nothing
 
-deleteQQMessage :: Manager -> QQConfig -> BridgeContext timeline -> StoredEvent -> (Text, Text) -> IO ()
-deleteQQMessage manager config context stored (groupId, messageId) = do
+deleteQQMessage :: Context timeline -> StoredEvent -> (Text, Text) -> IO ()
+deleteQQMessage context stored (groupId, messageId) = do
   let key = qqRetractionKey groupId stored.storedId
   alreadyDeleted <- context.mappingStore.lookupTimelineId key
   case alreadyDeleted of
     Just _ -> pure ()
     Nothing -> do
-      response <- qqApiCall context.logger manager config "delete_msg" (object ["message_id" .= qqIdJson messageId])
+      response <- qqApiCall context "delete_msg" (object ["message_id" .= qqIdJson messageId])
       case response of
         Left err -> logError context.logger ("qq delete_msg failed: " <> Text.pack err)
         Right _ -> context.mappingStore.insertMapping key stored.storedId
@@ -774,16 +790,16 @@ uploadQQFile context blobId bytes = do
           , "file" .= ("base64://" <> Text.Encoding.decodeUtf8 (Base64.encode bytes))
           , "name" .= name
           ]
-  response <- qqApiCall context.bridge.logger context.manager context.config "upload_group_file" params
+  response <- qqApiCall context.bridge "upload_group_file" params
   case response of
     Right _ -> pure [qqTextSegment ("[" <> name <> "]")]
     Left err -> do
       logError context.bridge.logger ("qq upload_group_file failed: " <> Text.pack err)
       pure [qqTextSegment "[file]"]
 
-fetchInitialRoomInfo :: Logger -> Manager -> QQConfig -> InitialRoomMapping -> IO RoomInfo
-fetchInitialRoomInfo logger manager config mapping = do
-  response <- qqApiCall logger manager config "get_group_info" (object ["group_id" .= qqIdJson mapping.platformKey.key])
+fetchInitialRoomInfo :: Context timeline -> InitialRoomMapping -> IO RoomInfo
+fetchInitialRoomInfo context mapping = do
+  response <- qqApiCall context "get_group_info" (object ["group_id" .= qqIdJson mapping.platformKey.key])
   case response of
     Left err -> fail ("qq get_group_info failed: " <> err)
     Right info ->
@@ -794,20 +810,20 @@ fetchInitialRoomInfo logger manager config mapping = do
           , avatar = Nothing
           }
 
-qqApiCall :: Logger -> Manager -> QQConfig -> Text -> Value -> IO (Either String Value)
-qqApiCall logger manager config action parameters = do
-  request0 <- parseRequest (Text.unpack (Text.dropWhileEnd (== '/') config.apiUrl <> "/" <> action))
+qqApiCall :: Context timeline -> Text -> Value -> IO (Either String Value)
+qqApiCall context action parameters = do
+  request0 <- parseRequest (Text.unpack (Text.dropWhileEnd (== '/') context.config.apiUrl <> "/" <> action))
   let authHeader =
-        if Text.null config.accessToken
+        if Text.null context.config.accessToken
           then []
-          else [("Authorization", Text.Encoding.encodeUtf8 ("Bearer " <> config.accessToken))]
+          else [("Authorization", Text.Encoding.encodeUtf8 ("Bearer " <> context.config.accessToken))]
       request =
         request0
           { method = "POST"
           , requestBody = RequestBodyLBS (encode parameters)
           , requestHeaders = ("Content-Type", "application/json") : authHeader <> request0.requestHeaders
           }
-  response <- HTTP.loggedHttp logger qqHttpLogOptions request manager
+  response <- HTTP.loggedHttp context.logger qqHttpLogOptions request context.manager
   pure (decodeQQApiResponse response)
 
 qqHttpLogOptions :: HttpLogOptions

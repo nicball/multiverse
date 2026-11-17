@@ -1,0 +1,18 @@
+name: napcat
+
+services:
+  napcat:
+    image: ghcr.io/napneko/napcatappimagebuild:latest
+    container_name: napcat
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6099:6099" # WebUI
+      - "127.0.0.1:3000:3000" # OneBot HTTP API
+      - "127.0.0.1:3001:3001" # OneBot forward WebSocket server
+    volumes:
+      - qq-data:/app/.config/QQ
+      - napcat-config:/app/napcat/config
+
+volumes:
+  qq-data:
+  napcat-config:

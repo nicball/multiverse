@@ -1,6 +1,5 @@
 module Multiverse.Telegram
-  ( TelegramConfig (..)
-  , telegramBridge
+  ( telegramBridge
   )
 where
 
@@ -14,7 +13,7 @@ import Data.ByteString.Lazy qualified as LByteString
 import Data.List (sortOn)
 import Data.List.NonEmpty (NonEmpty ((:|)), nonEmpty)
 import Data.List.NonEmpty qualified as NonEmpty
-import Data.Maybe (catMaybes, mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text
@@ -22,6 +21,7 @@ import Network.HTTP.Client
 import Network.HTTP.Client.TLS
 import Text.Read (readMaybe)
 import Multiverse.Bridge
+import Multiverse.Config (InitialRoomMapping (..), TelegramBridgeConfig (..))
 import Multiverse.Event hiding (eventId)
 import Multiverse.HTTP (HttpLogOptions (..), defaultHttpLogOptions)
 import Multiverse.HTTP qualified as HTTP
@@ -29,72 +29,93 @@ import Multiverse.Log
 import Multiverse.Timeline
 import Multiverse.Types
 
-data TelegramConfig = TelegramConfig
-  { botToken :: Text
-  , initialRooms :: [InitialRoomMapping]
-  , pollTimeoutSeconds :: Int
-  , noteInitialRoom :: InitialRoomMapping -> RoomId -> IO ()
+data Context timeline = Context
+  { timeline :: timeline
+  , mappingStore :: MappingStore
+  , logger :: Logger
+  , manager :: Manager
+  , config :: TelegramBridgeConfig
+  , apiBase :: Text
+  , fileBase :: Text
   }
 
-telegramBridge :: Timeline timeline => TelegramConfig -> Bridge timeline
-telegramBridge config =
-  Bridge
-    { bridgeName = "telegram"
-    , observe = observeTelegram config
-    , reflect = reflectTelegram config
-    }
-
-observeTelegram :: Timeline timeline => TelegramConfig -> BridgeContext timeline -> IO ()
-observeTelegram config context = do
+telegramBridge :: Timeline timeline => BridgeRuntime timeline -> TelegramBridgeConfig -> IO (Bridge, TelegramBridgeConfig)
+telegramBridge runtime initialConfig = do
+  mappingStore <- openMappingStore initialConfig.mappingDb
   manager <- newManager tlsManagerSettings
-  ensureInitialRoomsWith
-    config.initialRooms
-    context
-    (fetchInitialRoomInfo context.logger manager config)
-    config.noteInitialRoom
+  let provisionalContext =
+        Context
+          { timeline = runtime.timeline
+          , mappingStore
+          , logger = runtime.logger
+          , manager
+          , config = initialConfig
+          , apiBase = "https://api.telegram.org/bot" <> initialConfig.botToken
+          , fileBase = "https://api.telegram.org/file/bot" <> initialConfig.botToken
+          }
+  initialRooms <-
+    ensureInitialRooms
+      runtime.logger
+      runtime.timeline
+      mappingStore
+      (fetchInitialRoomInfo provisionalContext)
+      initialConfig.initialRooms
+  let config = initialConfig {initialRooms}
+      context = provisionalContext {config}
+  logInfo runtime.logger ("telegram bridge started with mapping db " <> Text.pack config.mappingDb)
+  pure
+    ( Bridge
+        { bridgeName = "telegram"
+        , observe = observeTelegram context
+        , reflect = reflectTelegram context
+        }
+    , config
+    )
+
+observeTelegram :: Timeline timeline => Context timeline -> IO ()
+observeTelegram context =
   forever do
     offset <- fmap readTextInt <$> context.mappingStore.lookupState "telegram.update_offset"
-    response <- telegramGetUpdates context.logger manager config offset
+    response <- telegramGetUpdates context offset
     case response of
       Left err -> do
         logError context.logger ("telegram observe error: " <> Text.pack err)
         threadDelay 5000000
       Right updates -> do
-        mapM_ (observeUpdate manager config context) updates
+        mapM_ (observeUpdate context) updates
         case updates of
           [] -> pure ()
           _ -> context.mappingStore.setState "telegram.update_offset" (Text.pack (show (maximum (map (.updateId) updates) + 1)))
 
-reflectTelegram :: Timeline timeline => TelegramConfig -> BridgeContext timeline -> IO ()
-reflectTelegram config context = do
-  manager <- newManager tlsManagerSettings
+reflectTelegram :: Timeline timeline => Context timeline -> IO ()
+reflectTelegram context =
   forever do
     afterEventId <- fmap (fmap EventId) (context.mappingStore.lookupState "telegram.reflect_event")
     storedEvents <- getEventsAfter context.timeline afterEventId
-    mapM_ (reflectEvent manager config context) storedEvents
+    mapM_ (reflectEvent context) storedEvents
     case storedEvents of
       [] -> threadDelay 2000000
       _ -> context.mappingStore.setState "telegram.reflect_event" (renderEventId ((last storedEvents).storedId))
 
-observeUpdate :: Timeline timeline => Manager -> TelegramConfig -> BridgeContext timeline -> TelegramUpdate -> IO ()
-observeUpdate manager config context update = do
+observeUpdate :: Timeline timeline => Context timeline -> TelegramUpdate -> IO ()
+observeUpdate context update = do
   case update.editedMessage of
-    Just message -> observeTelegramEdit manager config context update.updateId message
+    Just message -> observeTelegramEdit context update.updateId message
     Nothing -> pure ()
   case update.message of
     Nothing -> pure ()
     Just message -> do
-      room <- configuredRoom config context message.chat
+      room <- configuredRoom context message.chat
       case room of
         Nothing -> logDebug context.logger ("telegram ignoring unconfigured room " <> (telegramRoomKey message.chat).key)
         Just roomId -> do
           observeTelegramMembership context message roomId
-          body <- telegramMessageBody manager config context message
+          body <- telegramMessageBody context message
           case body of
             Nothing -> pure ()
             Just messageBody -> do
               userId <- ensureUser context message.from
-              ensureRoomMembership context "telegram" roomId userId
+              ensureRoomMembership context.logger context.timeline context.mappingStore "telegram" roomId userId
               replyTo <- telegramReplyTo context message
               let platformKey = telegramMessageKey message
                   event =
@@ -110,12 +131,12 @@ observeUpdate manager config context update = do
                               , body = messageBody
                               }
                       }
-              submitted <- submitMessageMapped context event
+              submitted <- submitMessageMapped context.timeline context.mappingStore event
               case submitted of
                 Right _ -> pure ()
                 Left err -> fail ("telegram submit error: " <> show err)
 
-observeTelegramMembership :: Timeline timeline => BridgeContext timeline -> TelegramMessage -> RoomId -> IO ()
+observeTelegramMembership :: Timeline timeline => Context timeline -> TelegramMessage -> RoomId -> IO ()
 observeTelegramMembership context message roomId = do
   forM_ message.newChatMembers \member -> submitMembership "join" member
   forM_ message.leftChatMember \member -> submitMembership "leave" member
@@ -125,14 +146,14 @@ observeTelegramMembership context message roomId = do
     let platformKey =
           PlatformKey "telegram" kind ((telegramMessageKey message).key <> "/" <> Text.pack (show member.userId))
         content = if kind == "join" then JoinRoom user roomId else LeaveRoom user roomId
-    result <- submitMapped context Event {platformKey, content}
+    result <- submitMapped context.timeline context.mappingStore Event {platformKey, content}
     case result of
       Left err -> logError context.logger ("telegram membership submit error: " <> Text.pack (show err))
       Right _ -> pure ()
 
-observeTelegramEdit :: Timeline timeline => Manager -> TelegramConfig -> BridgeContext timeline -> Int -> TelegramMessage -> IO ()
-observeTelegramEdit manager config context updateId message = do
-  room <- configuredRoom config context message.chat
+observeTelegramEdit :: Timeline timeline => Context timeline -> Int -> TelegramMessage -> IO ()
+observeTelegramEdit context updateId message = do
+  room <- configuredRoom context message.chat
   case room of
     Nothing -> pure ()
     Just _ -> do
@@ -140,15 +161,15 @@ observeTelegramEdit manager config context updateId message = do
       case target of
         Nothing -> pure ()
         Just targetId -> do
-          body <- telegramMessageBody manager config context message
+          body <- telegramMessageBody context message
           case body of
             Nothing -> pure ()
             Just newBody -> do
               let key = PlatformKey "telegram" "edit" (Text.pack (show updateId))
-              result <- submitMapped context Event {platformKey = key, content = EditMessage (MessageId targetId) newBody}
+              result <- submitMapped context.timeline context.mappingStore Event {platformKey = key, content = EditMessage (MessageId targetId) newBody}
               either (fail . show) (const (pure ())) result
 
-telegramReplyTo :: BridgeContext timeline -> TelegramMessage -> IO (Maybe MessageId)
+telegramReplyTo :: Context timeline -> TelegramMessage -> IO (Maybe MessageId)
 telegramReplyTo context message =
   case message.replyToMessage of
     Nothing -> pure Nothing
@@ -156,7 +177,7 @@ telegramReplyTo context message =
       mapped <- context.mappingStore.lookupTimelineId (telegramMessageRefKey repliedMessage)
       pure (MessageId <$> mapped)
 
-ensureUser :: Timeline timeline => BridgeContext timeline -> TelegramUser -> IO UserId
+ensureUser :: Timeline timeline => Context timeline -> TelegramUser -> IO UserId
 ensureUser context user = do
   let platformKey = telegramUserKey user
   existing <- context.mappingStore.lookupTimelineId platformKey
@@ -164,27 +185,27 @@ ensureUser context user = do
     Just eventId -> pure (UserId eventId)
     Nothing -> do
       let event = Event {platformKey, content = CreateUser UserInfo {name = telegramUserName user, avatar = Nothing}}
-      mapped <- submitMapped context event
+      mapped <- submitMapped context.timeline context.mappingStore event
       case mapped of
         Right eventId -> pure (UserId eventId)
         Left err -> fail ("could not create telegram user: " <> show err)
 
-configuredRoom :: TelegramConfig -> BridgeContext timeline -> TelegramChat -> IO (Maybe RoomId)
-configuredRoom config context chat = do
+configuredRoom :: Context timeline -> TelegramChat -> IO (Maybe RoomId)
+configuredRoom context chat = do
   let platformKey = telegramRoomKey chat
-  if enabledRoom config.initialRooms platformKey
+  if enabledRoom context.config.initialRooms platformKey
     then fmap RoomId <$> context.mappingStore.lookupTimelineId platformKey
     else pure Nothing
 
-reflectEvent :: Timeline timeline => Manager -> TelegramConfig -> BridgeContext timeline -> StoredEvent -> IO ()
-reflectEvent manager config context stored =
+reflectEvent :: Timeline timeline => Context timeline -> StoredEvent -> IO ()
+reflectEvent context stored =
   case stored.storedEvent.content of
     SendMessage info
       | stored.storedEvent.platformKey.platform == "telegram" ->
           logDebug context.logger ("telegram not reflecting own-origin event " <> renderEventId stored.storedId)
       | otherwise -> do
           roomKeys <- context.mappingStore.lookupPlatformKeys (roomEventId info.room)
-          let telegramRooms = filter (enabledRoom config.initialRooms) roomKeys
+          let telegramRooms = filter (enabledRoom context.config.initialRooms) roomKeys
           mapM_ (sendToRoom info) telegramRooms
     EditMessage message body
       | stored.storedEvent.platformKey.platform /= "telegram" -> do
@@ -194,8 +215,8 @@ reflectEvent manager config context stored =
               unless (messageBlobs info.body == messageBlobs body) do
                 logWarn context.logger "telegram cannot reflect changes to message attachments"
               targets <- telegramRetractTargets context message
-              text <- renderRelayedMessage context info {body = textBody body}
-              forM_ (filter (enabledTelegramTarget config) targets) \(chatId, messageId) -> do
+              text <- renderRelayedMessage context.timeline info {body = textBody body}
+              forM_ (filter (enabledTelegramTarget context) targets) \(chatId, messageId) -> do
                 textId <- context.mappingStore.lookupState ("telegram.send." <> renderEventId (messageEventId message) <> "." <> Text.pack (show chatId) <> ".0")
                 whenTextTarget textId messageId do
                   let editKey = "telegram.edit." <> renderEventId stored.storedId <> "." <> Text.pack (show chatId) <> "." <> Text.pack (show messageId)
@@ -203,7 +224,7 @@ reflectEvent manager config context stored =
                   case done of
                     Just _ -> pure ()
                     Nothing -> do
-                      result <- telegramEditText context.logger manager config chatId messageId text
+                      result <- telegramEditText context chatId messageId text
                       case result of
                         Left err | not ("message is not modified" `Text.isInfixOf` Text.toLower (Text.pack err)) ->
                           logError context.logger ("telegram edit reflect error: " <> Text.pack err)
@@ -217,14 +238,14 @@ reflectEvent manager config context stored =
           alreadyMapped <- hasPlatformMapping context.mappingStore "telegram" stored.storedId
           unless alreadyMapped do
             targets <- telegramRetractTargets context message
-            mapM_ deleteInChat (filter (enabledTelegramTarget config) targets)
+            mapM_ deleteInChat (filter (enabledTelegramTarget context) targets)
     ChangeRoomNick user room nick
       | stored.storedEvent.platformKey.platform == "telegram" ->
           logDebug context.logger ("telegram not reflecting own-origin nick change " <> renderEventId stored.storedId)
       | otherwise -> do
-          text <- renderNickChange context user nick
+          text <- renderNickChange context.timeline user nick
           roomKeys <- context.mappingStore.lookupPlatformKeys (roomEventId room)
-          forM_ (filter (enabledRoom config.initialRooms) roomKeys) \roomKey ->
+          forM_ (filter (enabledRoom context.config.initialRooms) roomKeys) \roomKey ->
             case readMaybe (Text.unpack roomKey.key) of
               Nothing -> logWarn context.logger ("telegram ignoring invalid chat id " <> roomKey.key)
               Just chatId -> do
@@ -233,7 +254,7 @@ reflectEvent manager config context stored =
                 case done of
                   Just _ -> pure ()
                   Nothing -> do
-                    result <- telegramSendMessage context.logger manager config chatId Nothing text
+                    result <- telegramSendMessage context chatId Nothing text
                     case result of
                       Left err -> logError context.logger ("telegram nick reflect error: " <> Text.pack err)
                       Right sentMessage -> do
@@ -245,7 +266,7 @@ reflectEvent manager config context stored =
     case readMaybe (Text.unpack roomKey.key) of
       Nothing -> pure ()
       Just chatId -> do
-        text <- renderRelayedMessage context info {body = textBody info.body}
+        text <- renderRelayedMessage context.timeline info {body = textBody info.body}
         replyTo <- telegramReplyMessageId context roomKey info.replyTo
         let stateKey index = "telegram.send." <> renderEventId stored.storedId <> "." <> roomKey.key <> "." <> Text.pack (show index)
             sendPart index action = do
@@ -259,14 +280,14 @@ reflectEvent manager config context stored =
                     Right message -> do
                       context.mappingStore.insertMapping (telegramMessageKey message) stored.storedId
                       context.mappingStore.setState (stateKey index) (Text.pack (show message.messageId))
-        sendPart (0 :: Int) (telegramSendMessage context.logger manager config chatId replyTo text)
+        sendPart (0 :: Int) (telegramSendMessage context chatId replyTo text)
         forM_ (zip [1 ..] (messageBlobs info.body)) \(index, (kind, blobId)) -> do
           blob <- getEvent context.timeline (blobEventId blobId)
           case fmap (.storedEvent.content) blob of
-            Just (CreateBlob bytes) -> sendPart index (sendMappedMedia context manager config chatId replyTo kind blobId bytes)
+            Just (CreateBlob bytes) -> sendPart index (sendMappedMedia context chatId replyTo kind blobId bytes)
             _ -> logError context.logger "telegram media blob is missing"
   deleteInChat (chatId, messageId) = do
-    result <- telegramDeleteMessage context.logger manager config chatId messageId
+    result <- telegramDeleteMessage context chatId messageId
     case result of
       Left err -> logError context.logger ("telegram retract reflect error: " <> Text.pack err)
       Right () -> context.mappingStore.insertMapping (telegramRetractionKey stored.storedId) stored.storedId
@@ -277,11 +298,11 @@ whenTextTarget target messageId action =
     Just value | readMaybe (Text.unpack value) /= Just messageId -> pure ()
     _ -> action
 
-enabledTelegramTarget :: TelegramConfig -> (Integer, Int) -> Bool
-enabledTelegramTarget config (chatId, _) =
-  enabledRoom config.initialRooms (PlatformKey "telegram" "room" (Text.pack (show chatId)))
+enabledTelegramTarget :: Context timeline -> (Integer, Int) -> Bool
+enabledTelegramTarget context (chatId, _) =
+  enabledRoom context.config.initialRooms (PlatformKey "telegram" "room" (Text.pack (show chatId)))
 
-telegramRetractTargets :: BridgeContext timeline -> MessageId -> IO [(Integer, Int)]
+telegramRetractTargets :: Context timeline -> MessageId -> IO [(Integer, Int)]
 telegramRetractTargets context message = do
   keys <- context.mappingStore.lookupPlatformKeys (messageEventId message)
   pure (mapMaybe telegramMessageTarget keys)
@@ -295,7 +316,7 @@ telegramMessageTarget platformKey
         [chatIdText, messageIdText] -> (,) <$> readMaybe (Text.unpack chatIdText) <*> readMaybe (Text.unpack messageIdText)
         _ -> Nothing
 
-telegramReplyMessageId :: BridgeContext timeline -> PlatformKey -> Maybe MessageId -> IO (Maybe Int)
+telegramReplyMessageId :: Context timeline -> PlatformKey -> Maybe MessageId -> IO (Maybe Int)
 telegramReplyMessageId _ _ Nothing = pure Nothing
 telegramReplyMessageId context roomKey (Just message) = do
   keys <- context.mappingStore.lookupPlatformKeys (messageEventId message)
@@ -313,21 +334,21 @@ matchingTelegramMessage chatId platformKey
           | messageChatId == chatId -> readMaybe (Text.unpack messageIdText)
         _ -> Nothing
 
-telegramGetUpdates :: Logger -> Manager -> TelegramConfig -> Maybe Int -> IO (Either String [TelegramUpdate])
-telegramGetUpdates logger manager config offset = do
-  request0 <- parseRequest (Text.unpack ("https://api.telegram.org/bot" <> config.botToken <> "/getUpdates"))
+telegramGetUpdates :: Context timeline -> Maybe Int -> IO (Either String [TelegramUpdate])
+telegramGetUpdates context offset = do
+  request0 <- parseRequest (Text.unpack (context.apiBase <> "/getUpdates"))
   let query =
-        [ ("timeout", Just (ByteString.Char8.pack (show config.pollTimeoutSeconds)))
+        [ ("timeout", Just (ByteString.Char8.pack (show context.config.pollTimeoutSeconds)))
         , ("allowed_updates", Just "[\"message\",\"edited_message\"]")
         ]
           <> maybe [] (\value -> [("offset", Just (ByteString.Char8.pack (show value)))]) offset
       request = setQueryString query request0
-  response <- loggedHttp logger request manager
+  response <- loggedHttp context.logger request context.manager
   pure (decodeResponse response)
 
-telegramSendMessage :: Logger -> Manager -> TelegramConfig -> Integer -> Maybe Int -> RenderedMessage -> IO (Either String TelegramMessage)
-telegramSendMessage logger manager config chatId replyTo text = do
-  request0 <- parseRequest (Text.unpack ("https://api.telegram.org/bot" <> config.botToken <> "/sendMessage"))
+telegramSendMessage :: Context timeline -> Integer -> Maybe Int -> RenderedMessage -> IO (Either String TelegramMessage)
+telegramSendMessage context chatId replyTo text = do
+  request0 <- parseRequest (Text.unpack (context.apiBase <> "/sendMessage"))
   let request =
         urlEncodedBody
           ( [ ("chat_id", ByteString.Char8.pack (show chatId))
@@ -337,31 +358,31 @@ telegramSendMessage logger manager config chatId replyTo text = do
               <> maybe [] (\messageId -> [("reply_to_message_id", ByteString.Char8.pack (show messageId))]) replyTo
           )
           request0
-  response <- loggedHttp logger request manager
+  response <- loggedHttp context.logger request context.manager
   pure (decodeResponse response)
 
-telegramEditText :: Logger -> Manager -> TelegramConfig -> Integer -> Int -> RenderedMessage -> IO (Either String TelegramMessage)
-telegramEditText logger manager config chatId messageId text = do
-  request0 <- parseRequest (Text.unpack ("https://api.telegram.org/bot" <> config.botToken <> "/editMessageText"))
+telegramEditText :: Context timeline -> Integer -> Int -> RenderedMessage -> IO (Either String TelegramMessage)
+telegramEditText context chatId messageId text = do
+  request0 <- parseRequest (Text.unpack (context.apiBase <> "/editMessageText"))
   let request = urlEncodedBody
         [ ("chat_id", ByteString.Char8.pack (show chatId))
         , ("message_id", ByteString.Char8.pack (show messageId))
         , ("text", Text.encodeUtf8 (telegramHtml text))
         , ("parse_mode", "HTML")
         ] request0
-  response <- loggedHttp logger request manager
+  response <- loggedHttp context.logger request context.manager
   pure (decodeResponse response)
 
-sendMappedMedia :: BridgeContext timeline -> Manager -> TelegramConfig -> Integer -> Maybe Int -> BlobType -> BlobId -> ByteString.ByteString -> IO (Either String TelegramMessage)
-sendMappedMedia context manager config chatId replyTo kind blobId bytes = do
+sendMappedMedia :: Context timeline -> Integer -> Maybe Int -> BlobType -> BlobId -> ByteString.ByteString -> IO (Either String TelegramMessage)
+sendMappedMedia context chatId replyTo kind blobId bytes = do
   let method = telegramMediaMethod kind bytes
       stateKey = telegramBlobStateKey method blobId
-      upload = telegramSendMedia context.logger manager config chatId replyTo method bytes
+      upload = telegramSendMedia context chatId replyTo method bytes
   existing <- context.mappingStore.lookupState stateKey
   result <- case existing of
     Nothing -> upload
     Just fileId -> do
-      sent <- telegramSendMediaId context.logger manager config chatId replyTo method fileId
+      sent <- telegramSendMediaId context chatId replyTo method fileId
       case sent of
         Right message -> pure (Right message)
         Left err -> do
@@ -369,9 +390,9 @@ sendMappedMedia context manager config chatId replyTo kind blobId bytes = do
           upload
   case result of
     Right message -> case message.media of
-      Just (returnedKind, fileId) | returnedKind == kind -> do
-        context.mappingStore.insertMapping (PlatformKey "telegram" "blob" fileId) (blobEventId blobId)
-        context.mappingStore.setState stateKey fileId
+      Just (returnedKind, media) | returnedKind == kind -> do
+        context.mappingStore.insertMapping (PlatformKey "telegram" "blob" media.fileId) (blobEventId blobId)
+        context.mappingStore.setState stateKey media.fileId
       _ -> pure ()
     Left _ -> pure ()
   pure result
@@ -391,18 +412,18 @@ telegramMediaMethod kind bytes = case kind of
   AudioBlob -> ("sendAudio", "audio")
   FileBlob -> ("sendDocument", "document")
 
-telegramSendMediaId :: Logger -> Manager -> TelegramConfig -> Integer -> Maybe Int -> (Text, ByteString.ByteString) -> Text -> IO (Either String TelegramMessage)
-telegramSendMediaId logger manager config chatId replyTo (methodName, fieldName) fileId = do
-  request0 <- parseRequest (Text.unpack ("https://api.telegram.org/bot" <> config.botToken <> "/" <> methodName))
+telegramSendMediaId :: Context timeline -> Integer -> Maybe Int -> (Text, ByteString.ByteString) -> Text -> IO (Either String TelegramMessage)
+telegramSendMediaId context chatId replyTo (methodName, fieldName) fileId = do
+  request0 <- parseRequest (Text.unpack (context.apiBase <> "/" <> methodName))
   let request = urlEncodedBody
         ([("chat_id", ByteString.Char8.pack (show chatId)), (fieldName, Text.encodeUtf8 fileId)]
           <> maybe [] (\messageId -> [("reply_to_message_id", ByteString.Char8.pack (show messageId))]) replyTo)
         request0
-  response <- loggedHttp logger request manager
+  response <- loggedHttp context.logger request context.manager
   pure (decodeResponse response)
 
-telegramSendMedia :: Logger -> Manager -> TelegramConfig -> Integer -> Maybe Int -> (Text, ByteString.ByteString) -> ByteString.ByteString -> IO (Either String TelegramMessage)
-telegramSendMedia logger manager config chatId replyTo (methodName, fieldName) bytes = do
+telegramSendMedia :: Context timeline -> Integer -> Maybe Int -> (Text, ByteString.ByteString) -> ByteString.ByteString -> IO (Either String TelegramMessage)
+telegramSendMedia context chatId replyTo (methodName, fieldName) bytes = do
   let boundary = chooseBoundary "multiverse-telegram" bytes
       field name value = "--" <> boundary <> "\r\nContent-Disposition: form-data; name=\"" <> name <> "\"\r\n\r\n" <> value <> "\r\n"
       body = ByteString.concat
@@ -410,9 +431,9 @@ telegramSendMedia logger manager config chatId replyTo (methodName, fieldName) b
           <> maybe [] (\messageId -> [field "reply_to_message_id" (ByteString.Char8.pack (show messageId))]) replyTo
           <> [ "--" <> boundary <> "\r\nContent-Disposition: form-data; name=\"" <> fieldName <> "\"; filename=\"upload\"\r\nContent-Type: application/octet-stream\r\n\r\n"
              , bytes, "\r\n--", boundary, "--\r\n" ] )
-  request0 <- parseRequest (Text.unpack ("https://api.telegram.org/bot" <> config.botToken <> "/" <> methodName))
+  request0 <- parseRequest (Text.unpack (context.apiBase <> "/" <> methodName))
   let request = request0 {method = "POST", requestBody = RequestBodyBS body, requestHeaders = [("Content-Type", "multipart/form-data; boundary=" <> boundary)]}
-  response <- loggedHttp logger request manager
+  response <- loggedHttp context.logger request context.manager
   pure (decodeResponse response)
 
 chooseBoundary :: ByteString.ByteString -> ByteString.ByteString -> ByteString.ByteString
@@ -446,36 +467,36 @@ replaceHeading level =
  where
   label = Text.pack (show level)
 
-telegramDeleteMessage :: Logger -> Manager -> TelegramConfig -> Integer -> Int -> IO (Either String ())
-telegramDeleteMessage logger manager config chatId messageId = do
-  request0 <- parseRequest (Text.unpack ("https://api.telegram.org/bot" <> config.botToken <> "/deleteMessage"))
+telegramDeleteMessage :: Context timeline -> Integer -> Int -> IO (Either String ())
+telegramDeleteMessage context chatId messageId = do
+  request0 <- parseRequest (Text.unpack (context.apiBase <> "/deleteMessage"))
   let request =
         urlEncodedBody
           [ ("chat_id", ByteString.Char8.pack (show chatId))
           , ("message_id", ByteString.Char8.pack (show messageId))
           ]
           request0
-  response <- loggedHttp logger request manager
+  response <- loggedHttp context.logger request context.manager
   pure (decodeResponse response)
 
-fetchInitialRoomInfo :: Logger -> Manager -> TelegramConfig -> InitialRoomMapping -> IO RoomInfo
-fetchInitialRoomInfo logger manager config mapping =
+fetchInitialRoomInfo :: Context timeline -> InitialRoomMapping -> IO RoomInfo
+fetchInitialRoomInfo context mapping =
   case readMaybe (Text.unpack mapping.platformKey.key) of
     Nothing -> fail ("telegram room key is not a chat id: " <> Text.unpack mapping.platformKey.key)
     Just chatId -> do
-      result <- telegramGetChat logger manager config chatId
+      result <- telegramGetChat context chatId
       case result of
         Left err -> fail ("telegram getChat failed: " <> err)
         Right chat -> pure RoomInfo {name = telegramChatName chat, description = "", avatar = Nothing}
 
-telegramGetChat :: Logger -> Manager -> TelegramConfig -> Integer -> IO (Either String TelegramChat)
-telegramGetChat logger manager config chatId = do
-  request0 <- parseRequest (Text.unpack ("https://api.telegram.org/bot" <> config.botToken <> "/getChat"))
+telegramGetChat :: Context timeline -> Integer -> IO (Either String TelegramChat)
+telegramGetChat context chatId = do
+  request0 <- parseRequest (Text.unpack (context.apiBase <> "/getChat"))
   let request =
         setQueryString
           [("chat_id", Just (ByteString.Char8.pack (show chatId)))]
           request0
-  response <- loggedHttp logger request manager
+  response <- loggedHttp context.logger request context.manager
   pure (decodeResponse response)
 
 loggedHttp :: Logger -> Request -> Manager -> IO (Response LByteString.ByteString)
@@ -533,40 +554,39 @@ telegramUserName user =
 telegramChatName :: TelegramChat -> Text
 telegramChatName chat = maybe (Text.pack (show chat.chatId)) id chat.title
 
-telegramMessageBody :: Timeline timeline => Manager -> TelegramConfig -> BridgeContext timeline -> TelegramMessage -> IO (Maybe Message)
-telegramMessageBody manager config context message = do
+telegramMessageBody :: Timeline timeline => Context timeline -> TelegramMessage -> IO (Maybe Message)
+telegramMessageBody context message = do
   media <- traverse importMedia message.media
   let textParts = maybe [] (NonEmpty.toList . (`telegramMessageFromEntities` message.entities)) message.text
   pure (nonEmpty (textParts <> maybe [] (\(kind, blob) -> [Blob kind blob]) media))
  where
-  importMedia (kind, fileId) = do
-    let key = PlatformKey "telegram" "blob" fileId
-    existing <- context.mappingStore.lookupTimelineId key
+  importMedia (kind, media) = do
+    let sourceKey = PlatformKey "telegram" "blob" (fromMaybe media.fileId media.fileUniqueId)
+    existing <- context.mappingStore.lookupTimelineId sourceKey
     content <- case existing of
       Just blobEvent -> do
         stored <- getEvent context.timeline blobEvent
         case fmap (.storedEvent.content) stored of
           Just (CreateBlob bytes) -> pure bytes
-          _ -> telegramDownloadFile context.logger manager config fileId
-      Nothing -> telegramDownloadFile context.logger manager config fileId
-    blobId <- case existing of
-      Just value -> pure value
+          _ -> telegramDownloadFile context media.fileId
+      Nothing -> telegramDownloadFile context media.fileId
+    blob <- case existing of
+      Just eventId -> pure (BlobId eventId)
       Nothing -> do
-        submitted <- submitMapped context Event {platformKey = key, content = CreateBlob content}
+        submitted <- submitBlob context.timeline context.mappingStore sourceKey content
         either (fail . show) pure submitted
-    let blob = BlobId blobId
-        method = telegramMediaMethod kind content
-    context.mappingStore.setState (telegramBlobStateKey method blob) fileId
+    let method = telegramMediaMethod kind content
+    context.mappingStore.setState (telegramBlobStateKey method blob) media.fileId
     pure (kind, blob)
 
-telegramDownloadFile :: Logger -> Manager -> TelegramConfig -> Text -> IO ByteString.ByteString
-telegramDownloadFile logger manager config fileId = do
-  request0 <- parseRequest (Text.unpack ("https://api.telegram.org/bot" <> config.botToken <> "/getFile"))
-  response <- loggedHttp logger (setQueryString [("file_id", Just (Text.encodeUtf8 fileId))] request0) manager
+telegramDownloadFile :: Context timeline -> Text -> IO ByteString.ByteString
+telegramDownloadFile context fileId = do
+  request0 <- parseRequest (Text.unpack (context.apiBase <> "/getFile"))
+  response <- loggedHttp context.logger (setQueryString [("file_id", Just (Text.encodeUtf8 fileId))] request0) context.manager
   file <- either fail pure (decodeResponse response :: Either String TelegramFile)
   path <- maybe (fail "telegram getFile response lacks file_path") pure file.filePath
-  request <- parseRequest (Text.unpack ("https://api.telegram.org/file/bot" <> config.botToken <> "/" <> path))
-  download <- loggedHttp logger request manager
+  request <- parseRequest (Text.unpack (context.fileBase <> "/" <> path))
+  download <- loggedHttp context.logger request context.manager
   pure (LByteString.toStrict download.responseBody)
 
 data TelegramFile = TelegramFile {filePath :: Maybe Text}
@@ -654,7 +674,7 @@ data TelegramMessage = TelegramMessage
   , text :: Maybe Text
   , entities :: [TelegramEntity]
   , replyToMessage :: Maybe TelegramMessageRef
-  , media :: Maybe (BlobType, Text)
+  , media :: Maybe (BlobType, TelegramMedia)
   , newChatMembers :: [TelegramUser]
   , leftChatMember :: Maybe TelegramUser
   }
@@ -670,9 +690,8 @@ instance FromJSON TelegramMessage where
     voice <- obj .:? "voice"
     document <- obj .:? "document"
     sticker <- obj .:? "sticker"
-    let fileId (TelegramMedia value _) = value
-        animationIsImage = case animation of
-          Just (TelegramMedia _ (Just mimeType)) -> "image/" `Text.isPrefixOf` mimeType
+    let animationIsImage = case animation of
+          Just media -> "image/" `Text.isPrefixOf` fromMaybe "" media.mimeType
           _ -> False
         imageAnimation = if animationIsImage then animation else Nothing
         videoAnimation = if animationIsImage then Nothing else animation
@@ -683,15 +702,22 @@ instance FromJSON TelegramMessage where
       <*> ((<|>) <$> obj .:? "text" <*> obj .:? "caption")
       <*> ((maybe [] id) <$> ((<|>) <$> obj .:? "entities" <*> obj .:? "caption_entities"))
       <*> obj .:? "reply_to_message"
-      <*> pure ((ImageBlob,) . fileId <$> (photo <|> sticker <|> imageAnimation) <|> (VideoBlob,) . fileId <$> (video <|> videoNote <|> videoAnimation) <|> (AudioBlob,) . fileId <$> (audio <|> voice) <|> (FileBlob,) . fileId <$> document)
+      <*> pure ((ImageBlob,) <$> (photo <|> sticker <|> imageAnimation) <|> (VideoBlob,) <$> (video <|> videoNote <|> videoAnimation) <|> (AudioBlob,) <$> (audio <|> voice) <|> (FileBlob,) <$> document)
       <*> obj .:? "new_chat_members" .!= []
       <*> obj .:? "left_chat_member"
 
-data TelegramMedia = TelegramMedia Text (Maybe Text)
+data TelegramMedia = TelegramMedia
+  { fileId :: Text
+  , fileUniqueId :: Maybe Text
+  , mimeType :: Maybe Text
+  }
 
 instance FromJSON TelegramMedia where
   parseJSON = withObject "TelegramMedia" \obj ->
-    TelegramMedia <$> obj .: "file_id" <*> obj .:? "mime_type"
+    TelegramMedia
+      <$> obj .: "file_id"
+      <*> obj .:? "file_unique_id"
+      <*> obj .:? "mime_type"
 
 data TelegramEntity = TelegramEntity
   { entityType :: Text

@@ -1,11 +1,11 @@
 module Multiverse.Config
   ( AppConfig (..)
+  , InitialRoomMapping (..)
   , MatrixBridgeConfig (..)
   , TelegramBridgeConfig (..)
   , QQBridgeConfig (..)
   , loadConfig
   , writeConfig
-  , setInitialRoom
   )
 where
 
@@ -14,7 +14,6 @@ import Data.Text qualified as Text
 import System.Directory (doesFileExist)
 import Toml (TomlCodec, (.=))
 import Toml qualified
-import Multiverse.Bridge
 import Multiverse.Log
 import Multiverse.Types
 
@@ -25,7 +24,14 @@ data AppConfig = AppConfig
   , matrix :: Maybe MatrixBridgeConfig
   , qq :: Maybe QQBridgeConfig
   }
-  deriving (Show)
+  deriving (Eq, Show)
+
+data InitialRoomMapping = InitialRoomMapping
+  { platformKey :: PlatformKey
+  , timelineRoom :: Maybe RoomId
+  , enable :: Bool
+  }
+  deriving (Eq, Show)
 
 data TelegramBridgeConfig = TelegramBridgeConfig
   { botToken :: Text
@@ -78,27 +84,6 @@ defaultConfig =
     , matrix = Nothing
     , qq = Nothing
     }
-
-setInitialRoom :: Text -> PlatformKey -> RoomId -> AppConfig -> AppConfig
-setInitialRoom bridgeName platformKey room config =
-  case bridgeName of
-    "telegram" -> config {telegram = updateTelegram <$> config.telegram}
-    "matrix" -> config {matrix = updateMatrix <$> config.matrix}
-    "qq" -> config {qq = updateQQ <$> config.qq}
-    _ -> config
- where
-  updateTelegram :: TelegramBridgeConfig -> TelegramBridgeConfig
-  updateTelegram (TelegramBridgeConfig botToken mappingDb pollTimeoutSeconds initialRooms) =
-    TelegramBridgeConfig botToken mappingDb pollTimeoutSeconds (map updateRoom initialRooms)
-  updateMatrix :: MatrixBridgeConfig -> MatrixBridgeConfig
-  updateMatrix (MatrixBridgeConfig homeserver accessToken mappingDb syncTimeoutMs initialRooms) =
-    MatrixBridgeConfig homeserver accessToken mappingDb syncTimeoutMs (map updateRoom initialRooms)
-  updateQQ :: QQBridgeConfig -> QQBridgeConfig
-  updateQQ (QQBridgeConfig apiUrl websocketUrl accessToken mappingDb initialRooms) =
-    QQBridgeConfig apiUrl websocketUrl accessToken mappingDb (map updateRoom initialRooms)
-  updateRoom mapping
-    | mapping.platformKey == platformKey = mapping {timelineRoom = Just room}
-    | otherwise = mapping
 
 appConfigCodec :: TomlCodec AppConfig
 appConfigCodec =

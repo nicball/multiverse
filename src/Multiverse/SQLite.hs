@@ -65,36 +65,54 @@ submitEvent :: Connection -> Event -> IO (Either SubmitError EventId)
 submitEvent connection event = do
   let newId = eventId event
       newIdText = renderRead newId
-  existing <- query connection "SELECT seq, event_id, event FROM events WHERE event_id = ?" (Only newIdText)
-  case decodeStoredRows existing of
-    Left err -> throwIO err
-    Right (_ : _) -> pure (Right newId)
-    Right [] -> do
-      conflict <-
-        query
-          connection
-          "SELECT event_id FROM events WHERE platform = ? AND entity_type = ? AND platform_key = ?"
-          (event.platformKey.platform, event.platformKey.entityType, event.platformKey.key)
+  existing <- eventIdExists connection newIdText
+  if existing
+    then pure (Right newId)
+    else do
+      conflict <- platformKeyConflict connection event.platformKey
       case conflict of
-        Only conflictingIdText : _ ->
-          case parseRead conflictingIdText of
-            Just conflictingId -> pure (Left (ConflictingPlatformKey event.platformKey conflictingId))
-            Nothing -> throwIO (CorruptTimeline ("invalid event id: " <> conflictingIdText))
-        [] -> do
+        Just conflictingId -> pure (Left (ConflictingPlatformKey event.platformKey conflictingId))
+        Nothing -> do
           missing <- missingReferences connection event
           if null missing
             then do
               execute
                 connection
-                "INSERT INTO events (event_id, platform, entity_type, platform_key, event) VALUES (?, ?, ?, ?, ?)"
+                "INSERT OR IGNORE INTO events (event_id, platform, entity_type, platform_key, event) VALUES (?, ?, ?, ?, ?)"
                 ( newIdText
                 , event.platformKey.platform
                 , event.platformKey.entityType
                 , event.platformKey.key
                 , renderRead event
                 )
-              pure (Right newId)
+              inserted <- eventIdExists connection newIdText
+              if inserted
+                then pure (Right newId)
+                else do
+                  raced <- platformKeyConflict connection event.platformKey
+                  case raced of
+                    Just conflictingId -> pure (Left (ConflictingPlatformKey event.platformKey conflictingId))
+                    Nothing -> throwIO (CorruptTimeline ("event insert ignored: " <> newIdText))
             else pure (Left (MissingReferences missing))
+
+eventIdExists :: Connection -> Text -> IO Bool
+eventIdExists connection eventIdText = do
+  rows <- query connection "SELECT 1 FROM events WHERE event_id = ? LIMIT 1" (Only eventIdText) :: IO [Only Int]
+  pure (not (null rows))
+
+platformKeyConflict :: Connection -> PlatformKey -> IO (Maybe EventId)
+platformKeyConflict connection platformKey = do
+  rows <-
+    query
+      connection
+      "SELECT event_id FROM events WHERE platform = ? AND entity_type = ? AND platform_key = ?"
+      (platformKey.platform, platformKey.entityType, platformKey.key)
+  case rows of
+    Only conflictingIdText : _ ->
+      case parseRead conflictingIdText of
+        Just conflictingId -> pure (Just conflictingId)
+        Nothing -> throwIO (CorruptTimeline ("invalid event id: " <> conflictingIdText))
+    [] -> pure Nothing
 
 lookupEvent :: Connection -> EventId -> IO (Maybe StoredEvent)
 lookupEvent connection wantedId = do
