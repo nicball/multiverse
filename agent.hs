@@ -40,7 +40,7 @@ data InlineTextPart
 
 type InlineText = NonEmpty InlineTextPart
 
-data BlobType = ImageBlob | VideoBlob | AudioBlob
+data BlobType = ImageBlob | VideoBlob | AudioBlob | FileBlob
 
 type Message = NonEmpty MessagePart
 

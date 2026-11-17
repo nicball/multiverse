@@ -37,7 +37,7 @@ data PlatformKey = PlatformKey
   }
   deriving (Eq, Ord, Read, Show)
 
-data BlobType = ImageBlob | VideoBlob | AudioBlob
+data BlobType = ImageBlob | VideoBlob | AudioBlob | FileBlob
   deriving (Eq, Ord, Read, Show)
 
 userEventId :: UserId -> EventId

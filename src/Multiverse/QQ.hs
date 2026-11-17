@@ -428,6 +428,7 @@ renderQQInlinePart context groupId room = \case
     pure ([qqTextSegment marker] <> rendered <> [qqTextSegment marker])
 
 renderQQBlob :: Timeline timeline => BridgeContext timeline -> BlobType -> BlobId -> IO [Value]
+renderQQBlob _ FileBlob _ = pure [qqTextSegment "[file]"]
 renderQQBlob context blobType blobId = do
   stored <- getEvent context.timeline (blobEventId blobId)
   case fmap (.storedEvent.content) stored of
@@ -436,6 +437,7 @@ renderQQBlob context blobType blobId = do
             ImageBlob -> "image"
             VideoBlob -> "video"
             AudioBlob -> "record"
+            FileBlob -> "file"
           file = "base64://" <> Text.Encoding.decodeUtf8 (Base64.encode bytes)
        in pure [object ["type" .= (kind :: Text), "data" .= object ["file" .= file]]]
     _ -> pure [qqTextSegment "[blob]"]
