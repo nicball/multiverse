@@ -6,6 +6,7 @@ module Multiverse.Bridge
   , RenderedMessage (..)
   , hasPlatformMapping
   , renderRelayedMessage
+  , renderMessageBody
   , submitMapped
   , submitMessageMapped
   , openMappingStore
@@ -63,15 +64,15 @@ renderRelayedMessage :: Timeline timeline => BridgeContext timeline -> SendMessa
 renderRelayedMessage context info = do
   user <- getUserInfo context.timeline info.sender (Just info.room)
   let sender = maybe "unknown" (.name) user
-      body = renderMessage info.body
+      body = renderMessageBody info.body
   pure
     RenderedMessage
       { plainText = sender <> ": " <> body.plainText
       , htmlText = htmlEscape sender <> ": " <> body.htmlText
       }
 
-renderMessage :: Message -> RenderedMessage
-renderMessage message =
+renderMessageBody :: Message -> RenderedMessage
+renderMessageBody message =
   let parts = map renderMessagePart (toList message)
    in RenderedMessage
         { plainText = Text.intercalate "\n" (map (.plainText) parts)
@@ -89,13 +90,13 @@ renderMessagePart = \case
           }
   Blob _ _ -> RenderedMessage "[blob]" "[blob]"
   List items ->
-    let rendered = map renderMessage (toList items)
+    let rendered = map renderMessageBody (toList items)
      in RenderedMessage
           { plainText = Text.intercalate "\n" (map (("- " <>) . (.plainText)) rendered)
           , htmlText = "<ul>" <> Text.concat (map (("<li>" <>) . (<> "</li>") . (.htmlText)) rendered) <> "</ul>"
           }
   BlockQuote message ->
-    let rendered = renderMessage message
+    let rendered = renderMessageBody message
      in RenderedMessage
           { plainText = "> " <> Text.replace "\n" "\n> " rendered.plainText
           , htmlText = "<blockquote>" <> rendered.htmlText <> "</blockquote>"

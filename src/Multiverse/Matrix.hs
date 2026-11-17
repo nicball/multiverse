@@ -11,6 +11,7 @@ import Data.Aeson
 import Data.Aeson.Types (Parser)
 import Data.Aeson.Key qualified as Aeson.Key
 import Data.Aeson.KeyMap qualified as Aeson.KeyMap
+import Data.ByteString qualified as ByteString
 import Data.ByteString.Lazy qualified as LByteString
 import Data.List.NonEmpty (NonEmpty ((:|)), nonEmpty)
 import Data.Maybe (mapMaybe)
@@ -175,7 +176,9 @@ reflectEvent manager config context stored =
           unless alreadyMapped do
             roomKeys <- context.mappingStore.lookupPlatformKeys (roomEventId info.room)
             let matrixRooms = filter ((== "matrix") . (.platform)) roomKeys
-            mapM_ (sendToRoom info) matrixRooms
+            (profile, body) <- renderMatrixRelayMessage context info
+            replyTo <- matrixReplyEventId context info.replyTo
+            mapM_ (sendToRoom profile body replyTo) matrixRooms
     RetractMessage _ message
       | stored.storedEvent.platformKey.platform == "matrix" ->
           logDebug context.logger ("matrix not reflecting own-origin event " <> renderEventId stored.storedId)
@@ -186,10 +189,8 @@ reflectEvent manager config context stored =
             mapM_ redactInRoom targets
     _ -> pure ()
  where
-  sendToRoom info roomKey = do
-    text <- renderRelayedMessage context info
-    replyTo <- matrixReplyEventId context info.replyTo
-    result <- matrixSendMessage context.logger manager config roomKey.key stored.storedId replyTo text
+  sendToRoom profile body replyTo roomKey = do
+    result <- matrixSendMessage context.logger manager config roomKey.key stored.storedId replyTo (Just profile) body
     case result of
       Left err -> logError context.logger ("matrix reflect error: " <> Text.pack err)
       Right matrixEventId -> context.mappingStore.insertMapping (matrixEventKey matrixEventId) stored.storedId
@@ -198,7 +199,7 @@ reflectEvent manager config context stored =
     case result of
       Left err -> do
         logError context.logger ("matrix retract reflect error: " <> Text.pack err)
-        fallback <- matrixSendMessage context.logger manager config roomId stored.storedId Nothing (retractionFailureMessage err)
+        fallback <- matrixSendMessage context.logger manager config roomId stored.storedId Nothing Nothing (retractionFailureMessage err)
         case fallback of
           Left fallbackErr -> logError context.logger ("matrix retract failure notice error: " <> Text.pack fallbackErr)
           Right matrixEventId -> context.mappingStore.insertMapping (matrixEventKey matrixEventId) stored.storedId
@@ -267,8 +268,57 @@ matrixGetDisplayName logger manager config matrixUserId = do
   response <- loggedHttp logger request manager
   pure (decodeMatrix response)
 
-matrixSendMessage :: Logger -> Manager -> MatrixConfig -> Text -> EventId -> Maybe Text -> RenderedMessage -> IO (Either String Text)
-matrixSendMessage logger manager config roomId eventId_ replyTo body = do
+renderMatrixRelayMessage :: Timeline timeline => BridgeContext timeline -> SendMessageInfo -> IO (Value, RenderedMessage)
+renderMatrixRelayMessage context info = do
+  user <- getUserInfo context.timeline info.sender (Just info.room)
+  let displayName = matrixProfileDisplayName (maybe "unknown" (.name) user)
+      message = renderMessageBody info.body
+      profile =
+        object
+          [ "id" .= renderEventId (userEventId info.sender)
+          , "displayname" .= displayName
+          , "avatar_url" .= ("" :: Text)
+          , "has_fallback" .= True
+          ]
+      fallback =
+        RenderedMessage
+          { plainText = displayName <> ": " <> message.plainText
+          , htmlText =
+              "<strong data-mx-profile-fallback>"
+                <> matrixHtmlEscape displayName
+                <> ": </strong>"
+                <> message.htmlText
+          }
+  pure (profile, fallback)
+
+matrixProfileDisplayName :: Text -> Text
+matrixProfileDisplayName name =
+  let bounded = truncateUtf8 255 (Text.filter (/= '\0') name)
+   in if Text.null bounded then "unknown" else bounded
+
+truncateUtf8 :: Int -> Text -> Text
+truncateUtf8 limit = Text.pack . go 0 . Text.unpack
+ where
+  go _ [] = []
+  go bytes (char : rest)
+    | nextBytes > limit = []
+    | otherwise = char : go nextBytes rest
+   where
+    nextBytes = bytes + ByteString.length (Text.encodeUtf8 (Text.singleton char))
+
+matrixHtmlEscape :: Text -> Text
+matrixHtmlEscape =
+  Text.concatMap \case
+    '&' -> "&amp;"
+    '<' -> "&lt;"
+    '>' -> "&gt;"
+    '"' -> "&quot;"
+    '\'' -> "&#39;"
+    char -> Text.singleton char
+
+matrixSendMessage ::
+  Logger -> Manager -> MatrixConfig -> Text -> EventId -> Maybe Text -> Maybe Value -> RenderedMessage -> IO (Either String Text)
+matrixSendMessage logger manager config roomId eventId_ replyTo profile body = do
   request0 <-
     authorizedRequest
       config
@@ -281,7 +331,7 @@ matrixSendMessage logger manager config roomId eventId_ replyTo body = do
   let request =
         request0
           { method = "PUT"
-          , requestBody = RequestBodyLBS (encode (matrixMessageContent replyTo body))
+          , requestBody = RequestBodyLBS (encode (matrixMessageContent replyTo profile body))
           , requestHeaders = ("Content-Type", "application/json") : request0.requestHeaders
           }
   response <- loggedHttp logger request manager
@@ -313,8 +363,8 @@ matrixRedactMessage logger manager config roomId eventId_ redactedEventId = do
     Left err -> Left err
     Right sent -> Right sent.eventId
 
-matrixMessageContent :: Maybe Text -> RenderedMessage -> Value
-matrixMessageContent replyTo body =
+matrixMessageContent :: Maybe Text -> Maybe Value -> RenderedMessage -> Value
+matrixMessageContent replyTo profile body =
   object
     ( [ "msgtype" .= ("m.text" :: Text)
       , "body" .= body.plainText
@@ -325,6 +375,8 @@ matrixMessageContent replyTo body =
           []
           (\eventId_ -> ["m.relates_to" .= object ["m.in_reply_to" .= object ["event_id" .= eventId_]]])
           replyTo
+        -- MSC4144 specifies this unstable prefix until the proposal is accepted.
+        <> maybe [] (\profile_ -> ["com.beeper.per_message_profile" .= profile_]) profile
     )
 
 fetchInitialRoomInfo :: Logger -> Manager -> MatrixConfig -> InitialRoomMapping -> IO RoomInfo
