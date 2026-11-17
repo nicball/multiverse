@@ -427,7 +427,13 @@ reflectEvent context stored =
         case fallback of
           Left fallbackErr -> logError context.logger ("matrix retract failure notice error: " <> Text.pack fallbackErr)
           Right matrixEventId -> context.mappingStore.insertMapping (matrixEventKey matrixEventId) stored.storedId
-      Right redactionEventId -> context.mappingStore.insertMapping (matrixRedactionKey redactionEventId) stored.storedId
+      Right redactionEventId -> do
+        let mappingKey =
+              maybe
+                (PlatformKey "matrix" "redaction" (renderEventId stored.storedId <> "/" <> roomId))
+                matrixRedactionKey
+                redactionEventId
+        context.mappingStore.insertMapping mappingKey stored.storedId
 
 -- | Transaction ids are idempotency keys scoped to the access token, so they
 -- must be unique per room and per part.
@@ -669,7 +675,7 @@ matrixUploadMedia context fileName mimeType bytes = go uploadEndpoints
         Right uploaded -> pure (Right uploaded.contentUri)
         Left _ -> go rest
 
-matrixRedactMessage :: Context timeline -> Text -> Text -> Text -> IO (Either String Text)
+matrixRedactMessage :: Context timeline -> Text -> Text -> Text -> IO (Either String (Maybe Text))
 matrixRedactMessage context roomId txnId redactedEventId = do
   request0 <-
     authorizedRequest
@@ -689,9 +695,12 @@ matrixRedactMessage context roomId txnId redactedEventId = do
           , requestHeaders = ("Content-Type", "application/json") : request0.requestHeaders
           }
   response <- loggedHttp context.logger request context.manager
-  pure case eitherDecode response.responseBody :: Either String MatrixSendResponse of
-    Left err -> Left err
-    Right sent -> Right sent.eventId
+  let status = statusCode response.responseStatus
+  if status < 200 || status >= 300
+    then pure (Left ("matrix redact failed with status " <> show status))
+    else pure case eitherDecode response.responseBody :: Either String MatrixRedactionResponse of
+      Right sent -> Right sent.eventId
+      Left _ -> Right Nothing
 
 matrixDownloadMedia :: Context timeline -> Text -> IO (Maybe ByteString)
 matrixDownloadMedia context uri =
@@ -1246,3 +1255,11 @@ data MatrixSendResponse = MatrixSendResponse
 instance FromJSON MatrixSendResponse where
   parseJSON = withObject "MatrixSendResponse" \obj ->
     MatrixSendResponse <$> obj .: "event_id"
+
+data MatrixRedactionResponse = MatrixRedactionResponse
+  { eventId :: Maybe Text
+  }
+
+instance FromJSON MatrixRedactionResponse where
+  parseJSON = withObject "MatrixRedactionResponse" \obj ->
+    MatrixRedactionResponse <$> obj .:? "event_id"
