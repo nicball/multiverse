@@ -81,8 +81,8 @@ data EventContent
   | JoinRoom UserId RoomId
   | LeaveRoom UserId RoomId
   | SendMessage SendMessageInfo
-  | RetractMessage UserId MessageId
-  | EditMessage UserId MessageId Message
+  | RetractMessage MessageId
+  | EditMessage MessageId Message
   | ModifyUser UserId UserInfo
   | ModifyRoom RoomId RoomInfo
   | ChangeRoomNick UserId RoomId Text
@@ -105,9 +105,9 @@ eventReferences event =
         : foldMap ((: []) . messageEventId) info.replyTo
         <> foldMap ((: []) . messageEventId) info.forwardOf
         <> messageReferences info.body
-    RetractMessage user message -> [userEventId user, messageEventId message]
-    EditMessage user message body ->
-      userEventId user : messageEventId message : messageReferences body
+    RetractMessage message -> [messageEventId message]
+    EditMessage message body ->
+      messageEventId message : messageReferences body
     ModifyUser user info ->
       userEventId user : maybe [] ((: []) . blobEventId) info.avatar
     ModifyRoom room info ->

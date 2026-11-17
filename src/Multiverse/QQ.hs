@@ -143,8 +143,8 @@ observeQQMessage manager config context event =
 
 observeQQRetraction :: Timeline timeline => QQConfig -> BridgeContext timeline -> QQEvent -> IO ()
 observeQQRetraction config context event =
-  case (event.qqGroupId, event.qqMessageId, event.qqOperatorId <|> event.qqUserId) of
-    (Just groupId, Just targetMessageId, Just operatorId) -> do
+  case (event.qqGroupId, event.qqMessageId) of
+    (Just groupId, Just targetMessageId) -> do
       room <- configuredRoom config context groupId
       case room of
         Nothing -> pure ()
@@ -153,9 +153,8 @@ observeQQRetraction config context event =
           case target of
             Nothing -> logDebug context.logger ("qq ignoring recall for unknown message " <> targetMessageId)
             Just targetId -> do
-              operator <- ensureQQUser context operatorId operatorId
               let key = PlatformKey "qq" "retraction" (groupId <> "/" <> targetMessageId)
-                  eventToSubmit = Event {platformKey = key, content = RetractMessage operator (MessageId targetId)}
+                  eventToSubmit = Event {platformKey = key, content = RetractMessage (MessageId targetId)}
               result <- submitMapped context eventToSubmit
               case result of
                 Left err -> logError context.logger ("qq retraction submit error: " <> Text.pack (show err))
@@ -304,7 +303,7 @@ reflectQQEvent manager config context stored =
       | otherwise -> do
           roomKeys <- context.mappingStore.lookupPlatformKeys (roomEventId info.room)
           mapM_ (sendToQQRoom manager config context stored info) (filter isQQRoom roomKeys)
-    RetractMessage _ message
+    RetractMessage message
       | stored.storedEvent.platformKey.platform == "qq" ->
           logDebug context.logger ("qq not reflecting own-origin retraction " <> renderEventId stored.storedId)
       | otherwise -> retractQQMessages manager config context stored message
@@ -499,7 +498,6 @@ data QQEvent = QQEvent
   , qqUserId :: Maybe Text
   , qqSelfId :: Maybe Text
   , qqMessageId :: Maybe Text
-  , qqOperatorId :: Maybe Text
   , qqMessage :: Maybe Value
   , qqSender :: Maybe QQSender
   }
@@ -516,7 +514,6 @@ instance FromJSON QQEvent where
         , qqUserId = valueTextField "user_id" (Object obj)
         , qqSelfId = valueTextField "self_id" (Object obj)
         , qqMessageId = valueTextField "message_id" (Object obj)
-        , qqOperatorId = valueTextField "operator_id" (Object obj)
         , qqMessage = Aeson.KeyMap.lookup "message" obj
         , qqSender = sender
         }

@@ -183,9 +183,9 @@ applyMessage message current stored =
   case stored.storedEvent.content of
     SendMessage info
       | MessageId stored.storedId == message -> Just info.body
-    EditMessage _ editedMessage body
+    EditMessage editedMessage body
       | editedMessage == message -> Just body
-    RetractMessage _ retractedMessage
+    RetractMessage retractedMessage
       | retractedMessage == message -> Nothing
     _ -> current
 

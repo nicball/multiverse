@@ -70,8 +70,8 @@ data EventContent
   | JoinRoom UserId RoomId
   | LeaveRoom UserId RoomId
   | SendMessage SendMessageInfo
-  | RetractMessage UserId MessageId
-  | EditMessage UserId MessageId Message
+  | RetractMessage MessageId
+  | EditMessage MessageId Message
   | ModifyUser UserId UserInfo
   | ModifyRoom RoomId RoomInfo
   | ChangeRoomNick UserId RoomId Text

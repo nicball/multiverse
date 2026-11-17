@@ -143,7 +143,7 @@ reflectEvent manager config context stored =
             roomKeys <- context.mappingStore.lookupPlatformKeys (roomEventId info.room)
             let telegramRooms = filter ((== "telegram") . (.platform)) roomKeys
             mapM_ (sendToRoom info) telegramRooms
-    RetractMessage _ message
+    RetractMessage message
       | stored.storedEvent.platformKey.platform == "telegram" ->
           logDebug context.logger ("telegram not reflecting own-origin event " <> renderEventId stored.storedId)
       | otherwise -> do

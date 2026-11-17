@@ -118,7 +118,6 @@ observeEvent manager context config ownUserId room event
             Right _ -> pure ()
             Left err -> logError context.logger ("matrix submit error: " <> Text.pack (show err))
         MatrixRedaction redactedEvent -> do
-          userId <- ensureUser manager context config event.sender
           target <- context.mappingStore.lookupTimelineId (matrixEventKey redactedEvent)
           case target of
             Nothing -> logDebug context.logger ("matrix ignoring redaction for unknown event " <> redactedEvent)
@@ -126,7 +125,7 @@ observeEvent manager context config ownUserId room event
               let timelineEvent =
                     Event
                       { platformKey = matrixRedactionKey event.eventId
-                      , content = RetractMessage userId (MessageId targetEventId)
+                      , content = RetractMessage (MessageId targetEventId)
                       }
               submitted <- submitMapped context timelineEvent
               case submitted of
@@ -179,7 +178,7 @@ reflectEvent manager config context stored =
             (profile, body) <- renderMatrixRelayMessage context info
             replyTo <- matrixReplyEventId context info.replyTo
             mapM_ (sendToRoom profile body replyTo) matrixRooms
-    RetractMessage _ message
+    RetractMessage message
       | stored.storedEvent.platformKey.platform == "matrix" ->
           logDebug context.logger ("matrix not reflecting own-origin event " <> renderEventId stored.storedId)
       | otherwise -> do
