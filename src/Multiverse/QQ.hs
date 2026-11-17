@@ -251,11 +251,7 @@ downloadQQMedia manager logger mediaUrl = do
     Left err -> logWarn logger ("qq media URL rejected: " <> Text.pack (show err)) >> pure Nothing
     Right request0 -> do
       let host = Text.toLower (Text.Encoding.decodeUtf8 request0.host)
-      if not request0.secure || not (isQQMediaHost host)
-        then do
-          logWarn logger "qq media URL rejected by HTTPS host allowlist"
-          pure Nothing
-        else download 1 host request0 {redirectCount = 0}
+      download 1 host request0 {redirectCount = 0}
  where
   download attempt host request = do
     logDebug logger ("qq media GET host=" <> host)
@@ -277,11 +273,6 @@ downloadQQMedia manager logger mediaUrl = do
           else do
             logWarn logger "qq media response rejected (status or size limit)"
             pure Nothing
-
-isQQMediaHost :: Text -> Bool
-isQQMediaHost host = any matches ["qq.com", "qpic.cn", "gtimg.cn"]
- where
-  matches suffix = host == suffix || ("." <> suffix) `Text.isSuffixOf` host
 
 reflectQQ :: Timeline timeline => QQConfig -> BridgeContext timeline -> IO ()
 reflectQQ config context = do

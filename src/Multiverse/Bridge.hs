@@ -73,7 +73,7 @@ renderRelayedMessage context info = do
   pure
     RenderedMessage
       { plainText = sender <> ": " <> body.plainText
-      , htmlText = htmlEscape sender <> ": " <> body.htmlText
+      , htmlText = "<b>" <> htmlEscape sender <> ":</b> " <> body.htmlText
       }
 
 renderMessageBody :: Message -> RenderedMessage
