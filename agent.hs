@@ -82,6 +82,7 @@ class Timeline timeline where
   getEventsAfter :: timeline -> Maybe EventId -> IO [StoredEvent]
   getUserInfo :: timeline -> UserId -> Maybe RoomId -> IO (Maybe UserInfo)
   getRoomInfo :: timeline -> RoomId -> IO (Maybe RoomInfo)
+  getRoomMembers :: timeline -> RoomId -> IO [UserId]
   getMessage :: timeline -> MessageId -> IO (Maybe Message)
 
 data StoredEvent = StoredEvent

@@ -6,7 +6,7 @@ where
 
 import Control.Concurrent (threadDelay)
 import Control.Applicative (asum, (<|>))
-import Control.Monad (forever, unless)
+import Control.Monad (forM_, forever, unless)
 import Data.Aeson
 import Data.Aeson.Types (Parser)
 import Data.Aeson.Key qualified as Aeson.Key
@@ -92,12 +92,13 @@ observeRoomEvents manager config context ownUserId roomEvents = do
 
 observeEvent :: Timeline timeline => Manager -> BridgeContext timeline -> MatrixConfig -> Text -> RoomId -> MatrixEvent -> IO ()
 observeEvent manager context config ownUserId room event
-  | event.sender == ownUserId =
+  | event.sender == ownUserId, not (isMemberEvent event.content) =
       logDebug context.logger ("matrix ignoring own event " <> event.eventId)
   | otherwise =
       case event.content of
         MatrixMessage body replyToEvent -> do
           userId <- ensureUser manager context config event.sender
+          ensureRoomMembership context "matrix" room userId
           replyTo <- matrixReplyTo context replyToEvent
           let platformKey = matrixEventKey event.eventId
               timelineEvent =
@@ -134,6 +135,44 @@ observeEvent manager context config ownUserId room event
                   | targetEventId `elem` missing ->
                       logDebug context.logger ("matrix ignoring redaction for missing timeline event " <> renderEventId targetEventId)
                 Left err -> logError context.logger ("matrix retraction submit error: " <> Text.pack (show err))
+        MatrixMember member -> observeMatrixMember manager context config ownUserId room event member
+
+isMemberEvent :: MatrixEventContent -> Bool
+isMemberEvent content = case content of
+  MatrixMember _ -> True
+  _ -> False
+
+observeMatrixMember :: Timeline timeline => Manager -> BridgeContext timeline -> MatrixConfig -> Text -> RoomId -> MatrixEvent -> MatrixMembership -> IO ()
+observeMatrixMember manager context config ownUserId room event member
+  | member.memberUserId == ownUserId =
+      logDebug context.logger ("matrix ignoring own membership " <> member.memberUserId)
+  | otherwise = case member.membership of
+      "join" -> withUser \user -> do
+        submitMembership "join" user
+        case (member.memberPreviousDisplayName, member.memberDisplayName) of
+          (Just previous, Just nick)
+            | nick /= previous -> submitNick user nick
+          _ -> pure ()
+      "leave" -> withUser (submitMembership "leave")
+      "ban" -> withUser (submitMembership "leave")
+      _ -> pure ()
+ where
+  withUser action = do
+    user <- ensureUser manager context config member.memberUserId
+    action user
+
+  eventKey kind = PlatformKey "matrix" kind (event.eventId <> "/" <> member.memberUserId)
+
+  submitEvent platformKey content = do
+    result <- submitMapped context Event {platformKey, content}
+    case result of
+      Left err -> logError context.logger ("matrix membership submit error: " <> Text.pack (show err))
+      Right _ -> pure ()
+
+  submitMembership kind user =
+    submitEvent (eventKey kind) (if kind == "join" then JoinRoom user room else LeaveRoom user room)
+
+  submitNick user nick = submitEvent (eventKey "nick") (ChangeRoomNick user room nick)
 
 matrixReplyTo :: BridgeContext timeline -> Maybe Text -> IO (Maybe MessageId)
 matrixReplyTo context replyToEvent =
@@ -186,6 +225,24 @@ reflectEvent manager config context stored =
           unless alreadyMapped do
             targets <- matrixRetractTargets context message
             mapM_ redactInRoom (filter (enabledRoom config.initialRooms . matrixRoomKey . fst) targets)
+    ChangeRoomNick user room nick
+      | stored.storedEvent.platformKey.platform == "matrix" ->
+          logDebug context.logger ("matrix not reflecting own-origin nick change " <> renderEventId stored.storedId)
+      | otherwise -> do
+          body <- renderNickChange context user nick
+          roomKeys <- context.mappingStore.lookupPlatformKeys (roomEventId room)
+          forM_ (filter (enabledRoom config.initialRooms) roomKeys) \roomKey -> do
+            let stateKey = "matrix.nick." <> renderEventId stored.storedId <> "." <> roomKey.key
+            done <- context.mappingStore.lookupState stateKey
+            case done of
+              Just _ -> pure ()
+              Nothing -> do
+                result <- matrixSendMessage context.logger manager config roomKey.key stored.storedId Nothing Nothing body
+                case result of
+                  Left err -> logError context.logger ("matrix nick reflect error: " <> Text.pack err)
+                  Right matrixEventId -> do
+                    context.mappingStore.insertMapping (matrixEventKey matrixEventId) stored.storedId
+                    context.mappingStore.setState stateKey "done"
     _ -> pure ()
  where
   sendToRoom profile body replyTo roomKey = do
@@ -519,6 +576,14 @@ data MatrixEvent = MatrixEvent
 data MatrixEventContent
   = MatrixMessage Message (Maybe Text)
   | MatrixRedaction Text
+  | MatrixMember MatrixMembership
+
+data MatrixMembership = MatrixMembership
+  { membership :: Text
+  , memberUserId :: Text
+  , memberDisplayName :: Maybe Text
+  , memberPreviousDisplayName :: Maybe Text
+  }
 
 usableEvent :: Value -> Maybe MatrixEvent
 usableEvent value = do
@@ -546,6 +611,29 @@ usableEvent value = do
             (Aeson.KeyMap.lookup "redacts" obj >>= asText)
               <|> (Aeson.KeyMap.lookup "content" obj >>= asObject >>= Aeson.KeyMap.lookup "redacts" >>= asText)
       MatrixEvent matrixEventId sender . MatrixRedaction <$> redactedEvent
+    "m.room.member" -> do
+      content <- Aeson.KeyMap.lookup "content" obj >>= asObject
+      membership <- Aeson.KeyMap.lookup "membership" content >>= asText
+      memberUserId <- Aeson.KeyMap.lookup "state_key" obj >>= asText
+      let previousContent =
+            Aeson.KeyMap.lookup "unsigned" obj
+              >>= asObject
+              >>= Aeson.KeyMap.lookup "prev_content"
+              >>= asObject
+          previousDisplayName = previousContent >>= Aeson.KeyMap.lookup "displayname" >>= asText
+      pure
+        MatrixEvent
+          { eventId = matrixEventId
+          , sender
+          , content =
+              MatrixMember
+                MatrixMembership
+                  { membership
+                  , memberUserId
+                  , memberDisplayName = Aeson.KeyMap.lookup "displayname" content >>= asText
+                  , memberPreviousDisplayName = previousDisplayName
+                  }
+          }
     _ -> Nothing
 
 asObject :: Value -> Maybe Object

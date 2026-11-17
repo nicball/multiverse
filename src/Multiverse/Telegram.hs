@@ -88,11 +88,13 @@ observeUpdate manager config context update = do
       case room of
         Nothing -> logDebug context.logger ("telegram ignoring unconfigured room " <> (telegramRoomKey message.chat).key)
         Just roomId -> do
+          observeTelegramMembership context message roomId
           body <- telegramMessageBody manager config context message
           case body of
             Nothing -> pure ()
             Just messageBody -> do
               userId <- ensureUser context message.from
+              ensureRoomMembership context "telegram" roomId userId
               replyTo <- telegramReplyTo context message
               let platformKey = telegramMessageKey message
                   event =
@@ -112,6 +114,21 @@ observeUpdate manager config context update = do
               case submitted of
                 Right _ -> pure ()
                 Left err -> fail ("telegram submit error: " <> show err)
+
+observeTelegramMembership :: Timeline timeline => BridgeContext timeline -> TelegramMessage -> RoomId -> IO ()
+observeTelegramMembership context message roomId = do
+  forM_ message.newChatMembers \member -> submitMembership "join" member
+  forM_ message.leftChatMember \member -> submitMembership "leave" member
+ where
+  submitMembership kind member = do
+    user <- ensureUser context member
+    let platformKey =
+          PlatformKey "telegram" kind ((telegramMessageKey message).key <> "/" <> Text.pack (show member.userId))
+        content = if kind == "join" then JoinRoom user roomId else LeaveRoom user roomId
+    result <- submitMapped context Event {platformKey, content}
+    case result of
+      Left err -> logError context.logger ("telegram membership submit error: " <> Text.pack (show err))
+      Right _ -> pure ()
 
 observeTelegramEdit :: Timeline timeline => Manager -> TelegramConfig -> BridgeContext timeline -> Int -> TelegramMessage -> IO ()
 observeTelegramEdit manager config context updateId message = do
@@ -201,6 +218,27 @@ reflectEvent manager config context stored =
           unless alreadyMapped do
             targets <- telegramRetractTargets context message
             mapM_ deleteInChat (filter (enabledTelegramTarget config) targets)
+    ChangeRoomNick user room nick
+      | stored.storedEvent.platformKey.platform == "telegram" ->
+          logDebug context.logger ("telegram not reflecting own-origin nick change " <> renderEventId stored.storedId)
+      | otherwise -> do
+          text <- renderNickChange context user nick
+          roomKeys <- context.mappingStore.lookupPlatformKeys (roomEventId room)
+          forM_ (filter (enabledRoom config.initialRooms) roomKeys) \roomKey ->
+            case readMaybe (Text.unpack roomKey.key) of
+              Nothing -> logWarn context.logger ("telegram ignoring invalid chat id " <> roomKey.key)
+              Just chatId -> do
+                let stateKey = "telegram.nick." <> renderEventId stored.storedId <> "." <> roomKey.key
+                done <- context.mappingStore.lookupState stateKey
+                case done of
+                  Just _ -> pure ()
+                  Nothing -> do
+                    result <- telegramSendMessage context.logger manager config chatId Nothing text
+                    case result of
+                      Left err -> logError context.logger ("telegram nick reflect error: " <> Text.pack err)
+                      Right sentMessage -> do
+                        context.mappingStore.insertMapping (telegramMessageKey sentMessage) stored.storedId
+                        context.mappingStore.setState stateKey "done"
     _ -> pure ()
  where
   sendToRoom info roomKey =
@@ -627,6 +665,8 @@ data TelegramMessage = TelegramMessage
   , entities :: [TelegramEntity]
   , replyToMessage :: Maybe TelegramMessageRef
   , media :: Maybe (BlobType, Text)
+  , newChatMembers :: [TelegramUser]
+  , leftChatMember :: Maybe TelegramUser
   }
 
 instance FromJSON TelegramMessage where
@@ -649,6 +689,8 @@ instance FromJSON TelegramMessage where
       <*> ((maybe [] id) <$> ((<|>) <$> obj .:? "entities" <*> obj .:? "caption_entities"))
       <*> obj .:? "reply_to_message"
       <*> pure ((ImageBlob,) . fileId <$> (photo <|> sticker) <|> (VideoBlob,) . fileId <$> (video <|> videoNote <|> animation) <|> (AudioBlob,) . fileId <$> (audio <|> voice) <|> (FileBlob,) . fileId <$> document)
+      <*> obj .:? "new_chat_members" .!= []
+      <*> obj .:? "left_chat_member"
 
 newtype TelegramMedia = TelegramMedia Text
 

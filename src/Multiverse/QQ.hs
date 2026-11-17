@@ -13,11 +13,12 @@ import Data.Aeson.Key qualified as Aeson.Key
 import Data.Aeson.KeyMap qualified as Aeson.KeyMap
 import Data.Aeson.Types (parseMaybe)
 import Data.ByteString (ByteString)
+import Data.ByteString qualified as ByteString
 import Data.ByteString.Base64 qualified as Base64
 import Data.ByteString.Lazy qualified as LByteString
 import Data.Foldable (toList)
 import Data.List.NonEmpty (NonEmpty ((:|)), nonEmpty)
-import Data.Maybe (fromMaybe, mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text.Encoding
@@ -96,8 +97,16 @@ observeQQEvent :: Timeline timeline => Manager -> QQConfig -> BridgeContext time
 observeQQEvent manager config context event =
   case (event.qqPostType, event.qqNoticeType, event.qqMessageType) of
     (Just "message", _, Just "group") -> observeQQMessage manager config context event
+    (Just "message", _, Just "private") -> logDebug context.logger "qq ignoring private message"
+    (Just "message_sent", _, _) -> logDebug context.logger "qq ignoring echoed message"
     (Just "notice", Just "group_recall", _) -> observeQQRetraction config context event
-    _ -> pure ()
+    (Just "notice", Just "group_increase", _) -> observeQQMembership manager config context event True
+    (Just "notice", Just "group_decrease", _) -> observeQQMembership manager config context event False
+    (Just "notice", Just "group_kick", _) -> observeQQMembership manager config context event False
+    (Just "notice", Just "group_card", _) -> observeQQCard config context event
+    (Just postType, Just noticeType, _) ->
+      logDebug context.logger ("qq ignoring notice " <> postType <> "/" <> noticeType)
+    _ -> logDebug context.logger "qq ignoring unrecognized event"
 
 observeQQMessage :: Timeline timeline => Manager -> QQConfig -> BridgeContext timeline -> QQEvent -> IO ()
 observeQQMessage manager config context event =
@@ -117,11 +126,19 @@ observeQQMessage manager config context event =
                 Nothing -> do
                   let senderName = qqSenderName userId event.qqSender
                   sender <- ensureQQUser context userId senderName
-                  segments <- pure (maybe [] messageSegments event.qqMessage)
-                  decoded <- mapM (decodeQQSegment manager context roomId messageKey) (zip [0 ..] segments)
-                  replyTo <- qqReplyTo context groupId (firstJust (map snd decoded))
-                  let bodyParts = concatMap fst decoded
-                      body = fromMaybe (plainMessage "") (nonEmpty bodyParts)
+                  ensureRoomMembership context "qq" roomId sender
+                  let messageContext =
+                        QQContext
+                          { manager
+                          , config
+                          , bridge = context
+                          , room = roomId
+                          , groupId
+                          , blobPrefix = messageKey.key
+                          }
+                  (bodyParts, replyId) <- decodeQQSegments messageContext (fromMaybe Null event.qqMessage)
+                  replyTo <- qqReplyTo context groupId replyId
+                  let body = fromMaybe (plainMessage "") (nonEmpty bodyParts)
                       timelineEvent =
                         Event
                           { platformKey = messageKey
@@ -140,6 +157,72 @@ observeQQMessage manager config context event =
                     Right _ -> pure ()
                     Left err -> logError context.logger ("qq message submit error: " <> Text.pack (show err))
     _ -> logDebug context.logger "qq ignored group message with incomplete identifiers"
+
+observeQQMembership :: Timeline timeline => Manager -> QQConfig -> BridgeContext timeline -> QQEvent -> Bool -> IO ()
+observeQQMembership manager config context event joined =
+  case (event.qqGroupId, event.qqUserId) of
+    (Just groupId, Just userId)
+      | event.qqSelfId == Just userId ->
+          logDebug context.logger ("qq ignoring own membership " <> userId)
+      | otherwise -> do
+          room <- configuredRoom config context groupId
+          case room of
+            Nothing -> pure ()
+            Just roomId -> do
+              name <- qqGroupMemberName manager config context.logger groupId userId (qqSenderName userId event.qqSender)
+              user <- ensureQQUser context userId name
+              let key = PlatformKey "qq" (if joined then "join" else "leave") (noticeKey groupId userId event.qqTime)
+                  content = if joined then JoinRoom user roomId else LeaveRoom user roomId
+              result <- submitMapped context Event {platformKey = key, content}
+              case result of
+                Left err -> logError context.logger ("qq membership submit error: " <> Text.pack (show err))
+                Right _ -> pure ()
+    _ -> logDebug context.logger "qq ignored membership notice with incomplete identifiers"
+
+observeQQCard :: Timeline timeline => QQConfig -> BridgeContext timeline -> QQEvent -> IO ()
+observeQQCard config context event =
+  case (event.qqGroupId, event.qqUserId, event.qqCardNew) of
+    (Just groupId, Just userId, Just card)
+      | event.qqSelfId == Just userId ->
+          logDebug context.logger ("qq ignoring own nickname change " <> userId)
+      | not (Text.null card) -> do
+          room <- configuredRoom config context groupId
+          case room of
+            Nothing -> pure ()
+            Just roomId -> do
+              let senderName = qqSenderName userId event.qqSender
+              user <- ensureQQUser context userId (if senderName == userId then card else senderName)
+              let key = PlatformKey "qq" "nick" (noticeKey groupId userId event.qqTime)
+              result <- submitMapped context Event {platformKey = key, content = ChangeRoomNick user roomId card}
+              case result of
+                Left err -> logError context.logger ("qq nickname submit error: " <> Text.pack (show err))
+                Right _ -> pure ()
+    _ -> logDebug context.logger "qq ignored card notice with incomplete identifiers"
+
+noticeKey :: Text -> Text -> Maybe Text -> Text
+noticeKey groupId userId time =
+  case time of
+    Just stamp -> groupId <> "/" <> userId <> "/" <> stamp
+    Nothing -> groupId <> "/" <> userId
+
+-- | Notices often carry no sender, so ask the platform for a display name.
+qqGroupMemberName :: Manager -> QQConfig -> Logger -> Text -> Text -> Text -> IO Text
+qqGroupMemberName manager config logger groupId userId fallback
+  | fallback /= userId = pure fallback
+  | otherwise = do
+      response <-
+        qqApiCall
+          logger
+          manager
+          config
+          "get_group_member_info"
+          (object ["group_id" .= qqIdJson groupId, "user_id" .= qqIdJson userId])
+      case response of
+        Left err -> do
+          logDebug logger ("qq get_group_member_info failed: " <> Text.pack err)
+          pure fallback
+        Right info ->
+          pure (fromMaybe fallback (firstNonempty [valueTextField "card" info, valueTextField "nickname" info]))
 
 observeQQRetraction :: Timeline timeline => QQConfig -> BridgeContext timeline -> QQEvent -> IO ()
 observeQQRetraction config context event =
@@ -188,61 +271,249 @@ ensureQQUser context qqUserId displayName = do
         Right eventId -> pure (UserId eventId)
         Left err -> fail ("could not create qq user: " <> show err)
 
-decodeQQSegment :: Timeline timeline => Manager -> BridgeContext timeline -> RoomId -> PlatformKey -> (Int, Value) -> IO ([MessagePart], Maybe Text)
-decodeQQSegment manager context room messageKey (index, segment) = do
+data QQContext timeline = QQContext
+  { manager :: Manager
+  , config :: QQConfig
+  , bridge :: BridgeContext timeline
+  , room :: RoomId
+  , groupId :: Text
+  , blobPrefix :: Text
+  }
+
+decodeQQSegments :: Timeline timeline => QQContext timeline -> Value -> IO ([MessagePart], Maybe Text)
+decodeQQSegments context value = do
+  decoded <- mapM (uncurry (decodeQQSegment context)) (zip [0 ..] (messageSegments value))
+  pure (concatMap fst decoded, firstJust (map snd decoded))
+
+decodeQQSegment :: Timeline timeline => QQContext timeline -> Int -> Value -> IO ([MessagePart], Maybe Text)
+decodeQQSegment context index segment = do
   let segmentType = valueTextField "type" segment
       segmentData = fromMaybe Null (valueField "data" segment)
   case segmentType of
-    Just "text" -> pure (oneTextPart (fromMaybe "" (valueTextField "text" segmentData)), Nothing)
-    Just "at" -> do
-      let targetId = valueTextField "qq" segmentData
-      case targetId of
-        Just "all" -> pure ([Text (Mention (Plain "@all" :| []) (Right room) :| [])], Nothing)
-        Just userId -> do
-          user <- ensureQQUser context userId userId
-          let label = Plain ("@" <> userId) :| []
-          pure ([Text (Mention label (Left user) :| [])], Nothing)
-        Nothing -> pure (oneTextPart "[mention]", Nothing)
-    Just "reply" -> pure ([], valueTextField "id" segmentData)
-    Just kind | kind `elem` ["image", "mface", "record", "video"] -> do
-      let blobType = case kind of
-            "record" -> AudioBlob
-            "video" -> VideoBlob
-            _ -> ImageBlob
-          url = valueTextField "url" segmentData <|> valueTextField "file" segmentData
-      blob <- traverse (importQQBlob manager context messageKey index) url
-      case blob of
-        Just (Just blobId) -> pure ([Blob blobType blobId], Nothing)
-        _ -> pure (oneTextPart ("[" <> kind <> "]"), Nothing)
-    Just "face" ->
-      let faceId = fromMaybe "?" (valueTextField "id" segmentData)
-       in pure (oneTextPart ("[face:" <> faceId <> "]"), Nothing)
-    Just "share" ->
-      let title = fromMaybe "link" (valueTextField "title" segmentData)
-          url = fromMaybe "" (valueTextField "url" segmentData)
-       in pure (oneTextPart (title <> if Text.null url then "" else " (" <> url <> ")"), Nothing)
-    Just kind -> pure (oneTextPart ("[" <> kind <> "]"), Nothing)
     Nothing -> pure (oneTextPart "[segment]", Nothing)
+    Just "text" ->
+      pure (oneTextPart (fromMaybe "" (valueTextField "text" segmentData)), Nothing)
+    Just "at" -> (, Nothing) <$> decodeQQMention context segmentData
+    Just "reply" -> pure ([], valueTextField "id" segmentData)
+    Just "image" -> do
+      blob <- importQQSegmentBlob context index segmentData
+      let flash = valueTextField "type" segmentData == Just "flash"
+          parts = qqBlobParts ImageBlob blob "image"
+      pure ((if flash then oneTextPart "[flash]" else []) <> parts, Nothing)
+    Just "mface" -> do
+      blob <- importQQSegmentBlob context index segmentData
+      let label = fromMaybe "mface" (valueTextField "summary" segmentData)
+      pure (qqBlobParts ImageBlob blob label, Nothing)
+    Just "record" -> decodeQQTypedBlob context index AudioBlob "record" segmentData
+    Just "video" -> decodeQQTypedBlob context index VideoBlob "video" segmentData
+    Just "cardimage" -> decodeQQTypedBlob context index ImageBlob "cardimage" segmentData
+    Just "file" -> do
+      blob <- importQQSegmentBlob context index segmentData
+      let label =
+            fromMaybe
+              "file"
+              (firstNonempty [valueTextField "name" segmentData, valueTextField "file_name" segmentData])
+      pure (qqBlobParts FileBlob blob label, Nothing)
+    Just "face" ->
+      pure (oneTextPart ("[face:" <> fromMaybe "?" (valueTextField "id" segmentData) <> "]"), Nothing)
+    Just "rps" -> pure (oneTextPart "[rps]", Nothing)
+    Just "dice" -> pure (oneTextPart "[dice]", Nothing)
+    Just "shake" -> pure (oneTextPart "[shake]", Nothing)
+    Just "poke" -> pure (oneTextPart "[poke]", Nothing)
+    Just "anonymous" -> pure ([], Nothing)
+    Just "keyboard" -> pure ([], Nothing)
+    Just "tts" -> pure (oneTextPart (fromMaybe "[tts]" (valueTextField "text" segmentData)), Nothing)
+    Just "share" -> pure (oneInlinePart (qqShareInline segmentData), Nothing)
+    Just "contact" -> pure (oneTextPart (qqContactText segmentData), Nothing)
+    Just "location" -> pure (oneInlinePart (qqLocationInline segmentData), Nothing)
+    Just "music" -> pure (oneInlinePart (qqMusicInline segmentData), Nothing)
+    Just "json" -> pure (oneTextPart (qqJsonCardText segmentData), Nothing)
+    Just "xml" -> pure (oneTextPart "[card]", Nothing)
+    Just "markdown" -> pure (oneTextPart (qqMarkdownText segmentData), Nothing)
+    Just "forward" -> (, Nothing) <$> decodeQQForward context index segmentData
+    Just "node" -> (, Nothing) <$> decodeQQNodes context (forwardPrefix context index) segmentData
+    Just other -> do
+      logDebug context.bridge.logger ("qq ignoring unsupported segment type " <> other)
+      pure (oneTextPart ("[" <> other <> "]"), Nothing)
 
-importQQBlob :: Timeline timeline => Manager -> BridgeContext timeline -> PlatformKey -> Int -> Text -> IO (Maybe BlobId)
-importQQBlob manager context messageKey index mediaUrl = do
-  existing <- context.mappingStore.lookupTimelineId blobKey
-  case existing of
-    Just eventId -> pure (Just (BlobId eventId))
-    Nothing -> do
-      bytes <- downloadQQMedia manager context.logger mediaUrl
-      case bytes of
-        Nothing -> pure Nothing
-        Just content -> do
-          let event = Event {platformKey = blobKey, content = CreateBlob content}
-          result <- submitMapped context event
-          case result of
-            Right eventId -> pure (Just (BlobId eventId))
-            Left err -> do
-              logError context.logger ("qq media submit error: " <> Text.pack (show err))
-              pure Nothing
+decodeQQTypedBlob :: Timeline timeline => QQContext timeline -> Int -> BlobType -> Text -> Value -> IO ([MessagePart], Maybe Text)
+decodeQQTypedBlob context index blobType label segmentData = do
+  blob <- importQQSegmentBlob context index segmentData
+  pure (qqBlobParts blobType blob label, Nothing)
+
+qqBlobParts :: BlobType -> Maybe BlobId -> Text -> [MessagePart]
+qqBlobParts blobType (Just blobId) _ = [Blob blobType blobId]
+qqBlobParts _ Nothing label = oneTextPart ("[" <> label <> "]")
+
+decodeQQMention :: Timeline timeline => QQContext timeline -> Value -> IO [MessagePart]
+decodeQQMention context segmentData =
+  case valueTextField "qq" segmentData of
+    Just "all" -> pure (oneInlinePart (Mention (Plain "@all" :| []) (Right context.room)))
+    Just userId -> do
+      let name = fromMaybe userId (firstNonempty [valueTextField "name" segmentData])
+      user <- ensureQQUser context.bridge userId name
+      pure (oneInlinePart (Mention (Plain ("@" <> name) :| []) (Left user)))
+    Nothing -> pure (oneTextPart "[mention]")
+
+importQQSegmentBlob :: Timeline timeline => QQContext timeline -> Int -> Value -> IO (Maybe BlobId)
+importQQSegmentBlob context index segmentData =
+  case firstHttpUrl [valueTextField "url" segmentData, valueTextField "file" segmentData, valueTextField "path" segmentData] of
+    Nothing -> pure Nothing
+    Just mediaUrl -> do
+      let blobKey = qqBlobKey context.blobPrefix index
+      existing <- context.bridge.mappingStore.lookupTimelineId blobKey
+      case existing of
+        Just eventId -> pure (Just (BlobId eventId))
+        Nothing -> do
+          bytes <- downloadQQMedia context.manager context.bridge.logger mediaUrl
+          case bytes of
+            Nothing -> pure Nothing
+            Just content -> do
+              let event = Event {platformKey = blobKey, content = CreateBlob content}
+              result <- submitMapped context.bridge event
+              case result of
+                Right eventId -> pure (Just (BlobId eventId))
+                Left err -> do
+                  logError context.bridge.logger ("qq media submit error: " <> Text.pack (show err))
+                  pure Nothing
+
+firstHttpUrl :: [Maybe Text] -> Maybe Text
+firstHttpUrl = firstJust . map (>>= httpUrl)
+
+httpUrl :: Text -> Maybe Text
+httpUrl text
+  | "http://" `Text.isPrefixOf` text = Just text
+  | "https://" `Text.isPrefixOf` text = Just text
+  | otherwise = Nothing
+
+decodeQQForward :: Timeline timeline => QQContext timeline -> Int -> Value -> IO [MessagePart]
+decodeQQForward context index segmentData =
+  case valueTextField "id" segmentData of
+    Just forwardId -> do
+      let params = object ["id" .= qqIdJson forwardId, "message_id" .= qqIdJson forwardId]
+      response <- qqApiCall context.bridge.logger context.manager context.config "get_forward_msg" params
+      case response of
+        Right value -> decodeQQNodes context (forwardPrefix context index) value
+        Left err -> do
+          logWarn context.bridge.logger ("qq get_forward_msg failed: " <> Text.pack err)
+          pure (oneTextPart "[forward]")
+    Nothing
+      | hasForwardContent segmentData -> decodeQQNodes context (forwardPrefix context index) segmentData
+      | otherwise -> pure (oneTextPart "[forward]")
+
+forwardPrefix :: QQContext timeline -> Int -> Text
+forwardPrefix context index = context.blobPrefix <> "/f" <> Text.pack (show index)
+
+hasForwardContent :: Value -> Bool
+hasForwardContent value = valueField "content" value /= Nothing || valueField "messages" value /= Nothing
+
+qqNodeValues :: Value -> [Value]
+qqNodeValues = \case
+  Array values -> toList values
+  value
+    | Just (Array messages) <- valueField "messages" value -> toList messages
+    | Just _ <- valueField "content" value -> [value]
+    | otherwise -> []
+
+decodeQQNodes :: Timeline timeline => QQContext timeline -> Text -> Value -> IO [MessagePart]
+decodeQQNodes context prefix value = do
+  messages <- mapM (uncurry (decodeQQNode context prefix)) (zip [0 ..] (qqNodeValues value))
+  pure case nonEmpty (catMaybes messages) of
+    Just items -> [List items]
+    Nothing -> oneTextPart "[forward]"
+
+decodeQQNode :: Timeline timeline => QQContext timeline -> Text -> Int -> Value -> IO (Maybe Message)
+decodeQQNode context prefix index node = do
+  let sender = fromMaybe Null (valueField "sender" node)
+      name =
+        firstNonempty
+          [ valueTextField "card" sender
+          , valueTextField "nickname" sender
+          , valueTextField "name" sender
+          , valueTextField "nickname" node
+          , valueTextField "user_id" node
+          ]
+      content = fromMaybe Null (valueField "content" node)
+      nodeContext = context {blobPrefix = prefix <> "/" <> Text.pack (show index)}
+  (parts, _) <- decodeQQSegments nodeContext content
+  pure (nonEmpty (maybe [] (\label -> oneTextPart (label <> ": ")) name <> parts))
+
+oneInlinePart :: InlineTextPart -> [MessagePart]
+oneInlinePart part = [Text (part :| [])]
+
+qqShareInline :: Value -> InlineTextPart
+qqShareInline segmentData =
+  let title = fromMaybe "link" (firstNonempty [valueTextField "title" segmentData, valueTextField "content" segmentData])
+   in case valueTextField "url" segmentData of
+        Just url -> Link (Plain title :| []) url
+        Nothing -> Plain title
+
+qqContactText :: Value -> Text
+qqContactText segmentData =
+  let kind = fromMaybe "contact" (valueTextField "type" segmentData)
+      target = fromMaybe "?" (valueTextField "id" segmentData)
+   in "[" <> kind <> ":" <> target <> "]"
+
+qqLocationInline :: Value -> InlineTextPart
+qqLocationInline segmentData =
+  case (valueTextField "lat" segmentData, valueTextField "lon" segmentData) of
+    (Just lat, Just lon) ->
+      let label =
+            Text.intercalate
+              " "
+              ( filter
+                  (not . Text.null)
+                  [ fromMaybe "location" (valueTextField "title" segmentData)
+                  , lat <> "," <> lon
+                  ]
+              )
+          mapUrl = "https://www.openstreetmap.org/?mlat=" <> lat <> "&mlon=" <> lon <> "#map=17/" <> lat <> "/" <> lon
+       in Link (Plain label :| []) mapUrl
+    _ -> Plain (fromMaybe "location" (firstNonempty [valueTextField "title" segmentData, valueTextField "content" segmentData]))
+
+qqMusicInline :: Value -> InlineTextPart
+qqMusicInline segmentData =
+  let title = fromMaybe "music" (firstNonempty [valueTextField "title" segmentData, valueTextField "id" segmentData])
+   in case valueTextField "url" segmentData of
+        Just url -> Link (Plain title :| []) url
+        Nothing -> Plain title
+
+qqJsonCardText :: Value -> Text
+qqJsonCardText segmentData =
+  case valueTextField "data" segmentData >>= decodeJsonText of
+    Just payload -> fromMaybe "[card]" (firstCardText payload)
+    Nothing -> "[card]"
  where
-  blobKey = qqBlobKey messageKey index
+  firstCardText payload =
+    firstNonempty
+      [ valueTextField "prompt" payload
+      , valueTextField "desc" payload
+      , valueField "meta" payload >>= firstMetaText
+      ]
+
+  firstMetaText (Object meta) =
+    firstNonempty
+      [ firstNonempty [valueTextField "title" value, valueTextField "desc" value]
+      | value <- toList meta
+      ]
+  firstMetaText _ = Nothing
+
+qqMarkdownText :: Value -> Text
+qqMarkdownText segmentData =
+  fromMaybe
+    "[markdown]"
+    ( firstNonempty
+        [ valueTextField "content" segmentData
+        , valueField "data" segmentData >>= valueTextField "content"
+        , valueTextField "data" segmentData >>= decodeJsonText >>= valueTextField "content"
+        ]
+    )
+
+decodeJsonText :: Text -> Maybe Value
+decodeJsonText raw =
+  case eitherDecodeStrict' (Text.Encoding.encodeUtf8 raw) :: Either String Value of
+    Right payload -> Just payload
+    Left _ -> Nothing
 
 downloadQQMedia :: Manager -> Logger -> Text -> IO (Maybe ByteString)
 downloadQQMedia manager logger mediaUrl = do
@@ -298,7 +569,31 @@ reflectQQEvent manager config context stored =
       | stored.storedEvent.platformKey.platform == "qq" ->
           logDebug context.logger ("qq not reflecting own-origin retraction " <> renderEventId stored.storedId)
       | otherwise -> retractQQMessages manager config context stored message
+    ChangeRoomNick user room nick
+      | stored.storedEvent.platformKey.platform == "qq" ->
+          logDebug context.logger ("qq not reflecting own-origin nick change " <> renderEventId stored.storedId)
+      | otherwise -> do
+          roomKeys <- context.mappingStore.lookupPlatformKeys (roomEventId room)
+          mapM_ (sendQQNickChange manager config context stored user nick) (filter (enabledRoom config.initialRooms) roomKeys)
     _ -> pure ()
+
+sendQQNickChange :: Timeline timeline => Manager -> QQConfig -> BridgeContext timeline -> StoredEvent -> UserId -> Text -> PlatformKey -> IO ()
+sendQQNickChange manager config context stored user nick roomKey =
+  case readMaybe (Text.unpack roomKey.key) :: Maybe Integer of
+    Nothing -> logWarn context.logger ("qq ignoring invalid group id " <> roomKey.key)
+    Just groupId -> do
+      alreadySent <- qqMessageMappedToGroup context stored.storedId roomKey.key
+      unless alreadySent do
+        text <- renderNickChange context user nick
+        let params = object ["group_id" .= groupId, "message" .= [qqTextSegment text.plainText]]
+        response <- qqApiCall context.logger manager config "send_group_msg" params
+        case response of
+          Left err -> logError context.logger ("qq nick send_group_msg failed: " <> Text.pack err)
+          Right result ->
+            case valueTextField "message_id" result of
+              Nothing -> logError context.logger "qq nick send_group_msg response lacked message_id"
+              Just messageId ->
+                context.mappingStore.insertMapping (qqMessageKey roomKey.key messageId) stored.storedId
 
 sendToQQRoom :: Timeline timeline => Manager -> QQConfig -> BridgeContext timeline -> StoredEvent -> SendMessageInfo -> PlatformKey -> IO ()
 sendToQQRoom manager config context stored info roomKey =
@@ -307,7 +602,16 @@ sendToQQRoom manager config context stored info roomKey =
     Just groupId -> do
       alreadySent <- qqMessageMappedToGroup context stored.storedId roomKey.key
       unless alreadySent do
-        body <- renderQQMessage context roomKey.key info
+        let qqContext =
+              QQContext
+                { manager
+                , config
+                , bridge = context
+                , room = info.room
+                , groupId = roomKey.key
+                , blobPrefix = ""
+                }
+        body <- renderQQMessage qqContext info
         replyTo <- qqReplyMessageId context roomKey.key info.replyTo
         let segments = maybe body (\messageId -> qqReplySegment messageId : body) replyTo
             params = object ["group_id" .= groupId, "message" .= segments]
@@ -367,70 +671,110 @@ deleteQQMessage manager config context stored (groupId, messageId) = do
         Left err -> logError context.logger ("qq delete_msg failed: " <> Text.pack err)
         Right _ -> context.mappingStore.insertMapping key stored.storedId
 
-renderQQMessage :: Timeline timeline => BridgeContext timeline -> Text -> SendMessageInfo -> IO [Value]
-renderQQMessage context groupId info = do
-  senderInfo <- getUserInfo context.timeline info.sender (Just info.room)
+renderQQMessage :: Timeline timeline => QQContext timeline -> SendMessageInfo -> IO [Value]
+renderQQMessage context info = do
+  senderInfo <- getUserInfo context.bridge.timeline info.sender (Just info.room)
   let senderName = maybe "unknown" (.name) senderInfo
-  body <- renderQQMessageBody context groupId info.room info.body
+  body <- renderQQMessageBody context info.body
   pure (qqTextSegment (senderName <> ": ") : body)
 
-renderQQMessageBody :: Timeline timeline => BridgeContext timeline -> Text -> RoomId -> Message -> IO [Value]
-renderQQMessageBody context groupId room = fmap concat . mapM (renderQQMessagePart context groupId room) . toList
+renderQQMessageBody :: Timeline timeline => QQContext timeline -> Message -> IO [Value]
+renderQQMessageBody context = fmap concat . mapM (renderQQMessagePart context) . toList
 
-renderQQMessagePart :: Timeline timeline => BridgeContext timeline -> Text -> RoomId -> MessagePart -> IO [Value]
-renderQQMessagePart context groupId room = \case
-  Text inline -> renderQQInline context groupId room inline
-  Emote inline -> (qqTextSegment "* " :) <$> renderQQInline context groupId room inline
+renderQQMessagePart :: Timeline timeline => QQContext timeline -> MessagePart -> IO [Value]
+renderQQMessagePart context = \case
+  Text inline -> renderQQInline context inline
+  Emote inline -> (qqTextSegment "* " :) <$> renderQQInline context inline
   Blob blobType blobId -> renderQQBlob context blobType blobId
-  List messages -> concat <$> mapM (\message -> (qqTextSegment "- " :) <$> renderQQMessageBody context groupId room message) (toList messages)
-  BlockQuote message -> (qqTextSegment "> " :) <$> renderQQMessageBody context groupId room message
+  List messages -> concat <$> mapM (\message -> (qqTextSegment "- " :) <$> renderQQMessageBody context message) (toList messages)
+  BlockQuote message -> (qqTextSegment "> " :) <$> renderQQMessageBody context message
   Heading level inline ->
     let safeLevel = max 1 (min 6 level)
-     in (qqTextSegment (Text.replicate safeLevel "#" <> " ") :) <$> renderQQInline context groupId room inline
+     in (qqTextSegment (Text.replicate safeLevel "#" <> " ") :) <$> renderQQInline context inline
 
-renderQQInline :: Timeline timeline => BridgeContext timeline -> Text -> RoomId -> InlineText -> IO [Value]
-renderQQInline context groupId room = fmap concat . mapM (renderQQInlinePart context groupId room) . toList
+renderQQInline :: Timeline timeline => QQContext timeline -> InlineText -> IO [Value]
+renderQQInline context = fmap concat . mapM (renderQQInlinePart context) . toList
 
-renderQQInlinePart :: Timeline timeline => BridgeContext timeline -> Text -> RoomId -> InlineTextPart -> IO [Value]
-renderQQInlinePart context groupId room = \case
+renderQQInlinePart :: Timeline timeline => QQContext timeline -> InlineTextPart -> IO [Value]
+renderQQInlinePart context = \case
   Bold inline -> wrapInline "*" inline
   Italic inline -> wrapInline "_" inline
   Link inline url -> do
-    rendered <- renderQQInline context groupId room inline
-    pure (rendered <> [qqTextSegment " (" , qqTextSegment url, qqTextSegment ")"])
+    rendered <- renderQQInline context inline
+    pure (rendered <> [qqTextSegment " (", qqTextSegment url, qqTextSegment ")"])
   Mention inline (Left user) -> do
-    keys <- context.mappingStore.lookupPlatformKeys (userEventId user)
+    keys <- context.bridge.mappingStore.lookupPlatformKeys (userEventId user)
     case [key.key | key <- keys, key.platform == "qq", key.entityType == "user"] of
-      qqUserId : _ -> pure [object ["type" .= ("at" :: Text), "data" .= object ["qq" .= qqUserId]]]
-      [] -> renderQQInline context groupId room inline
+      qqUserId : _ -> pure [object ["type" .= ("at" :: Text), "data" .= object ["qq" .= qqIdJson qqUserId]]]
+      [] -> renderQQInline context inline
   Mention inline (Right mentionedRoom)
-    | roomEventId mentionedRoom == roomEventId room ->
+    | roomEventId mentionedRoom == roomEventId context.room ->
         pure [object ["type" .= ("at" :: Text), "data" .= object ["qq" .= ("all" :: Text)]]]
-    | otherwise -> renderQQInline context groupId room inline
+    | otherwise -> renderQQInline context inline
   InlineQuote inline -> do
-    rendered <- renderQQInline context groupId room inline
-    pure ([qqTextSegment "\"" ] <> rendered <> [qqTextSegment "\""])
+    rendered <- renderQQInline context inline
+    pure ([qqTextSegment "\""] <> rendered <> [qqTextSegment "\""])
   Plain text -> pure [qqTextSegment text]
  where
   wrapInline marker inline = do
-    rendered <- renderQQInline context groupId room inline
+    rendered <- renderQQInline context inline
     pure ([qqTextSegment marker] <> rendered <> [qqTextSegment marker])
 
-renderQQBlob :: Timeline timeline => BridgeContext timeline -> BlobType -> BlobId -> IO [Value]
-renderQQBlob _ FileBlob _ = pure [qqTextSegment "[file]"]
+renderQQBlob :: Timeline timeline => QQContext timeline -> BlobType -> BlobId -> IO [Value]
 renderQQBlob context blobType blobId = do
-  stored <- getEvent context.timeline (blobEventId blobId)
+  stored <- getEvent context.bridge.timeline (blobEventId blobId)
   case fmap (.storedEvent.content) stored of
     Just (CreateBlob bytes) ->
-      let kind = case blobType of
-            ImageBlob -> "image"
-            VideoBlob -> "video"
-            AudioBlob -> "record"
-            FileBlob -> "file"
-          file = "base64://" <> Text.Encoding.decodeUtf8 (Base64.encode bytes)
-       in pure [object ["type" .= (kind :: Text), "data" .= object ["file" .= file]]]
+      case blobType of
+        FileBlob -> uploadQQFile context blobId bytes
+        _ -> pure [qqMediaSegment blobType bytes]
     _ -> pure [qqTextSegment "[blob]"]
 
+qqMediaSegment :: BlobType -> ByteString -> Value
+qqMediaSegment blobType bytes =
+  let kind = case blobType of
+        ImageBlob -> "image"
+        VideoBlob -> "video"
+        AudioBlob -> "record"
+        FileBlob -> "file"
+      file = "base64://" <> Text.Encoding.decodeUtf8 (Base64.encode bytes)
+   in object ["type" .= (kind :: Text), "data" .= object ["file" .= file]]
+
+uploadQQFile :: Timeline timeline => QQContext timeline -> BlobId -> ByteString -> IO [Value]
+uploadQQFile context blobId bytes = do
+  let name = "file-" <> Text.take 12 (renderEventId (blobEventId blobId)) <> sniffExtension bytes
+      params =
+        object
+          [ "group_id" .= qqIdJson context.groupId
+          , "file" .= ("base64://" <> Text.Encoding.decodeUtf8 (Base64.encode bytes))
+          , "name" .= name
+          ]
+  response <- qqApiCall context.bridge.logger context.manager context.config "upload_group_file" params
+  case response of
+    Right _ -> pure [qqTextSegment ("[" <> name <> "]")]
+    Left err -> do
+      logError context.bridge.logger ("qq upload_group_file failed: " <> Text.pack err)
+      pure [qqTextSegment "[file]"]
+
+sniffExtension :: ByteString -> Text
+sniffExtension bytes
+  | "\137PNG" `ByteString.isPrefixOf` bytes = ".png"
+  | "\255\216\255" `ByteString.isPrefixOf` bytes = ".jpg"
+  | "GIF8" `ByteString.isPrefixOf` bytes = ".gif"
+  | "BM" `ByteString.isPrefixOf` bytes = ".bmp"
+  | "RIFF" `ByteString.isPrefixOf` bytes && ByteString.take 4 (ByteString.drop 8 bytes) == "WEBP" = ".webp"
+  | "RIFF" `ByteString.isPrefixOf` bytes && ByteString.take 4 (ByteString.drop 8 bytes) == "WAVE" = ".wav"
+  | "ID3" `ByteString.isPrefixOf` bytes = ".mp3"
+  | "OggS" `ByteString.isPrefixOf` bytes = ".ogg"
+  | "fLaC" `ByteString.isPrefixOf` bytes = ".flac"
+  | "#!AMR" `ByteString.isPrefixOf` bytes = ".amr"
+  | "\2#!SILK_V3" `ByteString.isPrefixOf` bytes = ".silk"
+  | "%PDF" `ByteString.isPrefixOf` bytes = ".pdf"
+  | "PK\3\4" `ByteString.isPrefixOf` bytes = ".zip"
+  | "\31\139" `ByteString.isPrefixOf` bytes = ".gz"
+  | "ftyp" `ByteString.isPrefixOf` ByteString.drop 4 bytes = ".mp4"
+  | "\26\69\223\163" `ByteString.isPrefixOf` bytes = ".webm"
+  | otherwise = ""
 fetchInitialRoomInfo :: Logger -> Manager -> QQConfig -> InitialRoomMapping -> IO RoomInfo
 fetchInitialRoomInfo logger manager config mapping = do
   response <- qqApiCall logger manager config "get_group_info" (object ["group_id" .= qqIdJson mapping.platformKey.key])
@@ -491,6 +835,8 @@ data QQEvent = QQEvent
   , qqMessageId :: Maybe Text
   , qqMessage :: Maybe Value
   , qqSender :: Maybe QQSender
+  , qqTime :: Maybe Text
+  , qqCardNew :: Maybe Text
   }
 
 instance FromJSON QQEvent where
@@ -507,6 +853,8 @@ instance FromJSON QQEvent where
         , qqMessageId = valueTextField "message_id" (Object obj)
         , qqMessage = Aeson.KeyMap.lookup "message" obj
         , qqSender = sender
+        , qqTime = valueTextField "time" (Object obj)
+        , qqCardNew = valueTextField "card_new" (Object obj)
         }
 
 data QQSender = QQSender
@@ -521,8 +869,48 @@ instance FromJSON QQSender where
 messageSegments :: Value -> [Value]
 messageSegments = \case
   Array values -> toList values
-  String text -> [object ["type" .= ("text" :: Text), "data" .= object ["text" .= text]]]
+  String text -> parseCQSegments text
   _ -> []
+
+-- | OneBot implementations may deliver messages as CQ code strings instead of
+-- segment arrays. Decode those into the same segment shape.
+parseCQSegments :: Text -> [Value]
+parseCQSegments = go
+ where
+  go text =
+    case Text.breakOn "[CQ:" text of
+      (plain, rest)
+        | Text.null rest -> textSegments plain
+        | otherwise ->
+            textSegments plain <> case Text.breakOn "]" rest of
+              (rawSegment, remainder)
+                | Text.null remainder -> [cqSegment rawSegment]
+                | otherwise -> cqSegment rawSegment : go (Text.drop 1 remainder)
+
+  textSegments plain = [qqTextSegment (unescapeCQ plain) | not (Text.null plain)]
+
+  cqSegment rawSegment =
+    let body = Text.drop 4 rawSegment
+        (kind, parameterText) = Text.breakOn "," body
+     in object
+          [ "type" .= kind
+          , "data" .= object [Aeson.Key.fromText key .= value | (key, value) <- cqParameters parameterText]
+          ]
+
+  cqParameters parameterText =
+    [ (key, unescapeCQ rawValue)
+    | pair <- Text.splitOn "," (Text.drop 1 parameterText)
+    , let (key, rawValue) = Text.breakOn "=" pair
+    , not (Text.null key)
+    ]
+
+unescapeCQ :: Text -> Text
+unescapeCQ =
+  Text.replace "&amp;" "&"
+    . Text.replace "&#44;" ","
+    . Text.replace "&#93;" "]"
+    . Text.replace "&#91;" "["
+
 
 valueField :: Text -> Value -> Maybe Value
 valueField key (Object obj) = Aeson.KeyMap.lookup (Aeson.Key.fromText key) obj
@@ -586,8 +974,8 @@ qqUserKey userId = PlatformKey "qq" "user" userId
 qqMessageKey :: Text -> Text -> PlatformKey
 qqMessageKey groupId messageId = PlatformKey "qq" "message" (groupId <> "/" <> messageId)
 
-qqBlobKey :: PlatformKey -> Int -> PlatformKey
-qqBlobKey messageKey index = PlatformKey "qq" "blob" (messageKey.key <> "/" <> Text.pack (show index))
+qqBlobKey :: Text -> Int -> PlatformKey
+qqBlobKey prefix index = PlatformKey "qq" "blob" (prefix <> "/" <> Text.pack (show index))
 
 qqRetractionKey :: Text -> EventId -> PlatformKey
 qqRetractionKey groupId eventId_ = PlatformKey "qq" "retraction" (groupId <> "/" <> renderEventId eventId_)

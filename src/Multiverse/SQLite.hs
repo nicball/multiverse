@@ -41,6 +41,7 @@ instance Timeline SQLiteTimeline where
   getEventsAfter (SQLiteTimeline connection) = eventsAfter connection
   getUserInfo (SQLiteTimeline connection) = lookupUserInfo connection
   getRoomInfo (SQLiteTimeline connection) = lookupRoomInfo connection
+  getRoomMembers (SQLiteTimeline connection) = lookupRoomMembers connection
   getMessage (SQLiteTimeline connection) = lookupMessage connection
 
 migrate :: Connection -> IO ()
@@ -119,9 +120,18 @@ eventsAfter connection afterEventId = do
   either throwIO pure (decodeStoredRows rows)
 
 lookupUserInfo :: Connection -> UserId -> Maybe RoomId -> IO (Maybe UserInfo)
-lookupUserInfo connection user _room = do
+lookupUserInfo connection user room = do
   storedEvents <- eventsAfter connection Nothing
-  pure (foldl' (applyUser user) Nothing storedEvents)
+  let (info, roomName) = foldl' (applyUser user room) (Nothing, Nothing) storedEvents
+  pure (applyRoomName info roomName)
+ where
+  applyRoomName (Just value) (Just roomName) = Just UserInfo {name = roomName, avatar = value.avatar}
+  applyRoomName info _ = info
+
+lookupRoomMembers :: Connection -> RoomId -> IO [UserId]
+lookupRoomMembers connection room = do
+  storedEvents <- eventsAfter connection Nothing
+  pure (foldl' (applyMembership room) [] storedEvents)
 
 lookupRoomInfo :: Connection -> RoomId -> IO (Maybe RoomInfo)
 lookupRoomInfo connection room = do
@@ -160,13 +170,24 @@ decodeStoredRow row =
     <$> parse "event id" row.rowEventId
     <*> parse "event" row.rowEvent
 
-applyUser :: UserId -> Maybe UserInfo -> StoredEvent -> Maybe UserInfo
-applyUser user current stored =
+applyUser :: UserId -> Maybe RoomId -> (Maybe UserInfo, Maybe Text) -> StoredEvent -> (Maybe UserInfo, Maybe Text)
+applyUser user room (current, roomName) stored =
   case stored.storedEvent.content of
     CreateUser info
-      | UserId stored.storedId == user -> Just info
+      | UserId stored.storedId == user -> (Just info, Nothing)
     ModifyUser modifiedUser info
-      | modifiedUser == user -> Just info
+      | modifiedUser == user -> (Just info, roomName)
+    ChangeRoomNick changedUser changedRoom nick
+      | changedUser == user, room == Just changedRoom -> (current, Just nick)
+    _ -> (current, roomName)
+
+applyMembership :: RoomId -> [UserId] -> StoredEvent -> [UserId]
+applyMembership room current stored =
+  case stored.storedEvent.content of
+    JoinRoom user joinedRoom
+      | joinedRoom == room -> if user `elem` current then current else current <> [user]
+    LeaveRoom user leftRoom
+      | leftRoom == room -> filter (/= user) current
     _ -> current
 
 applyRoom :: RoomId -> Maybe RoomInfo -> StoredEvent -> Maybe RoomInfo

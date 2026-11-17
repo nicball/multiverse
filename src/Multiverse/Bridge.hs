@@ -8,6 +8,8 @@ module Multiverse.Bridge
   , hasPlatformMapping
   , renderRelayedMessage
   , renderMessageBody
+  , renderNickChange
+  , ensureRoomMembership
   , submitMapped
   , submitMessageMapped
   , openMappingStore
@@ -84,6 +86,16 @@ renderMessageBody message =
         , htmlText = Text.intercalate "\n" (map (.htmlText) parts)
         }
 
+renderNickChange :: Timeline timeline => BridgeContext timeline -> UserId -> Text -> IO RenderedMessage
+renderNickChange context user nick = do
+  userInfo <- getUserInfo context.timeline user Nothing
+  let previous = maybe "unknown" (.name) userInfo
+  pure
+    RenderedMessage
+      { plainText = "* " <> previous <> " is now known as " <> nick
+      , htmlText = "<em>" <> htmlEscape previous <> " is now known as " <> htmlEscape nick <> "</em>"
+      }
+
 renderMessagePart :: MessagePart -> RenderedMessage
 renderMessagePart = \case
   Text inline -> renderInline inline
@@ -155,6 +167,23 @@ htmlEscape =
 
 htmlAttributeEscape :: Text -> Text
 htmlAttributeEscape = htmlEscape
+
+-- | Bridges learn about users lazily, so the first sighting of a user in a
+-- room also establishes their membership. The key is derived from the referenced
+-- events, so repeated sightings dedupe to the same event.
+ensureRoomMembership :: Timeline timeline => BridgeContext timeline -> Text -> RoomId -> UserId -> IO ()
+ensureRoomMembership context platform room user = do
+  let platformKey =
+        PlatformKey
+          platform
+          "join"
+          (renderId (roomEventId room) <> "/" <> renderId (userEventId user))
+  result <- submitMapped context Event {platformKey, content = JoinRoom user room}
+  case result of
+    Left err -> logError context.logger ("membership submit error: " <> Text.pack (show err))
+    Right _ -> pure ()
+ where
+  renderId (EventId value) = value
 
 submitMapped :: Timeline timeline => BridgeContext timeline -> Event -> IO (Either SubmitError EventId)
 submitMapped context event = do
