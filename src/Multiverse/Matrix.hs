@@ -328,13 +328,13 @@ reflectEvent context stored =
             Just (SendMessage info) -> do
               unless (messageBlobs info.body == messageBlobs body) do
                 logWarn context.logger "matrix cannot reflect changes to message attachments"
-              text <- renderRelayedMessage context.timeline info {body = textBody body}
+              (profile, text) <- matrixRelayBody context info (renderMessageBody (textBody body))
               targets <- matrixEditTargets context message
               alreadyMapped <- hasPlatformMapping context.mappingStore "matrix" stored.storedId
               unless alreadyMapped do
                 forM_ targets \(roomId, matrixEventId) -> do
                   let txnId = matrixTransactionId stored "edit" roomId
-                  result <- matrixSendEdit context roomId txnId matrixEventId text
+                  result <- matrixSendEdit context roomId txnId matrixEventId profile text
                   case result of
                     Left err -> logError context.logger ("matrix edit reflect error: " <> Text.pack err)
                     Right editEventId -> context.mappingStore.insertMapping (matrixEventKey roomId editEventId) stored.storedId
@@ -345,8 +345,12 @@ reflectEvent context stored =
       | otherwise -> do
           alreadyMapped <- hasPlatformMapping context.mappingStore "matrix" stored.storedId
           unless alreadyMapped do
+            original <- getEvent context.timeline (messageEventId message)
+            let target = case fmap (.storedEvent.content) original of
+                  Just (SendMessage info) -> Just info
+                  _ -> Nothing
             targets <- matrixRetractTargets context message
-            mapM_ redactInRoom (filter (enabledRoom context.config.initialRooms . matrixRoomKey . fst) targets)
+            mapM_ (redactInRoom target) (filter (enabledRoom context.config.initialRooms . matrixRoomKey . fst) targets)
     ChangeRoomNick user room nick
       | stored.storedEvent.platformKey.platform == "matrix" ->
           logDebug context.logger ("matrix not reflecting own-origin nick change " <> renderEventId stored.storedId)
@@ -392,20 +396,25 @@ reflectEvent context stored =
                   Right mediaUrl -> do
                     context.mappingStore.insertMapping (matrixBlobKey mediaUrl) (blobEventId blobId)
                     let blobReplyTo = if index == 1 && not (hasTextContent info.body) then replyTo else Nothing
-                        content = matrixMediaContent kind name mimeType (ByteString.length bytes) mediaUrl
+                        content = matrixMediaContent (Just profile) kind name mimeType (ByteString.length bytes) mediaUrl
                         partTxnId = matrixTransactionId stored ("part" <> Text.pack (show index)) roomId
                     sendPart (matrixSendMedia context roomId partTxnId blobReplyTo content)
               _ -> logError context.logger "matrix media blob is missing"
       when (hasTextContent info.body) sendText
       forM_ (zip [1 :: Int ..] blobs) (uncurry sendBlob)
-  redactInRoom (roomId, eventId_) = do
+  redactInRoom target (roomId, eventId_) = do
     let txnId = matrixTransactionId stored "redact" roomId
     result <- matrixRedactMessage context roomId txnId eventId_
     case result of
       Left err -> do
         logError context.logger ("matrix retract reflect error: " <> Text.pack err)
         let fallbackTxnId = matrixTransactionId stored "redact-failure" roomId
-        fallback <- matrixSendMessage context roomId fallbackTxnId Nothing Nothing (retractionFailureMessage err)
+        (profile, notice) <- case target of
+          Just info -> do
+            (targetProfile, prefixed) <- matrixRelayBody context info (retractionFailureMessage err)
+            pure (Just targetProfile, prefixed)
+          Nothing -> pure (Nothing, retractionFailureMessage err)
+        fallback <- matrixSendMessage context roomId fallbackTxnId Nothing profile notice
         case fallback of
           Left fallbackErr -> logError context.logger ("matrix retract failure notice error: " <> Text.pack fallbackErr)
           Right matrixEventId -> context.mappingStore.insertMapping (matrixEventKey roomId matrixEventId) stored.storedId
@@ -509,25 +518,30 @@ matrixGetDisplayName context matrixUserId = do
   pure (decodeMatrix response)
 
 renderMatrixRelayMessage :: Timeline timeline => Context timeline -> SendMessageInfo -> IO (Value, RenderedMessage)
-renderMatrixRelayMessage context info = do
+renderMatrixRelayMessage context info = matrixRelayBody context info (renderMessageBody info.body)
+
+-- | Attaches the sender's MSC4144 profile to a message body. Edits and retraction
+-- notices reuse the profile of the message they act on, so a relayed message keeps
+-- the sender it was originally given. The name is repeated in the body because the
+-- profile key is unstable and clients without it must still see who sent this.
+matrixRelayBody :: Timeline timeline => Context timeline -> SendMessageInfo -> RenderedMessage -> IO (Value, RenderedMessage)
+matrixRelayBody context info body = do
   user <- getUserInfo context.timeline info.sender (Just info.room)
   let displayName = matrixProfileDisplayName (maybe "unknown" (.name) user)
-      message = renderMessageBody info.body
       profile =
         object
           [ "id" .= renderEventId (userEventId info.sender)
           , "displayname" .= displayName
           , "avatar_url" .= ("" :: Text)
-          , "has_fallback" .= True
           ]
       fallback =
         RenderedMessage
-          { plainText = displayName <> ": " <> message.plainText
+          { plainText = displayName <> ": " <> body.plainText
           , htmlText =
               "<strong data-mx-profile-fallback>"
                 <> matrixHtmlEscape displayName
                 <> ": </strong>"
-                <> message.htmlText
+                <> body.htmlText
           }
   pure (profile, fallback)
 
@@ -579,8 +593,8 @@ matrixSendMessage context roomId txnId replyTo profile body = do
     Left err -> Left err
     Right sent -> Right sent.eventId
 
-matrixSendEdit :: Context timeline -> Text -> Text -> Text -> RenderedMessage -> IO (Either String Text)
-matrixSendEdit context roomId txnId targetEventId body = do
+matrixSendEdit :: Context timeline -> Text -> Text -> Text -> Value -> RenderedMessage -> IO (Either String Text)
+matrixSendEdit context roomId txnId targetEventId profile body = do
   request0 <-
     authorizedRequest
       context
@@ -593,7 +607,7 @@ matrixSendEdit context roomId txnId targetEventId body = do
   let request =
         request0
           { method = "PUT"
-          , requestBody = RequestBodyLBS (encode (matrixEditContent targetEventId body))
+          , requestBody = RequestBodyLBS (encode (matrixEditContent targetEventId profile body))
           , requestHeaders = ("Content-Type", "application/json") : request0.requestHeaders
           }
   response <- loggedHttp context.logger request context.manager
@@ -707,45 +721,62 @@ matrixDownloadMedia context uri =
 
 matrixMessageContent :: Maybe Text -> Maybe Value -> RenderedMessage -> Value
 matrixMessageContent replyTo profile body =
-  object
-    ( [ "msgtype" .= ("m.text" :: Text)
+  matrixWithProfile profile True
+    . matrixWithReply replyTo
+    $ object
+      [ "msgtype" .= ("m.text" :: Text)
       , "body" .= body.plainText
       , "format" .= ("org.matrix.custom.html" :: Text)
       , "formatted_body" .= body.htmlText
       ]
-        <> maybe
-          []
-          (\eventId_ -> ["m.relates_to" .= object ["m.in_reply_to" .= object ["event_id" .= eventId_]]])
-          replyTo
-        -- MSC4144 specifies this unstable prefix until the proposal is accepted.
-        <> maybe [] (\profile_ -> ["com.beeper.per_message_profile" .= profile_]) profile
-    )
 
-matrixEditContent :: Text -> RenderedMessage -> Value
-matrixEditContent targetEventId body =
-  object
-    [ "msgtype" .= ("m.text" :: Text)
-    , "body" .= ("* " <> body.plainText)
-    , "format" .= ("org.matrix.custom.html" :: Text)
-    , "formatted_body" .= ("* " <> body.htmlText)
-    , "m.new_content"
-        .= object
-          [ "msgtype" .= ("m.text" :: Text)
-          , "body" .= body.plainText
-          , "format" .= ("org.matrix.custom.html" :: Text)
-          , "formatted_body" .= body.htmlText
-          ]
-    , "m.relates_to" .= object ["rel_type" .= ("m.replace" :: Text), "event_id" .= targetEventId]
-    ]
+matrixEditContent :: Text -> Value -> RenderedMessage -> Value
+matrixEditContent targetEventId profile body =
+  matrixWithProfile (Just profile) True
+    $ object
+      [ "msgtype" .= ("m.text" :: Text)
+      , "body" .= ("* " <> body.plainText)
+      , "format" .= ("org.matrix.custom.html" :: Text)
+      , "formatted_body" .= ("* " <> body.htmlText)
+      , "m.new_content"
+          .= object
+            [ "msgtype" .= ("m.text" :: Text)
+            , "body" .= body.plainText
+            , "format" .= ("org.matrix.custom.html" :: Text)
+            , "formatted_body" .= body.htmlText
+            ]
+      , "m.relates_to" .= object ["rel_type" .= ("m.replace" :: Text), "event_id" .= targetEventId]
+      ]
 
-matrixMediaContent :: BlobType -> Text -> Text -> Int -> Text -> Value
-matrixMediaContent kind fileName mimeType size mediaUrl =
-  object
-    [ "msgtype" .= matrixMsgType kind
-    , "body" .= fileName
-    , "url" .= mediaUrl
-    , "info" .= object ["mimetype" .= mimeType, "size" .= size]
-    ]
+matrixMediaContent :: Maybe Value -> BlobType -> Text -> Text -> Int -> Text -> Value
+matrixMediaContent profile kind fileName mimeType size mediaUrl =
+  matrixWithProfile profile False
+    $ object
+      [ "msgtype" .= matrixMsgType kind
+      , "body" .= fileName
+      , "url" .= mediaUrl
+      , "info" .= object ["mimetype" .= mimeType, "size" .= size]
+      ]
+
+-- | MSC4144 specifies the unstable key until the proposal is accepted.
+-- @has_fallback@ promises that the sender name is also present in the content as
+-- text; only a text body has room for it, so media sends claim no fallback.
+matrixWithProfile :: Maybe Value -> Bool -> Value -> Value
+matrixWithProfile Nothing _ content = content
+matrixWithProfile (Just profile) hasFallback content =
+  case content of
+    Object fields ->
+      Object
+        ( Aeson.KeyMap.insert
+            "com.beeper.per_message_profile"
+            (withFallback profile)
+            fields
+        )
+    other -> other
+ where
+  withFallback = \case
+    Object profileFields -> Object (Aeson.KeyMap.insert "has_fallback" (Bool hasFallback) profileFields)
+    other -> other
 
 matrixMsgType :: BlobType -> Text
 matrixMsgType = \case
