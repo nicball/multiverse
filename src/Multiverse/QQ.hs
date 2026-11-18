@@ -578,7 +578,7 @@ decodeQQNode context prefix index node = do
           , forwardDepth = context.forwardDepth + 1
           }
   (parts, _) <- decodeQQSegments nodeContext (nodeBodyOf node)
-  pure (nonEmpty (maybe [] (\label -> oneTextPart (label <> ": ")) name <> parts))
+  pure (nonEmpty (maybe [] (\label -> [Text (Bold (plainInline (label <> ": ")) :| [])]) name <> parts))
 
 -- | NapCat flat nodes keep the body in @message@, OneBot node segments in
 -- @content@, and @raw_message@ is the text of last resort.
