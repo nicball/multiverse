@@ -158,6 +158,8 @@ observeQQMessage context event =
                           , room = roomId
                           , groupId
                           , blobPrefix = messageKey.key
+                          , forwardRoot = Just messageId
+                          , forwardDepth = 0
                           }
                   (bodyParts, replyId) <- decodeQQSegments messageContext (fromMaybe Null event.qqMessage)
                   replyTo <- qqReplyTo context groupId replyId
@@ -283,7 +285,14 @@ data QQContext timeline = QQContext
   , room :: RoomId
   , groupId :: Text
   , blobPrefix :: Text
+  , forwardRoot :: Maybe Text
+  , forwardDepth :: Int
   }
+
+-- | QQ never expands a forward nested inside another forward, so nesting is
+-- only worth a bounded amount of work.
+maxForwardDepth :: Int
+maxForwardDepth = 3
 
 decodeQQSegments :: Timeline timeline => QQContext timeline -> Value -> IO ([MessagePart], Maybe Text)
 decodeQQSegments context value = do
@@ -336,7 +345,9 @@ decodeQQSegment context index segment = do
     Just "xml" -> pure (oneTextPart "[card]", Nothing)
     Just "markdown" -> pure (oneTextPart (qqMarkdownText segmentData), Nothing)
     Just "forward" -> (, Nothing) <$> decodeQQForward context index segmentData
-    Just "node" -> (, Nothing) <$> decodeQQNodes context (forwardPrefix context index) segmentData
+    Just "node"
+      | context.forwardDepth >= maxForwardDepth -> pure (oneTextPart "[forward]", Nothing)
+      | otherwise -> (, Nothing) <$> decodeQQNodes context (forwardPrefix context index) segmentData
     Just other -> do
       logDebug context.bridge.logger ("qq ignoring unsupported segment type " <> other)
       pure (oneTextPart ("[" <> other <> "]"), Nothing)
@@ -417,33 +428,129 @@ httpUrl text
   | otherwise = Nothing
 
 decodeQQForward :: Timeline timeline => QQContext timeline -> Int -> Value -> IO [MessagePart]
-decodeQQForward context index segmentData =
-  case valueTextField "id" segmentData of
+decodeQQForward context index segmentData = do
+  resolved <- resolveForwardContent context segmentData
+  case resolved of
+    Just value -> decodeQQNodes context (forwardPrefix context index) value
+    Nothing -> pure (oneTextPart "[forward]")
+
+-- | A @forward@ segment carries the resolved nodes only when NapCat's OneBot
+-- @parseMultMsg@ option is on, and @get_forward_msg@ cannot expand a forward
+-- nested inside another one ("消息已过期或者为内层消息"). Content already in
+-- hand therefore wins, then the container message, then the API call.
+resolveForwardContent :: Timeline timeline => QQContext timeline -> Value -> IO (Maybe Value)
+resolveForwardContent context segmentData
+  | hasForwardContent segmentData = pure (Just segmentData)
+  | context.forwardDepth >= maxForwardDepth = pure Nothing
+  | otherwise = do
+      fromMessage <- forwardContentFromMessage context
+      case fromMessage of
+        Just value -> pure (Just value)
+        Nothing -> forwardContentFromApi context segmentData
+
+-- | A freshly observed message often still has its forward card expanded, and
+-- @get_msg@ hands the card body back inline even when the event did not.
+forwardContentFromMessage :: Timeline timeline => QQContext timeline -> IO (Maybe Value)
+forwardContentFromMessage context =
+  case context.forwardRoot of
+    Just messageId
+      | context.forwardDepth == 0 -> do
+          response <- qqApiCall context.bridge "get_msg" (object ["message_id" .= qqIdJson messageId])
+          case response of
+            Right value ->
+              pure
+                ( firstJust
+                    (map inlineForwardContent (messageSegments (fromMaybe Null (valueField "message" value))))
+                )
+            Left err -> do
+              reportForwardFailure context "get_msg" err
+              pure Nothing
+    _ -> pure Nothing
+
+inlineForwardContent :: Value -> Maybe Value
+inlineForwardContent segment
+  | valueTextField "type" segment == Just "forward"
+  , Just segmentData <- valueField "data" segment
+  , hasForwardContent segmentData =
+      Just segmentData
+  | otherwise = Nothing
+
+forwardContentFromApi :: Timeline timeline => QQContext timeline -> Value -> IO (Maybe Value)
+forwardContentFromApi context segmentData =
+  case forwardIdOf segmentData of
+    Nothing -> pure Nothing
     Just forwardId -> do
-      let params = object ["id" .= qqIdJson forwardId, "message_id" .= qqIdJson forwardId]
+      let params =
+            object
+              [ "id" .= qqIdJson forwardId
+              , "message_id" .= qqIdJson forwardId
+              ]
       response <- qqApiCall context.bridge "get_forward_msg" params
       case response of
-        Right value -> decodeQQNodes context (forwardPrefix context index) value
+        Right value -> pure (Just value)
         Left err -> do
-          logWarn context.bridge.logger ("qq get_forward_msg failed: " <> Text.pack err)
-          pure (oneTextPart "[forward]")
-    Nothing
-      | hasForwardContent segmentData -> decodeQQNodes context (forwardPrefix context index) segmentData
-      | otherwise -> pure (oneTextPart "[forward]")
+          reportForwardFailure context "get_forward_msg" err
+          pure Nothing
+
+-- | NapCat names the forward resource @id@, other OneBot builds @res_id@.
+forwardIdOf :: Value -> Maybe Text
+forwardIdOf segmentData =
+  firstJust
+    [ valueTextField "id" segmentData
+    , valueTextField "res_id" segmentData
+    , valueTextField "resId" segmentData
+    ]
+
+-- | An expired forward and a nested one are normal traffic, not incidents.
+reportForwardFailure :: Timeline timeline => QQContext timeline -> Text -> String -> IO ()
+reportForwardFailure context action err =
+  let message = "qq " <> action <> " could not expand forward: " <> Text.pack err
+      expected marker = marker `Text.isInfixOf` Text.pack err
+   in if any expected ["已过期", "内层消息"]
+        then logDebug context.bridge.logger message
+        else logWarn context.bridge.logger message
 
 forwardPrefix :: QQContext timeline -> Int -> Text
 forwardPrefix context index = context.blobPrefix <> "/f" <> Text.pack (show index)
 
 hasForwardContent :: Value -> Bool
-hasForwardContent value = valueField "content" value /= Nothing || valueField "messages" value /= Nothing
+hasForwardContent = not . null . qqNodeValues
 
+-- | Node lists arrive in several shapes: the OneBot @messages@ array, the
+-- inline @content@ array NapCat emits for expanded forwards, a bare array, or
+-- a single node on its own.
 qqNodeValues :: Value -> [Value]
 qqNodeValues = \case
   Array values -> toList values
-  value
+  value@(Object _)
     | Just (Array messages) <- valueField "messages" value -> toList messages
+    | Just (Array nodes) <- valueField "content" value
+    , not (null (toList nodes))
+    , all looksLikeNode (toList nodes) ->
+        toList nodes
+    | looksLikeNode value -> [value]
     | Just _ <- valueField "content" value -> [value]
     | otherwise -> []
+  _ -> []
+
+-- | NapCat's @get_forward_msg@ returns flat nodes, while OneBot node segments
+-- wrap a node in @data@.
+looksLikeNode :: Value -> Bool
+looksLikeNode value@(Object _) = any (\key -> valueField key value /= Nothing) nodeMarkerKeys
+looksLikeNode _ = False
+
+nodeMarkerKeys :: [Text]
+nodeMarkerKeys =
+  [ "sender"
+  , "user_id"
+  , "uin"
+  , "nickname"
+  , "raw_message"
+  , "message_seq"
+  , "real_id"
+  , "message_type"
+  , "message"
+  ]
 
 decodeQQNodes :: Timeline timeline => QQContext timeline -> Text -> Value -> IO [MessagePart]
 decodeQQNodes context prefix value = do
@@ -461,12 +568,29 @@ decodeQQNode context prefix index node = do
           , valueTextField "nickname" sender
           , valueTextField "name" sender
           , valueTextField "nickname" node
+          , valueTextField "name" node
+          , valueTextField "uin" node
           , valueTextField "user_id" node
           ]
-      content = fromMaybe Null (valueField "content" node)
-      nodeContext = context {blobPrefix = prefix <> "/" <> Text.pack (show index)}
-  (parts, _) <- decodeQQSegments nodeContext content
+      nodeContext =
+        context
+          { blobPrefix = prefix <> "/" <> Text.pack (show index)
+          , forwardDepth = context.forwardDepth + 1
+          }
+  (parts, _) <- decodeQQSegments nodeContext (nodeBodyOf node)
   pure (nonEmpty (maybe [] (\label -> oneTextPart (label <> ": ")) name <> parts))
+
+-- | NapCat flat nodes keep the body in @message@, OneBot node segments in
+-- @content@, and @raw_message@ is the text of last resort.
+nodeBodyOf :: Value -> Value
+nodeBodyOf node
+  | not (null (messageSegments messageBody)) = messageBody
+  | not (null (messageSegments contentBody)) = contentBody
+  | otherwise = maybe Null String rawText
+ where
+  messageBody = fromMaybe Null (valueField "message" node)
+  contentBody = fromMaybe Null (valueField "content" node)
+  rawText = valueTextField "raw_message" node
 
 oneInlinePart :: InlineTextPart -> [MessagePart]
 oneInlinePart part = [Text (part :| [])]
@@ -639,6 +763,8 @@ sendToQQRoom context stored info roomKey =
                 , room = info.room
                 , groupId = roomKey.key
                 , blobPrefix = ""
+                , forwardRoot = Nothing
+                , forwardDepth = 0
                 }
         body <- renderQQMessage qqContext info
         replyTo <- qqReplyMessageId context roomKey.key info.replyTo
