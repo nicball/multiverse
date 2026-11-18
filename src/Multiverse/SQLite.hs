@@ -41,6 +41,7 @@ instance Timeline SQLiteTimeline where
   getUserInfo (SQLiteTimeline connection) = lookupUserInfo connection
   getRoomInfo (SQLiteTimeline connection) = lookupRoomInfo connection
   getRoomMembers (SQLiteTimeline connection) = lookupRoomMembers connection
+  getMembership (SQLiteTimeline connection) = lookupMembership connection
   getMessage (SQLiteTimeline connection) = lookupMessage connection
 
 migrate :: Connection -> IO ()
@@ -150,6 +151,12 @@ lookupRoomMembers :: Connection -> RoomId -> IO [UserId]
 lookupRoomMembers connection room =
   foldEvents connection (applyMembership room) []
 
+-- | The head of a @(user, room)@ membership chain: the latest join or leave
+-- event for that pair, whichever came last in submission order.
+lookupMembership :: Connection -> UserId -> RoomId -> IO (Maybe EventId)
+lookupMembership connection user room =
+  foldEvents connection (applyMembershipEvent user room) Nothing
+
 lookupRoomInfo :: Connection -> RoomId -> IO (Maybe RoomInfo)
 lookupRoomInfo connection room =
   foldEvents connection (applyRoom room) Nothing
@@ -181,12 +188,21 @@ applyUser user room (current, roomName) stored =
       | changedUser == user, room == Just changedRoom -> (current, Just nick)
     _ -> (current, roomName)
 
+applyMembershipEvent :: UserId -> RoomId -> Maybe EventId -> StoredEvent -> Maybe EventId
+applyMembershipEvent user room current stored =
+  case stored.storedEvent.content of
+    JoinRoom joinedUser joinedRoom _
+      | joinedUser == user, joinedRoom == room -> Just stored.storedId
+    LeaveRoom leftUser leftRoom _
+      | leftUser == user, leftRoom == room -> Just stored.storedId
+    _ -> current
+
 applyMembership :: RoomId -> [UserId] -> StoredEvent -> [UserId]
 applyMembership room current stored =
   case stored.storedEvent.content of
-    JoinRoom user joinedRoom
+    JoinRoom user joinedRoom _
       | joinedRoom == room -> if user `elem` current then current else current <> [user]
-    LeaveRoom user leftRoom
+    LeaveRoom user leftRoom _
       | leftRoom == room -> filter (/= user) current
     _ -> current
 

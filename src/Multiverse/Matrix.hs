@@ -270,8 +270,10 @@ observeMatrixMember observer room event member
       Left err -> logError context.logger ("matrix membership submit error: " <> Text.pack (show err))
       Right _ -> pure ()
 
-  submitMembership kind user =
-    submitEvent (eventKey kind) (if kind == "join" then JoinRoom user room else LeaveRoom user room)
+  submitMembership kind user = do
+    previous <- getMembership context.timeline user room
+    let content = if kind == "join" then JoinRoom user room previous else LeaveRoom user room previous
+    submitEvent (eventKey kind) content
 
   submitNick user nick = submitEvent (eventKey "nick") (ChangeRoomNick user room nick)
 

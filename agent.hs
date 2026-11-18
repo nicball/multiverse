@@ -67,8 +67,8 @@ data EventContent
   = CreateRoom RoomInfo
   | CreateUser UserInfo
   | CreateBlob ByteString
-  | JoinRoom UserId RoomId
-  | LeaveRoom UserId RoomId
+  | JoinRoom UserId RoomId (Maybe EventId)
+  | LeaveRoom UserId RoomId (Maybe EventId)
   | SendMessage SendMessageInfo
   | RetractMessage MessageId
   | EditMessage MessageId Message
@@ -83,6 +83,7 @@ class Timeline timeline where
   getUserInfo :: timeline -> UserId -> Maybe RoomId -> IO (Maybe UserInfo)
   getRoomInfo :: timeline -> RoomId -> IO (Maybe RoomInfo)
   getRoomMembers :: timeline -> RoomId -> IO [UserId]
+  getMembership :: timeline -> UserId -> RoomId -> IO (Maybe EventId)
   getMessage :: timeline -> MessageId -> IO (Maybe Message)
 
 data StoredEvent = StoredEvent

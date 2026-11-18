@@ -87,8 +87,8 @@ data EventContent
   = CreateRoom RoomInfo
   | CreateUser UserInfo
   | CreateBlob ByteString
-  | JoinRoom UserId RoomId
-  | LeaveRoom UserId RoomId
+  | JoinRoom UserId RoomId (Maybe EventId)
+  | LeaveRoom UserId RoomId (Maybe EventId)
   | SendMessage SendMessageInfo
   | RetractMessage MessageId
   | EditMessage MessageId Message
@@ -106,8 +106,10 @@ eventReferences event =
     CreateRoom info -> maybe [] ((: []) . blobEventId) info.avatar
     CreateUser info -> maybe [] ((: []) . blobEventId) info.avatar
     CreateBlob _ -> []
-    JoinRoom user room -> [userEventId user, roomEventId room]
-    LeaveRoom user room -> [userEventId user, roomEventId room]
+    JoinRoom user room previous ->
+      [userEventId user, roomEventId room] <> maybe [] pure previous
+    LeaveRoom user room previous ->
+      [userEventId user, roomEventId room] <> maybe [] pure previous
     SendMessage info ->
       userEventId info.sender
         : roomEventId info.room

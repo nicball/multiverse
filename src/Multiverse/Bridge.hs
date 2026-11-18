@@ -34,7 +34,7 @@ where
 
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Exception (SomeException, try)
-import Control.Monad (forever, void)
+import Control.Monad (forever, unless, void)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as ByteString
 import Data.List.NonEmpty (nonEmpty, toList)
@@ -259,19 +259,34 @@ sniffType bytes
   | otherwise = ("", "application/octet-stream")
 
 -- | Bridges learn about users lazily, so the first sighting of a user in a
--- room also establishes their membership. The key is derived from the referenced
--- events, so repeated sightings dedupe to the same event.
+-- room also establishes their membership. The last join/leave event for the
+-- pair decides whether the user is currently in the room; a new join links to
+-- it, so the membership events of a @(user, room)@ pair form a linked list.
 ensureRoomMembership :: Timeline timeline => Logger -> timeline -> MappingStore -> Text -> RoomId -> UserId -> IO ()
 ensureRoomMembership logger timeline mappingStore platform room user = do
-  let platformKey =
-        PlatformKey
-          platform
-          "join"
-          (renderId (roomEventId room) <> "/" <> renderId (userEventId user))
-  result <- submitMapped logger timeline mappingStore Event {platformKey, content = JoinRoom user room}
-  case result of
-    Left err -> logError logger ("membership submit error: " <> Text.pack (show err))
-    Right _ -> pure ()
+  previous <- getMembership timeline user room
+  alreadyJoined <- case previous of
+    Nothing -> pure False
+    Just previousId -> do
+      previousEvent <- getEvent timeline previousId
+      pure case fmap (.storedEvent.content) previousEvent of
+        Just (JoinRoom _ _ _) -> True
+        _ -> False
+  unless alreadyJoined do
+    let platformKey =
+          PlatformKey
+            platform
+            "join"
+            ( renderId (roomEventId room)
+                <> "/"
+                <> renderId (userEventId user)
+                <> "/"
+                <> maybe "none" renderId previous
+            )
+    result <- submitMapped logger timeline mappingStore Event {platformKey, content = JoinRoom user room previous}
+    case result of
+      Left err -> logError logger ("membership submit error: " <> Text.pack (show err))
+      Right _ -> pure ()
  where
   renderId (EventId value) = value
 
@@ -369,8 +384,8 @@ eventKind = \case
   CreateRoom _ -> "room creation"
   CreateUser _ -> "user creation"
   CreateBlob _ -> "blob creation"
-  JoinRoom _ _ -> "room join"
-  LeaveRoom _ _ -> "room leave"
+  JoinRoom _ _ _ -> "room join"
+  LeaveRoom _ _ _ -> "room leave"
   SendMessage _ -> "message"
   RetractMessage _ -> "retraction"
   EditMessage _ _ -> "edit"

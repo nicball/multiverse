@@ -138,9 +138,10 @@ observeTelegramMembership context message roomId = do
  where
   submitMembership kind member = do
     user <- ensureUser context member
+    previous <- getMembership context.timeline user roomId
     let platformKey =
           PlatformKey "telegram" kind ((telegramMessageKey message).key <> "/" <> Text.pack (show member.userId))
-        content = if kind == "join" then JoinRoom user roomId else LeaveRoom user roomId
+        content = if kind == "join" then JoinRoom user roomId previous else LeaveRoom user roomId previous
     result <- submitMapped context.logger context.timeline context.mappingStore Event {platformKey, content}
     case result of
       Left err -> logError context.logger ("telegram membership submit error: " <> Text.pack (show err))

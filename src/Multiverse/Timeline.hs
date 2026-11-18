@@ -15,6 +15,7 @@ class Timeline timeline where
   getUserInfo :: timeline -> UserId -> Maybe RoomId -> IO (Maybe UserInfo)
   getRoomInfo :: timeline -> RoomId -> IO (Maybe RoomInfo)
   getRoomMembers :: timeline -> RoomId -> IO [UserId]
+  getMembership :: timeline -> UserId -> RoomId -> IO (Maybe EventId)
   getMessage :: timeline -> MessageId -> IO (Maybe Message)
 
 data StoredEvent = StoredEvent

@@ -194,8 +194,9 @@ observeQQMembership context event joined =
             Just roomId -> do
               name <- qqGroupMemberName context groupId userId (qqSenderName userId event.qqSender)
               user <- ensureQQUser context userId name
+              previous <- getMembership context.timeline user roomId
               let key = PlatformKey "qq" (if joined then "join" else "leave") (noticeKey groupId userId event.qqTime)
-                  content = if joined then JoinRoom user roomId else LeaveRoom user roomId
+                  content = if joined then JoinRoom user roomId previous else LeaveRoom user roomId previous
               result <- submitMapped context.logger context.timeline context.mappingStore Event {platformKey = key, content}
               case result of
                 Left err -> logError context.logger ("qq membership submit error: " <> Text.pack (show err))
