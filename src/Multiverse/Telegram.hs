@@ -10,10 +10,11 @@ import Data.Aeson
 import Data.ByteString qualified as ByteString
 import Data.ByteString.Char8 qualified as ByteString.Char8
 import Data.ByteString.Lazy qualified as LByteString
-import Data.List (sortOn)
+import Data.Function (on)
+import Data.List (nubBy, sortOn)
 import Data.List.NonEmpty (NonEmpty ((:|)), nonEmpty)
 import Data.List.NonEmpty qualified as NonEmpty
-import Data.Maybe (catMaybes, fromMaybe, mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isJust, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text
@@ -214,21 +215,16 @@ reflectEvent context stored =
             Just (SendMessage info) -> do
               unless (messageBlobs info.body == messageBlobs body) do
                 logWarn context.logger "telegram cannot reflect changes to message attachments"
-              targets <- telegramRetractTargets context message
               text <- renderRelayedMessage context.timeline info {body = textBody body}
-              forM_ (filter (enabledTelegramTarget context) targets) \(chatId, messageId) -> do
-                textId <- context.mappingStore.lookupState ("telegram.send." <> renderEventId (messageEventId message) <> "." <> Text.pack (show chatId) <> ".0")
-                whenTextTarget textId messageId do
-                  let editKey = "telegram.edit." <> renderEventId stored.storedId <> "." <> Text.pack (show chatId) <> "." <> Text.pack (show messageId)
-                  done <- context.mappingStore.lookupState editKey
-                  case done of
-                    Just _ -> pure ()
-                    Nothing -> do
-                      result <- telegramEditText context chatId messageId text
-                      case result of
-                        Left err | not ("message is not modified" `Text.isInfixOf` Text.toLower (Text.pack err)) ->
-                          logError context.logger ("telegram edit reflect error: " <> Text.pack err)
-                        _ -> context.mappingStore.setState editKey "done"
+              alreadyMapped <- hasPlatformMapping context.mappingStore "telegram" stored.storedId
+              unless alreadyMapped do
+                targets <- telegramTextTargets context message
+                forM_ (filter (enabledTelegramTarget context) targets) \(chatId, messageId) -> do
+                  result <- telegramEditText context chatId messageId text
+                  case result of
+                    Left err | not ("message is not modified" `Text.isInfixOf` Text.toLower (Text.pack err)) ->
+                      logError context.logger ("telegram edit reflect error: " <> Text.pack err)
+                    _ -> context.mappingStore.insertMapping (telegramEditKey stored.storedId chatId messageId) stored.storedId
             _ -> pure ()
       | otherwise -> pure ()
     RetractMessage message
@@ -249,54 +245,66 @@ reflectEvent context stored =
             case readMaybe (Text.unpack roomKey.key) of
               Nothing -> logWarn context.logger ("telegram ignoring invalid chat id " <> roomKey.key)
               Just chatId -> do
-                let stateKey = "telegram.nick." <> renderEventId stored.storedId <> "." <> roomKey.key
-                done <- context.mappingStore.lookupState stateKey
-                case done of
-                  Just _ -> pure ()
-                  Nothing -> do
-                    result <- telegramSendMessage context chatId Nothing text
-                    case result of
-                      Left err -> logError context.logger ("telegram nick reflect error: " <> Text.pack err)
-                      Right sentMessage -> do
-                        context.mappingStore.insertMapping (telegramMessageKey sentMessage) stored.storedId
-                        context.mappingStore.setState stateKey "done"
+                alreadySent <- telegramMessageMappedToChat context stored.storedId roomKey.key
+                unless alreadySent do
+                  result <- telegramSendMessage context chatId Nothing text
+                  case result of
+                    Left err -> logError context.logger ("telegram nick reflect error: " <> Text.pack err)
+                    Right sentMessage ->
+                      context.mappingStore.insertMapping (telegramMessageKey sentMessage) stored.storedId
     _ -> pure ()
  where
+  -- A message is reflected part by part; each part's mapping row is written as
+  -- soon as that part is delivered, and the room's mapping row is what stops the
+  -- event from being reflected into the same chat twice. An interrupted message
+  -- is therefore not resumed where it stopped.
   sendToRoom info roomKey =
     case readMaybe (Text.unpack roomKey.key) of
       Nothing -> pure ()
       Just chatId -> do
-        text <- renderRelayedMessage context.timeline info {body = textBody info.body}
-        replyTo <- telegramReplyMessageId context roomKey info.replyTo
-        let stateKey index = "telegram.send." <> renderEventId stored.storedId <> "." <> roomKey.key <> "." <> Text.pack (show index)
-            sendPart index action = do
-              sent <- context.mappingStore.lookupState (stateKey index)
-              case sent of
-                Just _ -> pure ()
-                Nothing -> do
-                  result <- action
-                  case result of
-                    Left err -> logError context.logger ("telegram reflect error: " <> Text.pack err)
-                    Right message -> do
-                      context.mappingStore.insertMapping (telegramMessageKey message) stored.storedId
-                      context.mappingStore.setState (stateKey index) (Text.pack (show message.messageId))
-        sendPart (0 :: Int) (telegramSendMessage context chatId replyTo text)
-        forM_ (zip [1 ..] (messageBlobs info.body)) \(index, (kind, blobId)) -> do
-          blob <- getEvent context.timeline (blobEventId blobId)
-          case fmap (.storedEvent.content) blob of
-            Just (CreateBlob bytes) -> sendPart index (sendMappedMedia context chatId replyTo kind blobId bytes)
-            _ -> logError context.logger "telegram media blob is missing"
+        alreadySent <- telegramMessageMappedToChat context stored.storedId roomKey.key
+        unless alreadySent do
+          text <- renderRelayedMessage context.timeline info {body = textBody info.body}
+          replyTo <- telegramReplyMessageId context roomKey info.replyTo
+          let sendPart action = do
+                result <- action
+                case result of
+                  Left err -> logError context.logger ("telegram reflect error: " <> Text.pack err)
+                  Right message ->
+                    context.mappingStore.insertMapping (telegramMessageKey message) stored.storedId
+          sendPart (telegramSendMessage context chatId replyTo text)
+          forM_ (messageBlobs info.body) \(kind, blobId) -> do
+            blob <- getEvent context.timeline (blobEventId blobId)
+            case fmap (.storedEvent.content) blob of
+              Just (CreateBlob bytes) -> sendPart (sendMappedMedia context chatId replyTo kind blobId bytes)
+              _ -> logError context.logger "telegram media blob is missing"
   deleteInChat (chatId, messageId) = do
     result <- telegramDeleteMessage context chatId messageId
     case result of
       Left err -> logError context.logger ("telegram retract reflect error: " <> Text.pack err)
       Right () -> context.mappingStore.insertMapping (telegramRetractionKey stored.storedId) stored.storedId
 
-whenTextTarget :: Maybe Text -> Int -> IO () -> IO ()
-whenTextTarget target messageId action =
-  case target of
-    Just value | readMaybe (Text.unpack value) /= Just messageId -> pure ()
-    _ -> action
+-- | Telegram reports no identifier for an edit, so the applied edit is recorded
+-- under a key derived from the platform message it changed.
+telegramEditKey :: EventId -> Integer -> Int -> PlatformKey
+telegramEditKey eventId_ chatId messageId =
+  PlatformKey
+    "telegram"
+    "edit"
+    (renderEventId eventId_ <> "/" <> Text.pack (show chatId) <> "/" <> Text.pack (show messageId))
+
+telegramMessageMappedToChat :: Context timeline -> EventId -> Text -> IO Bool
+telegramMessageMappedToChat context eventId_ chatId = do
+  keys <- context.mappingStore.lookupPlatformKeys eventId_
+  pure (any (isJust . matchingTelegramMessage chatId) keys)
+
+-- | Telegram cannot say which of the messages sent for an event carries its
+-- text, but the text part is always sent first and message ids grow within a
+-- chat, so the smallest id in each chat is the text part.
+telegramTextTargets :: Context timeline -> MessageId -> IO [(Integer, Int)]
+telegramTextTargets context message = do
+  targets <- telegramRetractTargets context message
+  pure (nubBy ((==) `on` fst) (sortOn id targets))
 
 enabledTelegramTarget :: Context timeline -> (Integer, Int) -> Bool
 enabledTelegramTarget context (chatId, _) =
@@ -747,7 +755,6 @@ instance FromJSON TelegramMessageRef where
 
 data TelegramUser = TelegramUser
   { userId :: Integer
-  , username :: Maybe Text
   , firstName :: Maybe Text
   , lastName :: Maybe Text
   }
@@ -756,7 +763,6 @@ instance FromJSON TelegramUser where
   parseJSON = withObject "TelegramUser" \obj ->
     TelegramUser
       <$> obj .: "id"
-      <*> obj .:? "username"
       <*> obj .:? "first_name"
       <*> obj .:? "last_name"
 

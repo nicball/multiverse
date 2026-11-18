@@ -8,11 +8,19 @@ Each entity (message, user, room, blob, etc) is identified by its creation event
 
 Each event has a platform key which describes the origin platform event id. The platform key must be unique. Each event has an ID which is a cryptographic hash from the event content. Therefore the ID is also unique and provide idempotency for submission.
 
+Timeline-owned resources such as blobs have no platform origin. Their platform key is `multiverse:blob:<sha256 of the content>`, so blob identity is content-based and identical bytes dedupe to a single event.
+
 The timeline is persistent through sqlite. It may has additional tables to make state query more efficient. The timeline is a typeclass which the sqlite backend provides an instance with.
 
 # The Bridges
 
 Each platform, i.e. Telegram/Matrix/QQ, bridge maintains its own two way mapping of platform entities/events to its timeline counterparts. This mapping is also persistent separately.
+
+A bridge mapping has two roles: platform messages/entities to timeline events, and platform media resource keys to timeline blobs. The bridge-local resource key (for example Telegram `file_unique_id`, a Matrix `mxc://` URI, or a QQ message segment position) need not equal the timeline blob's platform key, and several platform resource keys may map to the same content-addressed blob.
+
+A mapping key is the platform key of the entity, so it carries whatever the platform needs to identify that entity by itself: Telegram and QQ message keys are `<room id>/<message id>`, and Matrix message keys are `<room id>/<event id>` because a Matrix event id does not name its room. One timeline event therefore has one mapping row per platform entity it was reflected as, and the row is also the record that the side effect happened. Consequently a partially delivered multi-part message is not resumed where it stopped.
+
+The bridge state table holds only opaque platform cursors, such as a Matrix sync batch token or a Telegram update offset, and derived media handles such as an uploaded blob's URL or file id.
 
 Each bridge has two parts: Observer and Reflector.
 

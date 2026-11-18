@@ -305,7 +305,7 @@ submitBlob timeline mappingStore sourceKey bytes = do
 openMappingStore :: FilePath -> IO MappingStore
 openMappingStore path = do
   connection <- open path
-  migrateMappingStore connection
+  initializeMappingStore connection
   pure
     MappingStore
       { lookupTimelineId = lookupTimelineIdSql connection
@@ -372,25 +372,36 @@ renderPlatformKey :: PlatformKey -> Text
 renderPlatformKey platformKey =
   platformKey.platform <> ":" <> platformKey.entityType <> ":" <> platformKey.key
 
-migrateMappingStore :: Connection -> IO ()
-migrateMappingStore connection = do
-  execute_
-    connection
-    "CREATE TABLE IF NOT EXISTS bridge_mappings\
-    \ (platform TEXT NOT NULL,\
-    \  entity_type TEXT NOT NULL,\
-    \  platform_key TEXT NOT NULL,\
-    \  event_id TEXT NOT NULL,\
-    \  UNIQUE (platform, entity_type, platform_key),\
-    \  UNIQUE (event_id, platform, entity_type, platform_key))"
-  execute_
-    connection
-    "CREATE INDEX IF NOT EXISTS bridge_mappings_event_id_idx ON bridge_mappings (event_id)"
-  execute_
-    connection
-    "CREATE TABLE IF NOT EXISTS bridge_state\
-    \ (key TEXT PRIMARY KEY,\
-    \  value TEXT NOT NULL)"
+-- | A bridge mapping is a single fact: this platform entity is that timeline
+-- event. Rooms are part of the platform key because a platform key identifies
+-- one platform-side entity on its own; one timeline event therefore maps to as
+-- many platform keys as it was reflected into.
+bridgeMappingsDdl :: Query
+bridgeMappingsDdl =
+  "CREATE TABLE IF NOT EXISTS bridge_mappings\
+  \ (platform TEXT NOT NULL,\
+  \  entity_type TEXT NOT NULL,\
+  \  platform_key TEXT NOT NULL,\
+  \  event_id TEXT NOT NULL,\
+  \  UNIQUE (platform, entity_type, platform_key))"
+
+bridgeMappingsIndexDdl :: Query
+bridgeMappingsIndexDdl =
+  "CREATE INDEX IF NOT EXISTS bridge_mappings_event_id_idx ON bridge_mappings (event_id)"
+
+-- | Only opaque platform cursors and derived media handles belong here; the fact
+-- that something was reflected is a @bridge_mappings@ row.
+bridgeStateDdl :: Query
+bridgeStateDdl =
+  "CREATE TABLE IF NOT EXISTS bridge_state\
+  \ (key TEXT PRIMARY KEY,\
+  \  value TEXT NOT NULL)"
+
+initializeMappingStore :: Connection -> IO ()
+initializeMappingStore connection = do
+  execute_ connection bridgeStateDdl
+  execute_ connection bridgeMappingsDdl
+  execute_ connection bridgeMappingsIndexDdl
 
 lookupTimelineIdSql :: Connection -> PlatformKey -> IO (Maybe EventId)
 lookupTimelineIdSql connection platformKey = do

@@ -6,7 +6,6 @@ module Multiverse.SQLite
 where
 
 import Control.Exception (Exception, throwIO)
-import Data.Int (Int64)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Database.SQLite.Simple
@@ -18,13 +17,12 @@ import Multiverse.Types
 newtype SQLiteTimeline = SQLiteTimeline Connection
 
 data StoredRow = StoredRow
-  { rowSeq :: Int64
-  , rowEventId :: Text
+  { rowEventId :: Text
   , rowEvent :: Text
   }
 
 instance FromRow StoredRow where
-  fromRow = StoredRow <$> field <*> field <*> field
+  fromRow = StoredRow <$> field <*> field
 
 openTimeline :: FilePath -> IO SQLiteTimeline
 openTimeline path = do
@@ -116,7 +114,7 @@ platformKeyConflict connection platformKey = do
 
 lookupEvent :: Connection -> EventId -> IO (Maybe StoredEvent)
 lookupEvent connection wantedId = do
-  rows <- query connection "SELECT seq, event_id, event FROM events WHERE event_id = ?" (Only (renderRead wantedId))
+  rows <- query connection "SELECT event_id, event FROM events WHERE event_id = ?" (Only (renderRead wantedId))
   case decodeStoredRows rows of
     Left err -> throwIO err
     Right [] -> pure Nothing
@@ -127,11 +125,11 @@ eventsAfter connection afterEventId = do
   rows <-
     case afterEventId of
       Nothing ->
-        query_ connection "SELECT seq, event_id, event FROM events ORDER BY seq ASC"
+        query_ connection "SELECT event_id, event FROM events ORDER BY seq ASC"
       Just eventId_ ->
         query
           connection
-          "SELECT seq, event_id, event FROM events\
+          "SELECT event_id, event FROM events\
           \ WHERE seq > (SELECT seq FROM events WHERE event_id = ?)\
           \ ORDER BY seq ASC"
           (Only (renderRead eventId_))
