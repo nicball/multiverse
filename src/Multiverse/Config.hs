@@ -9,6 +9,7 @@ module Multiverse.Config
   )
 where
 
+import Control.Monad (void)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import System.Directory (doesFileExist)
@@ -71,9 +72,8 @@ loadConfig path = do
     else pure defaultConfig
 
 writeConfig :: FilePath -> AppConfig -> IO ()
-writeConfig path config = do
-  _ <- Toml.encodeToFile appConfigCodec path config
-  pure ()
+writeConfig path config =
+  void (Toml.encodeToFile appConfigCodec path config)
 
 defaultConfig :: AppConfig
 defaultConfig =
@@ -137,7 +137,7 @@ platformKeyCodec platform =
 roomIdCodec :: TomlCodec RoomId
 roomIdCodec =
   Toml.dimap
-    renderRoomId
+    (renderEventId . roomEventId)
     (RoomId . EventId)
     (Toml.text "timeline_room")
 
@@ -161,9 +161,6 @@ optionalWithDefault fallback =
     Just
     (maybe fallback id)
     . Toml.dioptional
-
-renderRoomId :: RoomId -> Text
-renderRoomId (RoomId (EventId eventId)) = eventId
 
 renderLogLevel :: LogLevel -> Text
 renderLogLevel = \case

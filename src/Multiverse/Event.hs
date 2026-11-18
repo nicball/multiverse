@@ -5,6 +5,8 @@ module Multiverse.Event
   , InlineTextPart (..)
   , InlineText
   , Message
+  , plainInline
+  , plainMessage
   , SendMessageInfo (..)
   , UserInfo (..)
   , RoomInfo (..)
@@ -14,14 +16,14 @@ module Multiverse.Event
   )
 where
 
+import Crypto.Hash.SHA256 qualified as SHA256
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as ByteString
-import Crypto.Hash.SHA256 qualified as SHA256
 import Data.Char (intToDigit)
-import Data.List.NonEmpty (NonEmpty, toList)
+import Data.List.NonEmpty (NonEmpty ((:|)), toList)
 import Data.Text (Text)
 import Data.Text qualified as Text
-import Data.Text.Encoding qualified as Text
+import Data.Text.Encoding qualified as Text.Encoding
 import Data.Word (Word8)
 import Multiverse.Types
 
@@ -52,6 +54,12 @@ data InlineTextPart
 type InlineText = NonEmpty InlineTextPart
 
 type Message = NonEmpty MessagePart
+
+plainInline :: Text -> InlineText
+plainInline text = Plain text :| []
+
+plainMessage :: Text -> Message
+plainMessage text = Text (plainInline text) :| []
 
 data SendMessageInfo = SendMessageInfo
   { sender :: UserId
@@ -153,7 +161,7 @@ showContent = \case
   other -> Text.pack (show other)
 
 sha256Hex :: Text -> Text
-sha256Hex = sha256HexBytes . Text.encodeUtf8
+sha256Hex = sha256HexBytes . Text.Encoding.encodeUtf8
 
 sha256HexBytes :: ByteString -> Text
 sha256HexBytes =

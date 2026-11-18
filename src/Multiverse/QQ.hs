@@ -16,7 +16,7 @@ import Data.ByteString.Base64 qualified as Base64
 import Data.ByteString.Lazy qualified as LByteString
 import Data.Foldable (toList)
 import Data.List.NonEmpty (NonEmpty ((:|)), nonEmpty)
-import Data.Maybe (catMaybes, fromMaybe, mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe, listToMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text.Encoding
@@ -140,7 +140,7 @@ observeQQMessage context event =
       | event.qqSelfId == Just userId ->
           logDebug context.logger ("qq ignoring own message " <> messageId)
       | otherwise -> do
-          room <- configuredRoom context groupId
+          room <- lookupConfiguredRoom context.mappingStore context.config.initialRooms (qqRoomKey groupId)
           case room of
             Nothing -> logDebug context.logger ("qq ignoring unconfigured group " <> groupId)
             Just roomId -> do
@@ -188,7 +188,7 @@ observeQQMembership context event joined =
       | event.qqSelfId == Just userId ->
           logDebug context.logger ("qq ignoring own membership " <> userId)
       | otherwise -> do
-          room <- configuredRoom context groupId
+          room <- lookupConfiguredRoom context.mappingStore context.config.initialRooms (qqRoomKey groupId)
           case room of
             Nothing -> pure ()
             Just roomId -> do
@@ -209,7 +209,7 @@ observeQQCard context event =
       | event.qqSelfId == Just userId ->
           logDebug context.logger ("qq ignoring own nickname change " <> userId)
       | not (Text.null card) -> do
-          room <- configuredRoom context groupId
+          room <- lookupConfiguredRoom context.mappingStore context.config.initialRooms (qqRoomKey groupId)
           case room of
             Nothing -> pure ()
             Just roomId -> do
@@ -249,7 +249,7 @@ observeQQRetraction :: Timeline timeline => Context timeline -> QQEvent -> IO ()
 observeQQRetraction context event =
   case (event.qqGroupId, event.qqMessageId) of
     (Just groupId, Just targetMessageId) -> do
-      room <- configuredRoom context groupId
+      room <- lookupConfiguredRoom context.mappingStore context.config.initialRooms (qqRoomKey groupId)
       case room of
         Nothing -> pure ()
         Just _ -> do
@@ -265,13 +265,6 @@ observeQQRetraction context event =
                 Right _ -> pure ()
     _ -> logDebug context.logger "qq ignored recall event with incomplete identifiers"
 
-configuredRoom :: Context timeline -> Text -> IO (Maybe RoomId)
-configuredRoom context groupId = do
-  let key = qqRoomKey groupId
-  if enabledRoom context.config.initialRooms key
-    then fmap RoomId <$> context.mappingStore.lookupTimelineId key
-    else pure Nothing
-
 qqReplyTo :: Context timeline -> Text -> Maybe Text -> IO (Maybe MessageId)
 qqReplyTo _ _ Nothing = pure Nothing
 qqReplyTo context groupId (Just messageId) = do
@@ -280,17 +273,9 @@ qqReplyTo context groupId (Just messageId) = do
 
 ensureQQUser :: Timeline timeline => Context timeline -> Text -> Text -> IO UserId
 ensureQQUser context qqUserId displayName = do
-  let key = qqUserKey qqUserId
-  existing <- context.mappingStore.lookupTimelineId key
-  case existing of
-    Just eventId -> pure (UserId eventId)
-    Nothing -> do
-      let userName = if Text.null displayName then qqUserId else displayName
-          event = Event {platformKey = key, content = CreateUser UserInfo {name = userName, avatar = Nothing}}
-      mapped <- submitMapped context.timeline context.mappingStore event
-      case mapped of
-        Right eventId -> pure (UserId eventId)
-        Left err -> fail ("could not create qq user: " <> show err)
+  let name = if Text.null displayName then qqUserId else displayName
+  mapped <- ensureUserMapped context.timeline context.mappingStore (qqUserKey qqUserId) (pure name)
+  either (\err -> fail ("could not create qq user: " <> show err)) pure mapped
 
 data QQContext timeline = QQContext
   { bridge :: Context timeline
@@ -367,11 +352,11 @@ qqBlobParts _ Nothing label = oneTextPart ("[" <> label <> "]")
 decodeQQMention :: Timeline timeline => QQContext timeline -> Value -> IO [MessagePart]
 decodeQQMention context segmentData =
   case valueTextField "qq" segmentData of
-    Just "all" -> pure (oneInlinePart (Mention (Plain "@all" :| []) (Right context.room)))
+    Just "all" -> pure (oneInlinePart (Mention (plainInline "@all") (Right context.room)))
     Just userId -> do
       let name = fromMaybe userId (firstNonempty [valueTextField "name" segmentData])
       user <- ensureQQUser context.bridge userId name
-      pure (oneInlinePart (Mention (Plain ("@" <> name) :| []) (Left user)))
+      pure (oneInlinePart (Mention (plainInline ("@" <> name)) (Left user)))
     Nothing -> pure (oneTextPart "[mention]")
 
 importQQSegmentBlob :: Timeline timeline => QQContext timeline -> Int -> Maybe Text -> IO (Maybe BlobId)
@@ -489,7 +474,7 @@ qqShareInline :: Value -> InlineTextPart
 qqShareInline segmentData =
   let title = fromMaybe "link" (firstNonempty [valueTextField "title" segmentData, valueTextField "content" segmentData])
    in case valueTextField "url" segmentData of
-        Just url -> Link (Plain title :| []) url
+        Just url -> Link (plainInline title) url
         Nothing -> Plain title
 
 qqContactText :: Value -> Text
@@ -512,14 +497,14 @@ qqLocationInline segmentData =
                   ]
               )
           mapUrl = "https://www.openstreetmap.org/?mlat=" <> lat <> "&mlon=" <> lon <> "#map=17/" <> lat <> "/" <> lon
-       in Link (Plain label :| []) mapUrl
+       in Link (plainInline label) mapUrl
     _ -> Plain (fromMaybe "location" (firstNonempty [valueTextField "title" segmentData, valueTextField "content" segmentData]))
 
 qqMusicInline :: Value -> InlineTextPart
 qqMusicInline segmentData =
   let title = fromMaybe "music" (firstNonempty [valueTextField "title" segmentData, valueTextField "id" segmentData])
    in case valueTextField "url" segmentData of
-        Just url -> Link (Plain title :| []) url
+        Just url -> Link (plainInline title) url
         Nothing -> Plain title
 
 qqJsonCardText :: Value -> Text
@@ -666,39 +651,37 @@ sendToQQRoom context stored info roomKey =
                 context.mappingStore.insertMapping (qqMessageKey roomKey.key messageId) stored.storedId
 
 qqMessageMappedToGroup :: Context timeline -> EventId -> Text -> IO Bool
-qqMessageMappedToGroup context eventId groupId = do
-  keys <- context.mappingStore.lookupPlatformKeys eventId
-  pure (any (\key -> key.platform == "qq" && key.entityType == "message" && messageGroupId key == Just groupId) keys)
+qqMessageMappedToGroup context eventId_ groupId = do
+  keys <- lookupMappedKeys context.mappingStore "qq" "message" eventId_
+  pure (any ((== Just groupId) . messageGroupId) keys)
 
 qqReplyMessageId :: Context timeline -> Text -> Maybe MessageId -> IO (Maybe Text)
 qqReplyMessageId _ _ Nothing = pure Nothing
 qqReplyMessageId context groupId (Just message) = do
-  keys <- context.mappingStore.lookupPlatformKeys (messageEventId message)
+  keys <- lookupMappedKeys context.mappingStore "qq" "message" (messageEventId message)
   pure (firstJust (map (qqMessageIdForGroup groupId) keys))
 
-qqMessageIdForGroup :: Text -> PlatformKey -> Maybe Text
+qqMessageIdForGroup :: Text -> Text -> Maybe Text
 qqMessageIdForGroup groupId key =
-  case Text.splitOn "/" key.key of
+  case Text.splitOn "/" key of
     [mappedGroupId, messageId]
-      | key.platform == "qq" && key.entityType == "message" && mappedGroupId == groupId -> Just messageId
+      | mappedGroupId == groupId -> Just messageId
     _ -> Nothing
 
 retractQQMessages :: Timeline timeline => Context timeline -> StoredEvent -> MessageId -> IO ()
 retractQQMessages context stored message = do
-  original <- getEvent context.timeline (messageEventId message)
-  case fmap (.storedEvent.content) original of
-    Just (SendMessage _) -> do
-      keys <- context.mappingStore.lookupPlatformKeys (messageEventId message)
+  original <- lookupSendMessage context.timeline message
+  case original of
+    Just _ -> do
+      keys <- lookupMappedKeys context.mappingStore "qq" "message" (messageEventId message)
       mapM_ (deleteQQMessage context stored) (filter (enabledRoom context.config.initialRooms . qqRoomKey . fst) (mapMaybe qqMessageTarget keys))
-    _ -> pure ()
+    Nothing -> pure ()
 
-qqMessageTarget :: PlatformKey -> Maybe (Text, Text)
-qqMessageTarget key
-  | key.platform /= "qq" || key.entityType /= "message" = Nothing
-  | otherwise =
-      case Text.splitOn "/" key.key of
-        [groupId, messageId] -> Just (groupId, messageId)
-        _ -> Nothing
+qqMessageTarget :: Text -> Maybe (Text, Text)
+qqMessageTarget key =
+  case Text.splitOn "/" key of
+    [groupId, messageId] -> Just (groupId, messageId)
+    _ -> Nothing
 
 deleteQQMessage :: Context timeline -> StoredEvent -> (Text, Text) -> IO ()
 deleteQQMessage context stored (groupId, messageId) = do
@@ -744,8 +727,8 @@ renderQQInlinePart context = \case
     rendered <- renderQQInline context inline
     pure (rendered <> [qqTextSegment " (", qqTextSegment url, qqTextSegment ")"])
   Mention inline (Left user) -> do
-    keys <- context.bridge.mappingStore.lookupPlatformKeys (userEventId user)
-    case [key.key | key <- keys, key.platform == "qq", key.entityType == "user"] of
+    keys <- lookupMappedKeys context.bridge.mappingStore "qq" "user" (userEventId user)
+    case keys of
       qqUserId : _ -> pure [object ["type" .= ("at" :: Text), "data" .= object ["qq" .= qqIdJson qqUserId]]]
       [] -> renderQQInline context inline
   Mention inline (Right mentionedRoom)
@@ -961,22 +944,13 @@ qqSenderName userId sender =
     )
 
 firstNonempty :: [Maybe Text] -> Maybe Text
-firstNonempty = \case
-  [] -> Nothing
-  Just text : _ | not (Text.null text) -> Just text
-  _ : rest -> firstNonempty rest
+firstNonempty = firstJust . filter (maybe False (not . Text.null))
 
 firstJust :: [Maybe a] -> Maybe a
-firstJust = \case
-  [] -> Nothing
-  Just value : _ -> Just value
-  _ : rest -> firstJust rest
+firstJust = listToMaybe . catMaybes
 
 oneTextPart :: Text -> [MessagePart]
-oneTextPart text = [Text (Plain text :| [])]
-
-plainMessage :: Text -> Message
-plainMessage text = Text (Plain text :| []) :| []
+oneTextPart = pure . Text . plainInline
 
 qqTextSegment :: Text -> Value
 qqTextSegment text = object ["type" .= ("text" :: Text), "data" .= object ["text" .= text]]
@@ -1002,11 +976,8 @@ qqBlobKey prefix index = PlatformKey "qq" "blob" (prefix <> "/" <> Text.pack (sh
 qqRetractionKey :: Text -> EventId -> PlatformKey
 qqRetractionKey groupId eventId_ = PlatformKey "qq" "retraction" (groupId <> "/" <> renderEventId eventId_)
 
-messageGroupId :: PlatformKey -> Maybe Text
+messageGroupId :: Text -> Maybe Text
 messageGroupId key =
-  case Text.splitOn "/" key.key of
+  case Text.splitOn "/" key of
     groupId : _ -> Just groupId
     [] -> Nothing
-
-renderEventId :: EventId -> Text
-renderEventId (EventId eventId_) = eventId_

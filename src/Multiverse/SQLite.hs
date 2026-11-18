@@ -6,6 +6,7 @@ module Multiverse.SQLite
 where
 
 import Control.Exception (Exception, throwIO)
+import Control.Monad (filterM)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Database.SQLite.Simple
@@ -62,8 +63,7 @@ migrate connection = do
 submitEvent :: Connection -> Event -> IO (Either SubmitError EventId)
 submitEvent connection event = do
   let newId = eventId event
-      newIdText = renderRead newId
-  existing <- eventIdExists connection newIdText
+  existing <- eventExists connection newId
   if existing
     then pure (Right newId)
     else do
@@ -77,25 +77,25 @@ submitEvent connection event = do
               execute
                 connection
                 "INSERT OR IGNORE INTO events (event_id, platform, entity_type, platform_key, event) VALUES (?, ?, ?, ?, ?)"
-                ( newIdText
+                ( persistedEventId newId
                 , event.platformKey.platform
                 , event.platformKey.entityType
                 , event.platformKey.key
-                , renderRead event
+                , renderEvent event
                 )
-              inserted <- eventIdExists connection newIdText
+              inserted <- eventExists connection newId
               if inserted
                 then pure (Right newId)
                 else do
                   raced <- platformKeyConflict connection event.platformKey
                   case raced of
                     Just conflictingId -> pure (Left (ConflictingPlatformKey event.platformKey conflictingId))
-                    Nothing -> throwIO (CorruptTimeline ("event insert ignored: " <> newIdText))
+                    Nothing -> throwIO (CorruptTimeline ("event insert ignored: " <> persistedEventId newId))
             else pure (Left (MissingReferences missing))
 
-eventIdExists :: Connection -> Text -> IO Bool
-eventIdExists connection eventIdText = do
-  rows <- query connection "SELECT 1 FROM events WHERE event_id = ? LIMIT 1" (Only eventIdText) :: IO [Only Int]
+eventExists :: Connection -> EventId -> IO Bool
+eventExists connection wantedId = do
+  rows <- query connection "SELECT 1 FROM events WHERE event_id = ? LIMIT 1" (Only (persistedEventId wantedId)) :: IO [Only Int]
   pure (not (null rows))
 
 platformKeyConflict :: Connection -> PlatformKey -> IO (Maybe EventId)
@@ -107,14 +107,14 @@ platformKeyConflict connection platformKey = do
       (platformKey.platform, platformKey.entityType, platformKey.key)
   case rows of
     Only conflictingIdText : _ ->
-      case parseRead conflictingIdText of
+      case parsePersistedEventId conflictingIdText of
         Just conflictingId -> pure (Just conflictingId)
         Nothing -> throwIO (CorruptTimeline ("invalid event id: " <> conflictingIdText))
     [] -> pure Nothing
 
 lookupEvent :: Connection -> EventId -> IO (Maybe StoredEvent)
 lookupEvent connection wantedId = do
-  rows <- query connection "SELECT event_id, event FROM events WHERE event_id = ?" (Only (renderRead wantedId))
+  rows <- query connection "SELECT event_id, event FROM events WHERE event_id = ?" (Only (persistedEventId wantedId))
   case decodeStoredRows rows of
     Left err -> throwIO err
     Right [] -> pure Nothing
@@ -132,50 +132,34 @@ eventsAfter connection afterEventId = do
           "SELECT event_id, event FROM events\
           \ WHERE seq > (SELECT seq FROM events WHERE event_id = ?)\
           \ ORDER BY seq ASC"
-          (Only (renderRead eventId_))
+          (Only (persistedEventId eventId_))
   either throwIO pure (decodeStoredRows rows)
 
+-- | State queries replay the event log, so they all share this fold.
+foldEvents :: Connection -> (a -> StoredEvent -> a) -> a -> IO a
+foldEvents connection step initial = foldl' step initial <$> eventsAfter connection Nothing
+
 lookupUserInfo :: Connection -> UserId -> Maybe RoomId -> IO (Maybe UserInfo)
-lookupUserInfo connection user room = do
-  storedEvents <- eventsAfter connection Nothing
-  let (info, roomName) = foldl' (applyUser user room) (Nothing, Nothing) storedEvents
-  pure (applyRoomName info roomName)
+lookupUserInfo connection user room =
+  uncurry applyRoomName <$> foldEvents connection (applyUser user room) (Nothing, Nothing)
  where
   applyRoomName (Just value) (Just roomName) = Just UserInfo {name = roomName, avatar = value.avatar}
   applyRoomName info _ = info
 
 lookupRoomMembers :: Connection -> RoomId -> IO [UserId]
-lookupRoomMembers connection room = do
-  storedEvents <- eventsAfter connection Nothing
-  pure (foldl' (applyMembership room) [] storedEvents)
+lookupRoomMembers connection room =
+  foldEvents connection (applyMembership room) []
 
 lookupRoomInfo :: Connection -> RoomId -> IO (Maybe RoomInfo)
-lookupRoomInfo connection room = do
-  storedEvents <- eventsAfter connection Nothing
-  pure (foldl' (applyRoom room) Nothing storedEvents)
+lookupRoomInfo connection room =
+  foldEvents connection (applyRoom room) Nothing
 
 lookupMessage :: Connection -> MessageId -> IO (Maybe Message)
-lookupMessage connection message = do
-  storedEvents <- eventsAfter connection Nothing
-  pure (foldl' (applyMessage message) Nothing storedEvents)
+lookupMessage connection message =
+  foldEvents connection (applyMessage message) Nothing
 
 missingReferences :: Connection -> Event -> IO [EventId]
-missingReferences connection event = filterMUnknown exists (eventReferences event)
- where
-  exists eventId_ = do
-    rows <- query connection "SELECT 1 FROM events WHERE event_id = ? LIMIT 1" (Only (renderRead eventId_)) :: IO [Only Int]
-    pure (not (null rows))
-
-filterMUnknown :: (a -> IO Bool) -> [a] -> IO [a]
-filterMUnknown predicate = go []
- where
-  go missing = \case
-    [] -> pure (reverse missing)
-    item : rest -> do
-      ok <- predicate item
-      if ok
-        then go missing rest
-        else go (item : missing) rest
+missingReferences connection event = filterM (fmap not . eventExists connection) (eventReferences event)
 
 decodeStoredRows :: [StoredRow] -> Either CorruptTimeline [StoredEvent]
 decodeStoredRows = traverse decodeStoredRow
@@ -183,8 +167,8 @@ decodeStoredRows = traverse decodeStoredRow
 decodeStoredRow :: StoredRow -> Either CorruptTimeline StoredEvent
 decodeStoredRow row =
   StoredEvent
-    <$> parse "event id" row.rowEventId
-    <*> parse "event" row.rowEvent
+    <$> parseWith parsePersistedEventId "event id" row.rowEventId
+    <*> parseWith parseEvent "event" row.rowEvent
 
 applyUser :: UserId -> Maybe RoomId -> (Maybe UserInfo, Maybe Text) -> StoredEvent -> (Maybe UserInfo, Maybe Text)
 applyUser user room (current, roomName) stored =
@@ -226,18 +210,18 @@ applyMessage message current stored =
       | retractedMessage == message -> Nothing
     _ -> current
 
-renderRead :: Show a => a -> Text
-renderRead = Text.pack . show
+renderEvent :: Event -> Text
+renderEvent = Text.pack . show
 
-parseRead :: Read a => Text -> Maybe a
-parseRead = readMaybe . Text.unpack
+parseEvent :: Text -> Maybe Event
+parseEvent = readMaybe . Text.unpack
 
-parse :: Read a => Text -> Text -> Either CorruptTimeline a
-parse label value =
+parseWith :: (Text -> Maybe a) -> Text -> Text -> Either CorruptTimeline a
+parseWith parser label value =
   maybe
     (Left (CorruptTimeline ("invalid " <> label <> ": " <> value)))
     Right
-    (parseRead value)
+    (parser value)
 
 newtype CorruptTimeline = CorruptTimeline Text
   deriving (Show)

@@ -15,10 +15,10 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as ByteString
 import Data.ByteString.Lazy qualified as LByteString
 import Data.List.NonEmpty (NonEmpty ((:|)), nonEmpty)
-import Data.Maybe (fromMaybe, mapMaybe)
+import Data.Maybe (fromMaybe, listToMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as Text
-import Data.Text.Encoding qualified as Text
+import Data.Text.Encoding qualified as Text.Encoding
 import Network.HTTP.Client
 import Network.HTTP.Client.TLS
 import Network.HTTP.Types.Status (statusCode)
@@ -100,24 +100,22 @@ observeMatrix context = do
 
 reflectMatrix :: Timeline timeline => Context timeline -> IO ()
 reflectMatrix context =
-  forever do
-    afterEventId <- fmap (fmap EventId) (context.mappingStore.lookupState "matrix.reflect_event")
-    storedEvents <- getEventsAfter context.timeline afterEventId
-    mapM_ (reflectEvent context) storedEvents
-    case storedEvents of
-      [] -> threadDelay 2000000
-      _ -> context.mappingStore.setState "matrix.reflect_event" (renderEventId ((last storedEvents).storedId))
+  reflectForever context.timeline context.mappingStore "matrix.reflect_event" (reflectEvent context)
 
 observeRoomEvents :: Timeline timeline => Observer timeline -> MatrixRoomEvents -> IO ()
 observeRoomEvents observer roomEvents = do
-  room <- configuredRoom observer.bridge roomEvents.roomId
+  room <-
+    lookupConfiguredRoom
+      observer.bridge.mappingStore
+      observer.bridge.config.initialRooms
+      (matrixRoomKey roomEvents.roomId)
   case room of
     Nothing -> logDebug observer.bridge.logger ("matrix ignoring unconfigured room " <> roomEvents.roomId)
     Just roomId -> mapM_ (observeEvent observer roomEvents.roomId roomId) roomEvents.events
 
 observeEvent :: Timeline timeline => Observer timeline -> Text -> RoomId -> MatrixEvent -> IO ()
 observeEvent observer platformRoom room event
-  | event.sender == observer.ownUserId, not (isMemberEvent event.content) =
+  | event.sender == observer.ownUserId, not (isMember event.content) =
       logDebug observer.bridge.logger ("matrix ignoring own event " <> event.eventId)
   | otherwise =
       case event.content of
@@ -145,6 +143,9 @@ observeEvent observer platformRoom room event
           | reason == "m.room.encrypted" ->
               logWarn observer.bridge.logger ("matrix cannot decrypt event " <> event.eventId <> ": encrypted rooms are not supported")
           | otherwise -> logDebug observer.bridge.logger ("matrix ignoring " <> reason <> " event " <> event.eventId)
+ where
+  isMember (MatrixMember _) = True
+  isMember _ = False
 
 observeMatrixMessage :: Timeline timeline => Observer timeline -> MatrixEvent -> Text -> RoomId -> MatrixMessageContent -> IO ()
 observeMatrixMessage observer event platformRoom room messageContent = do
@@ -209,9 +210,9 @@ observeMatrixMedia observer event platformRoom room mediaContent = do
   let label = fromMaybe (matrixMediaLabel mediaContent.mediaKind) mediaContent.mediaName
       parts = case blobId of
         Just blob
-          | mediaContent.mediaKind == FileBlob -> [Text (Plain label :| []), Blob FileBlob blob]
+          | mediaContent.mediaKind == FileBlob -> [Text (plainInline label), Blob FileBlob blob]
           | otherwise -> [Blob mediaContent.mediaKind blob]
-        Nothing -> [Text (Plain ("[" <> label <> "]") :| [])]
+        Nothing -> [Text (plainInline ("[" <> label <> "]"))]
   case nonEmpty parts of
     Nothing -> pure ()
     Just body -> do
@@ -240,12 +241,6 @@ matrixMediaLabel = \case
   VideoBlob -> "video"
   AudioBlob -> "audio"
   FileBlob -> "file"
-
-
-isMemberEvent :: MatrixEventContent -> Bool
-isMemberEvent content = case content of
-  MatrixMember _ -> True
-  _ -> False
 
 observeMatrixMember :: Timeline timeline => Observer timeline -> RoomId -> MatrixEvent -> MatrixMembership -> IO ()
 observeMatrixMember observer room event member
@@ -291,24 +286,13 @@ matrixReplyTo context platformRoom replyToEvent =
 ensureUser :: Timeline timeline => Observer timeline -> Text -> IO UserId
 ensureUser observer matrixUserId = do
   let context = observer.bridge
-  let platformKey = matrixUserKey matrixUserId
-  existing <- context.mappingStore.lookupTimelineId platformKey
-  case existing of
-    Just eventId -> pure (UserId eventId)
-    Nothing -> do
-      displayName <- matrixUserDisplayName context matrixUserId
-      let event = Event {platformKey, content = CreateUser UserInfo {name = maybe matrixUserId id displayName, avatar = Nothing}}
-      mapped <- submitMapped context.timeline context.mappingStore event
-      case mapped of
-        Right eventId -> pure (UserId eventId)
-        Left err -> fail ("could not create matrix user: " <> show err)
-
-configuredRoom :: Context timeline -> Text -> IO (Maybe RoomId)
-configuredRoom context matrixRoomId = do
-  let platformKey = matrixRoomKey matrixRoomId
-  if enabledRoom context.config.initialRooms platformKey
-    then fmap RoomId <$> context.mappingStore.lookupTimelineId platformKey
-    else pure Nothing
+  mapped <-
+    ensureUserMapped
+      context.timeline
+      context.mappingStore
+      (matrixUserKey matrixUserId)
+      (maybe matrixUserId id <$> matrixUserDisplayName context matrixUserId)
+  either (\err -> fail ("could not create matrix user: " <> show err)) pure mapped
 
 reflectEvent :: Timeline timeline => Context timeline -> StoredEvent -> IO ()
 reflectEvent context stored =
@@ -323,9 +307,9 @@ reflectEvent context stored =
           mapM_ (sendToRoom info profile body) matrixRooms
     EditMessage message body
       | stored.storedEvent.platformKey.platform /= "matrix" -> do
-          original <- getEvent context.timeline (messageEventId message)
-          case fmap (.storedEvent.content) original of
-            Just (SendMessage info) -> do
+          original <- lookupSendMessage context.timeline message
+          case original of
+            Just info -> do
               unless (messageBlobs info.body == messageBlobs body) do
                 logWarn context.logger "matrix cannot reflect changes to message attachments"
               (profile, text) <- matrixRelayBody context info (renderMessageBody (textBody body))
@@ -345,10 +329,7 @@ reflectEvent context stored =
       | otherwise -> do
           alreadyMapped <- hasPlatformMapping context.mappingStore "matrix" stored.storedId
           unless alreadyMapped do
-            original <- getEvent context.timeline (messageEventId message)
-            let target = case fmap (.storedEvent.content) original of
-                  Just (SendMessage info) -> Just info
-                  _ -> Nothing
+            target <- lookupSendMessage context.timeline message
             targets <- matrixRetractTargets context message
             mapM_ (redactInRoom target) (filter (enabledRoom context.config.initialRooms . matrixRoomKey . fst) targets)
     ChangeRoomNick user room nick
@@ -450,57 +431,50 @@ matrixRetractTargets context message = matrixMessageTargets context (messageEven
 -- single lookup covers both.
 matrixMessageTargets :: Context timeline -> EventId -> IO [(Text, Text)]
 matrixMessageTargets context eventId_ = do
-  keys <- context.mappingStore.lookupPlatformKeys eventId_
+  keys <- lookupMappedKeys context.mappingStore "matrix" "message" eventId_
   pure (mapMaybe matrixMessageTarget keys)
 
-matrixMessageTarget :: PlatformKey -> Maybe (Text, Text)
-matrixMessageTarget platformKey
-  | platformKey.platform /= "matrix" = Nothing
-  | platformKey.entityType /= "message" = Nothing
-  | otherwise =
-      case Text.splitOn "/" platformKey.key of
-        [roomId, matrixEventId] -> Just (roomId, matrixEventId)
-        _ -> Nothing
+matrixMessageTarget :: Text -> Maybe (Text, Text)
+matrixMessageTarget key =
+  case Text.splitOn "/" key of
+    [roomId, matrixEventId] -> Just (roomId, matrixEventId)
+    _ -> Nothing
 
 matrixMessageMappedToRoom :: Context timeline -> EventId -> Text -> IO Bool
 matrixMessageMappedToRoom context eventId_ roomId = do
-  keys <- context.mappingStore.lookupPlatformKeys eventId_
-  pure (any ((== Just roomId) . fmap fst . matrixMessageTarget) keys)
+  targets <- matrixMessageTargets context eventId_
+  pure (any ((== roomId) . fst) targets)
 
 -- | Media this bridge already uploaded for a blob, so that a blob reflected into
 -- several rooms is uploaded once. The mapper is keyed by the URI the homeserver
 -- returned, which is what the observer would record for the same media anyway.
 matrixUploadedMedia :: Context timeline -> BlobId -> IO (Maybe Text)
-matrixUploadedMedia context blobId = do
-  keys <- context.mappingStore.lookupPlatformKeys (blobEventId blobId)
-  pure case [key.key | key <- keys, key.platform == "matrix", key.entityType == "blob"] of
-    mediaUri : _ -> Just mediaUri
-    [] -> Nothing
+matrixUploadedMedia context blobId =
+  listToMaybe <$> lookupMappedKeys context.mappingStore "matrix" "blob" (blobEventId blobId)
 
 matrixReplyEventId :: Context timeline -> Text -> Maybe MessageId -> IO (Maybe Text)
 matrixReplyEventId _ _ Nothing = pure Nothing
 matrixReplyEventId context roomId (Just message) = do
-  keys <- context.mappingStore.lookupPlatformKeys (messageEventId message)
-  pure case [matrixEventId | key <- keys, Just (targetRoom, matrixEventId) <- [matrixMessageTarget key], targetRoom == roomId] of
-    eventId_ : _ -> Just eventId_
-    [] -> Nothing
+  targets <- matrixMessageTargets context (messageEventId message)
+  pure (lookup roomId targets)
+
+matrixCall :: FromJSON a => Context timeline -> Text -> (Request -> Request) -> IO (Either String a)
+matrixCall context url modify = do
+  request0 <- authorizedRequest context url
+  response <- loggedHttp context.logger (modify request0) context.manager
+  pure (eitherDecode response.responseBody)
 
 matrixSync :: Context timeline -> Maybe Text -> IO (Either String MatrixSync)
 matrixSync context since = do
-  request0 <- authorizedRequest context (context.config.homeserver <> "/_matrix/client/v3/sync")
   let query =
-        [ ("timeout", Just (Text.encodeUtf8 (Text.pack (show context.config.syncTimeoutMs))))
+        [ ("timeout", Just (Text.Encoding.encodeUtf8 (Text.pack (show context.config.syncTimeoutMs))))
         ]
-          <> maybe [] (\token -> [("since", Just (Text.encodeUtf8 token))]) since
-      request = setQueryString query request0
-  response <- loggedHttp context.logger request context.manager
-  pure (decodeMatrix response)
+          <> maybe [] (\token -> [("since", Just (Text.Encoding.encodeUtf8 token))]) since
+  matrixCall context (context.config.homeserver <> "/_matrix/client/v3/sync") (setQueryString query)
 
 matrixWhoami :: Context timeline -> IO (Either String MatrixWhoami)
-matrixWhoami context = do
-  request <- authorizedRequest context (context.config.homeserver <> "/_matrix/client/v3/account/whoami")
-  response <- loggedHttp context.logger request context.manager
-  pure (decodeMatrix response)
+matrixWhoami context =
+  matrixCall context (context.config.homeserver <> "/_matrix/client/v3/account/whoami") id
 
 matrixUserDisplayName :: Context timeline -> Text -> IO (Maybe Text)
 matrixUserDisplayName context matrixUserId = do
@@ -512,10 +486,11 @@ matrixUserDisplayName context matrixUserId = do
       pure Nothing
 
 matrixGetDisplayName :: Context timeline -> Text -> IO (Either String MatrixDisplayName)
-matrixGetDisplayName context matrixUserId = do
-  request <- authorizedRequest context (context.config.homeserver <> "/_matrix/client/v3/profile/" <> escapePathSegment matrixUserId <> "/displayname")
-  response <- loggedHttp context.logger request context.manager
-  pure (decodeMatrix response)
+matrixGetDisplayName context matrixUserId =
+  matrixCall
+    context
+    (context.config.homeserver <> "/_matrix/client/v3/profile/" <> escapePathSegment matrixUserId <> "/displayname")
+    id
 
 renderMatrixRelayMessage :: Timeline timeline => Context timeline -> SendMessageInfo -> IO (Value, RenderedMessage)
 renderMatrixRelayMessage context info = matrixRelayBody context info (renderMessageBody info.body)
@@ -539,7 +514,7 @@ matrixRelayBody context info body = do
           { plainText = displayName <> ": " <> body.plainText
           , htmlText =
               "<strong data-mx-profile-fallback>"
-                <> matrixHtmlEscape displayName
+                <> htmlEscape displayName
                 <> ": </strong>"
                 <> body.htmlText
           }
@@ -558,67 +533,25 @@ truncateUtf8 limit = Text.pack . go 0 . Text.unpack
     | nextBytes > limit = []
     | otherwise = char : go nextBytes rest
    where
-    nextBytes = bytes + ByteString.length (Text.encodeUtf8 (Text.singleton char))
-
-matrixHtmlEscape :: Text -> Text
-matrixHtmlEscape =
-  Text.concatMap \case
-    '&' -> "&amp;"
-    '<' -> "&lt;"
-    '>' -> "&gt;"
-    '"' -> "&quot;"
-    '\'' -> "&#39;"
-    char -> Text.singleton char
+    nextBytes = bytes + ByteString.length (Text.Encoding.encodeUtf8 (Text.singleton char))
 
 matrixSendMessage ::
   Context timeline -> Text -> Text -> Maybe Text -> Maybe Value -> RenderedMessage -> IO (Either String Text)
-matrixSendMessage context roomId txnId replyTo profile body = do
-  request0 <-
-    authorizedRequest
-      context
-      ( context.config.homeserver
-          <> "/_matrix/client/v3/rooms/"
-          <> roomId
-          <> "/send/m.room.message/"
-          <> txnId
-      )
-  let request =
-        request0
-          { method = "PUT"
-          , requestBody = RequestBodyLBS (encode (matrixMessageContent replyTo profile body))
-          , requestHeaders = ("Content-Type", "application/json") : request0.requestHeaders
-          }
-  response <- loggedHttp context.logger request context.manager
-  pure case eitherDecode response.responseBody :: Either String MatrixSendResponse of
-    Left err -> Left err
-    Right sent -> Right sent.eventId
+matrixSendMessage context roomId txnId replyTo profile body =
+  matrixSendContent context roomId txnId (matrixMessageContent replyTo profile body)
 
 matrixSendEdit :: Context timeline -> Text -> Text -> Text -> Value -> RenderedMessage -> IO (Either String Text)
-matrixSendEdit context roomId txnId targetEventId profile body = do
-  request0 <-
-    authorizedRequest
-      context
-      ( context.config.homeserver
-          <> "/_matrix/client/v3/rooms/"
-          <> roomId
-          <> "/send/m.room.message/"
-          <> txnId
-      )
-  let request =
-        request0
-          { method = "PUT"
-          , requestBody = RequestBodyLBS (encode (matrixEditContent targetEventId profile body))
-          , requestHeaders = ("Content-Type", "application/json") : request0.requestHeaders
-          }
-  response <- loggedHttp context.logger request context.manager
-  pure case eitherDecode response.responseBody :: Either String MatrixSendResponse of
-    Left err -> Left err
-    Right sent -> Right sent.eventId
+matrixSendEdit context roomId txnId targetEventId profile body =
+  matrixSendContent context roomId txnId (matrixEditContent targetEventId profile body)
 
 matrixSendMedia :: Context timeline -> Text -> Text -> Maybe Text -> Value -> IO (Either String Text)
-matrixSendMedia context roomId txnId replyTo content = do
-  request0 <-
-    authorizedRequest
+matrixSendMedia context roomId txnId replyTo content =
+  matrixSendContent context roomId txnId (matrixWithReply replyTo content)
+
+matrixSendContent :: Context timeline -> Text -> Text -> Value -> IO (Either String Text)
+matrixSendContent context roomId txnId content = do
+  result <-
+    matrixCall
       context
       ( context.config.homeserver
           <> "/_matrix/client/v3/rooms/"
@@ -626,16 +559,14 @@ matrixSendMedia context roomId txnId replyTo content = do
           <> "/send/m.room.message/"
           <> txnId
       )
-  let request =
-        request0
-          { method = "PUT"
-          , requestBody = RequestBodyLBS (encode (matrixWithReply replyTo content))
-          , requestHeaders = ("Content-Type", "application/json") : request0.requestHeaders
-          }
-  response <- loggedHttp context.logger request context.manager
-  pure case eitherDecode response.responseBody :: Either String MatrixSendResponse of
-    Left err -> Left err
-    Right sent -> Right sent.eventId
+      ( \request ->
+          request
+            { method = "PUT"
+            , requestBody = RequestBodyLBS (encode content)
+            , requestHeaders = ("Content-Type", "application/json") : request.requestHeaders
+            }
+      ) :: IO (Either String MatrixSendResponse)
+  pure (fmap (.eventId) result)
 
 matrixUploadMedia :: Context timeline -> Text -> Text -> ByteString -> IO (Either String Text)
 matrixUploadMedia context fileName mimeType bytes = go uploadEndpoints
@@ -653,7 +584,7 @@ matrixUploadMedia context fileName mimeType bytes = go uploadEndpoints
             request0
               { method = "POST"
               , requestBody = RequestBodyBS bytes
-              , requestHeaders = ("Content-Type", Text.encodeUtf8 mimeType) : request0.requestHeaders
+              , requestHeaders = ("Content-Type", Text.Encoding.encodeUtf8 mimeType) : request0.requestHeaders
               }
       response <- loggedHttp context.logger request context.manager
       case eitherDecode response.responseBody :: Either String MatrixUploadResponse of
@@ -719,33 +650,33 @@ matrixDownloadMedia context uri =
               pure (Just (LByteString.toStrict response.responseBody))
         _ -> tryPaths rest
 
+matrixTextContent :: RenderedMessage -> Value
+matrixTextContent body =
+  object
+    [ "msgtype" .= ("m.text" :: Text)
+    , "body" .= body.plainText
+    , "format" .= ("org.matrix.custom.html" :: Text)
+    , "formatted_body" .= body.htmlText
+    ]
+
 matrixMessageContent :: Maybe Text -> Maybe Value -> RenderedMessage -> Value
 matrixMessageContent replyTo profile body =
-  matrixWithProfile profile True
-    . matrixWithReply replyTo
-    $ object
-      [ "msgtype" .= ("m.text" :: Text)
-      , "body" .= body.plainText
-      , "format" .= ("org.matrix.custom.html" :: Text)
-      , "formatted_body" .= body.htmlText
-      ]
+  matrixWithProfile profile True (matrixWithReply replyTo (matrixTextContent body))
 
 matrixEditContent :: Text -> Value -> RenderedMessage -> Value
 matrixEditContent targetEventId profile body =
   matrixWithProfile (Just profile) True
-    $ object
+    $ insertField "m.new_content" (matrixTextContent body)
+    $ insertField "m.relates_to" relates
+    $ prefixed
+ where
+  relates = object ["rel_type" .= ("m.replace" :: Text), "event_id" .= targetEventId]
+  prefixed =
+    object
       [ "msgtype" .= ("m.text" :: Text)
       , "body" .= ("* " <> body.plainText)
       , "format" .= ("org.matrix.custom.html" :: Text)
       , "formatted_body" .= ("* " <> body.htmlText)
-      , "m.new_content"
-          .= object
-            [ "msgtype" .= ("m.text" :: Text)
-            , "body" .= body.plainText
-            , "format" .= ("org.matrix.custom.html" :: Text)
-            , "formatted_body" .= body.htmlText
-            ]
-      , "m.relates_to" .= object ["rel_type" .= ("m.replace" :: Text), "event_id" .= targetEventId]
       ]
 
 matrixMediaContent :: Maybe Value -> BlobType -> Text -> Text -> Int -> Text -> Value
@@ -764,19 +695,16 @@ matrixMediaContent profile kind fileName mimeType size mediaUrl =
 matrixWithProfile :: Maybe Value -> Bool -> Value -> Value
 matrixWithProfile Nothing _ content = content
 matrixWithProfile (Just profile) hasFallback content =
-  case content of
-    Object fields ->
-      Object
-        ( Aeson.KeyMap.insert
-            "com.beeper.per_message_profile"
-            (withFallback profile)
-            fields
-        )
-    other -> other
+  insertField "com.beeper.per_message_profile" (withFallback profile) content
  where
   withFallback = \case
     Object profileFields -> Object (Aeson.KeyMap.insert "has_fallback" (Bool hasFallback) profileFields)
     other -> other
+
+insertField :: Aeson.Key.Key -> Value -> Value -> Value
+insertField key value = \case
+  Object fields -> Object (Aeson.KeyMap.insert key value fields)
+  other -> other
 
 matrixMsgType :: BlobType -> Text
 matrixMsgType = \case
@@ -788,15 +716,7 @@ matrixMsgType = \case
 matrixWithReply :: Maybe Text -> Value -> Value
 matrixWithReply Nothing content = content
 matrixWithReply (Just eventId_) content =
-  case content of
-    Object obj ->
-      Object
-        ( Aeson.KeyMap.insert
-            "m.relates_to"
-            (object ["m.in_reply_to" .= object ["event_id" .= eventId_]])
-            obj
-        )
-    other -> other
+  insertField "m.relates_to" (object ["m.in_reply_to" .= object ["event_id" .= eventId_]]) content
 
 data MatrixUploadResponse = MatrixUploadResponse
   { contentUri :: Text
@@ -808,34 +728,24 @@ instance FromJSON MatrixUploadResponse where
 
 fetchInitialRoomInfo :: Context timeline -> InitialRoomMapping -> IO RoomInfo
 fetchInitialRoomInfo context mapping = do
-  name <- matrixRoomName context mapping.platformKey.key
-  topic <- matrixRoomTopic context mapping.platformKey.key
+  name <- matrixStateField context mapping.platformKey.key "m.room.name" "name"
+  topic <- matrixStateField context mapping.platformKey.key "m.room.topic" "topic"
   pure
     RoomInfo
       { name = maybe mapping.platformKey.key id name
-      , description = maybe "" id topic
+      , description = fromMaybe "" topic
       , avatar = Nothing
       }
 
-matrixRoomName :: Context timeline -> Text -> IO (Maybe Text)
-matrixRoomName context roomId = do
-  result <- matrixGetState context roomId "m.room.name" :: IO (Either String MatrixRoomNameState)
-  pure case result of
-    Right value -> value.name
-    Left _ -> Nothing
-
-matrixRoomTopic :: Context timeline -> Text -> IO (Maybe Text)
-matrixRoomTopic context roomId = do
-  result <- matrixGetState context roomId "m.room.topic" :: IO (Either String MatrixRoomTopicState)
-  pure case result of
-    Right value -> value.topic
-    Left _ -> Nothing
-
-matrixGetState :: FromJSON a => Context timeline -> Text -> Text -> IO (Either String a)
-matrixGetState context roomId eventType = do
-  request <- authorizedRequest context (context.config.homeserver <> "/_matrix/client/v3/rooms/" <> roomId <> "/state/" <> eventType)
-  response <- loggedHttp context.logger request context.manager
-  pure (decodeMatrix response)
+matrixStateField :: Context timeline -> Text -> Text -> Text -> IO (Maybe Text)
+matrixStateField context roomId eventType field = do
+  result <- matrixCall context url id :: IO (Either String Value)
+  pure do
+    value <- either (const Nothing) Just result
+    obj <- asObject value
+    Aeson.KeyMap.lookup (Aeson.Key.fromText field) obj >>= asText
+ where
+  url = context.config.homeserver <> "/_matrix/client/v3/rooms/" <> roomId <> "/state/" <> eventType
 
 loggedHttp :: Logger -> Request -> Manager -> IO (Response LByteString.ByteString)
 loggedHttp logger = HTTP.loggedHttp logger matrixHttpLogOptions
@@ -843,22 +753,6 @@ loggedHttp logger = HTTP.loggedHttp logger matrixHttpLogOptions
 matrixHttpLogOptions :: HttpLogOptions
 matrixHttpLogOptions =
   defaultHttpLogOptions {requestSuffix = " authorization=<redacted>"}
-
-data MatrixRoomNameState = MatrixRoomNameState
-  { name :: Maybe Text
-  }
-
-instance FromJSON MatrixRoomNameState where
-  parseJSON = withObject "MatrixRoomNameState" \obj ->
-    MatrixRoomNameState <$> obj .:? "name"
-
-data MatrixRoomTopicState = MatrixRoomTopicState
-  { topic :: Maybe Text
-  }
-
-instance FromJSON MatrixRoomTopicState where
-  parseJSON = withObject "MatrixRoomTopicState" \obj ->
-    MatrixRoomTopicState <$> obj .:? "topic"
 
 data MatrixWhoami = MatrixWhoami
   { userId :: Text
@@ -881,11 +775,8 @@ authorizedRequest context url = do
   request <- parseRequest (Text.unpack url)
   pure
     request
-      { requestHeaders = ("Authorization", Text.encodeUtf8 ("Bearer " <> context.config.accessToken)) : request.requestHeaders
+      { requestHeaders = ("Authorization", Text.Encoding.encodeUtf8 ("Bearer " <> context.config.accessToken)) : request.requestHeaders
       }
-
-decodeMatrix :: FromJSON a => Response LByteString.ByteString -> Either String a
-decodeMatrix response = eitherDecode response.responseBody
 
 matrixUserKey :: Text -> PlatformKey
 matrixUserKey userId = PlatformKey "matrix" "user" userId
@@ -905,14 +796,8 @@ matrixRedactionKey roomId matrixEventId = PlatformKey "matrix" "redaction" (room
 matrixBlobKey :: Text -> PlatformKey
 matrixBlobKey mediaUri = PlatformKey "matrix" "blob" mediaUri
 
-renderEventId :: EventId -> Text
-renderEventId (EventId eventId_) = eventId_
-
 escapePathSegment :: Text -> Text
-escapePathSegment = Text.decodeUtf8 . urlEncode True . Text.encodeUtf8
-
-plainMessage :: Text -> Message
-plainMessage text = Text (Plain text :| []) :| []
+escapePathSegment = Text.Encoding.decodeUtf8 . urlEncode True . Text.Encoding.encodeUtf8
 
 data MatrixSync = MatrixSync
   { nextBatch :: Text
@@ -1088,9 +973,9 @@ matrixLocationBody :: Object -> Text -> Message
 matrixLocationBody content fallback =
   let label = if Text.null fallback then "location" else fallback
       inline = case Aeson.KeyMap.lookup "geo_uri" content >>= asText >>= geoMapLink of
-        Just url -> Link (Plain label :| []) url
+        Just url -> Link (plainInline label) url
         Nothing -> Plain label
-   in Text (inline :| []) :| []
+   in pure (Text (pure inline))
 
 geoMapLink :: Text -> Maybe Text
 geoMapLink uri = do
@@ -1160,20 +1045,20 @@ parseBlock start rest
           items = parseListItems inside
        in case nonEmpty items of
             Just nonEmptyItems -> (List nonEmptyItems, after)
-            Nothing -> (Text (Plain "" :| []), after)
+            Nothing -> (Text (plainInline ""), after)
   | otherwise =
       case headingLevel start of
         Just level ->
           let tagName = "h" <> Text.pack (show level)
               (inside, after) = takeUntilClose tagName rest
            in (Heading level (matrixInlineFromTagsOrPlain inside), after)
-        Nothing -> (Text (Plain (innerText [start]) :| []), rest)
+        Nothing -> (Text (plainInline (innerText [start])), rest)
 
 messageFromTags :: [Tag Text] -> Message
 messageFromTags tags =
   case parseMessageParts tags of
     part : parts -> part :| parts
-    [] -> Text (Plain (innerText tags) :| []) :| []
+    [] -> plainMessage (innerText tags)
 
 parseListItems :: [Tag Text] -> [Message]
 parseListItems [] = []
@@ -1201,7 +1086,7 @@ matrixInlineFromTagsOrPlain :: [Tag Text] -> InlineText
 matrixInlineFromTagsOrPlain tags =
   case matrixInlineFromTags tags of
     Just inline -> inline
-    Nothing -> Plain (innerText tags) :| []
+    Nothing -> plainInline (innerText tags)
 
 matrixInlineFromTags :: [Tag Text] -> Maybe InlineText
 matrixInlineFromTags tags =

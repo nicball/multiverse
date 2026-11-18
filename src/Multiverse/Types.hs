@@ -6,6 +6,9 @@ module Multiverse.Types
   , BlobId (..)
   , PlatformKey (..)
   , BlobType (..)
+  , renderEventId
+  , persistedEventId
+  , parsePersistedEventId
   , userEventId
   , roomEventId
   , messageEventId
@@ -14,6 +17,8 @@ module Multiverse.Types
 where
 
 import Data.Text (Text)
+import Data.Text qualified as Text
+import Text.Read (readMaybe)
 
 newtype EventId = EventId Text
   deriving (Eq, Ord, Read, Show)
@@ -39,6 +44,18 @@ data PlatformKey = PlatformKey
 
 data BlobType = ImageBlob | VideoBlob | AudioBlob | FileBlob
   deriving (Eq, Ord, Read, Show)
+
+renderEventId :: EventId -> Text
+renderEventId (EventId value) = value
+
+-- | The sqlite stores persist event ids with the derived 'Show'/'Read'
+-- instances, so existing databases stay readable. Everything else (platform
+-- keys, URLs, configuration) uses the raw id from 'renderEventId'.
+persistedEventId :: EventId -> Text
+persistedEventId = Text.pack . show
+
+parsePersistedEventId :: Text -> Maybe EventId
+parsePersistedEventId = readMaybe . Text.unpack
 
 userEventId :: UserId -> EventId
 userEventId (UserId eventId) = eventId

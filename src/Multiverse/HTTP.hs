@@ -13,7 +13,7 @@ import Data.Char (toLower)
 import Data.Int (Int64)
 import Data.Text (Text)
 import Data.Text qualified as Text
-import Data.Text.Encoding qualified as Text
+import Data.Text.Encoding qualified as Text.Encoding
 import Data.Text.Encoding.Error (lenientDecode)
 import Network.HTTP.Client
 import Network.HTTP.Types (hContentType, statusCode)
@@ -103,7 +103,7 @@ bodyPreview contentType body
       redactBlobData text
         <> if LByteString.length body > previewLimit then "...<truncated>" else ""
  where
-  text = Text.decodeUtf8With lenientDecode (LByteString.toStrict (LByteString.take previewLimit body))
+  text = Text.Encoding.decodeUtf8With lenientDecode (LByteString.toStrict (LByteString.take previewLimit body))
 
 previewLimit :: Int64
 previewLimit = 512
@@ -135,11 +135,11 @@ redactBlobData text = redactAfter "base64://" (redactAfter "base64," text)
 requestUrl :: HttpLogOptions -> Request -> Text
 requestUrl options request =
   options.redactUrl
-    ( Text.decodeUtf8 (securePrefix request)
-        <> Text.decodeUtf8 request.host
+    ( Text.Encoding.decodeUtf8 (securePrefix request)
+        <> Text.Encoding.decodeUtf8 request.host
         <> portText request
-        <> Text.decodeUtf8 request.path
-        <> Text.decodeUtf8 request.queryString
+        <> Text.Encoding.decodeUtf8 request.path
+        <> Text.Encoding.decodeUtf8 request.queryString
     )
 
 securePrefix :: Request -> ByteString.Char8.ByteString

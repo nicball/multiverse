@@ -4,7 +4,8 @@ module Multiverse.App
 where
 
 import Control.Concurrent (threadDelay)
-import Control.Monad (forM_, forever)
+import Control.Exception (bracket)
+import Control.Monad (forM_, forever, when)
 import Data.Maybe (catMaybes)
 import Data.Text qualified as Text
 import System.Environment (getArgs)
@@ -20,26 +21,26 @@ run :: IO ()
 run = do
   configPath <- configPathFromArgs
   config <- loadConfig configPath
-  logger <- newLogger config.logLevel
-  logInfo logger ("loaded config " <> Text.pack configPath)
-  timeline <- SQLite.openTimeline config.timelineDb
-  logInfo logger ("timeline opened " <> Text.pack config.timelineDb)
-  let runtime = BridgeRuntime {timeline, logger}
-  telegram <- traverse (Telegram.telegramBridge runtime) config.telegram
-  matrix <- traverse (Matrix.matrixBridge runtime) config.matrix
-  qq <- traverse (QQ.qqBridge runtime) config.qq
-  let bridges = catMaybes [fst <$> telegram, fst <$> matrix, fst <$> qq]
-      updatedConfig =
-        config
-          { telegram = snd <$> telegram
-          , matrix = snd <$> matrix
-          , qq = snd <$> qq
-          }
-  if updatedConfig == config then pure () else writeConfig configPath updatedConfig
-  forM_ bridges (startBridge logger)
-  if null bridges
-    then logWarn logger "no bridges configured"
-    else forever (threadDelay maxBound)
+  bracket (newLogger config.logLevel) closeLogger \logger -> do
+    logInfo logger ("loaded config " <> Text.pack configPath)
+    bracket (SQLite.openTimeline config.timelineDb) SQLite.closeTimeline \timeline -> do
+      logInfo logger ("timeline opened " <> Text.pack config.timelineDb)
+      let runtime = BridgeRuntime {timeline, logger}
+      telegram <- traverse (Telegram.telegramBridge runtime) config.telegram
+      matrix <- traverse (Matrix.matrixBridge runtime) config.matrix
+      qq <- traverse (QQ.qqBridge runtime) config.qq
+      let bridges = catMaybes [fst <$> telegram, fst <$> matrix, fst <$> qq]
+          updatedConfig =
+            config
+              { telegram = snd <$> telegram
+              , matrix = snd <$> matrix
+              , qq = snd <$> qq
+              }
+      when (updatedConfig /= config) (writeConfig configPath updatedConfig)
+      forM_ bridges (startBridge logger)
+      if null bridges
+        then logWarn logger "no bridges configured"
+        else forever (threadDelay maxBound)
 
 configPathFromArgs :: IO FilePath
 configPathFromArgs = do

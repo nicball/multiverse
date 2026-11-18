@@ -2,19 +2,25 @@ module Multiverse.Bridge
   ( Bridge (..)
   , BridgeRuntime (..)
   , enabledRoom
+  , lookupConfiguredRoom
+  , lookupMappedKeys
   , MappingStore (..)
   , RenderedMessage (..)
   , hasPlatformMapping
   , renderRelayedMessage
   , renderMessageBody
   , renderNickChange
+  , htmlEscape
   , ensureRoomMembership
+  , ensureUserMapped
+  , lookupSendMessage
   , submitMapped
   , submitMessageMapped
   , submitBlob
   , openMappingStore
   , ensureInitialRooms
   , startBridge
+  , reflectForever
   , textBody
   , messageBlobs
   , hasTextContent
@@ -29,11 +35,10 @@ import Control.Exception (SomeException, try)
 import Control.Monad (forever, void)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as ByteString
-import Data.List.NonEmpty (NonEmpty ((:|)), nonEmpty, toList)
+import Data.List.NonEmpty (nonEmpty, toList)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Database.SQLite.Simple
-import Text.Read (readMaybe)
 import Multiverse.Config (InitialRoomMapping (..))
 import Multiverse.Event hiding (eventId)
 import Multiverse.Log
@@ -73,11 +78,22 @@ data MappingStore = MappingStore
   , insertMapping :: PlatformKey -> EventId -> IO ()
   , lookupState :: Text -> IO (Maybe Text)
   , setState :: Text -> Text -> IO ()
-  , closeMappingStore :: IO ()
   }
 
 enabledRoom :: [InitialRoomMapping] -> PlatformKey -> Bool
 enabledRoom mappings key = any (\mapping -> mapping.enable && mapping.platformKey == key) mappings
+
+lookupConfiguredRoom :: MappingStore -> [InitialRoomMapping] -> PlatformKey -> IO (Maybe RoomId)
+lookupConfiguredRoom mappingStore mappings platformKey =
+  if enabledRoom mappings platformKey
+    then fmap RoomId <$> mappingStore.lookupTimelineId platformKey
+    else pure Nothing
+
+-- | The keys this timeline event was mapped to under one platform entity type.
+lookupMappedKeys :: MappingStore -> Text -> Text -> EventId -> IO [Text]
+lookupMappedKeys mappingStore platform entityType eventId = do
+  keys <- mappingStore.lookupPlatformKeys eventId
+  pure [key.key | key <- keys, key.platform == platform, key.entityType == entityType]
 
 data RenderedMessage = RenderedMessage
   { plainText :: Text
@@ -167,7 +183,7 @@ renderInlinePart = \case
     let rendered = renderInline inline
      in RenderedMessage
           { plainText = rendered.plainText <> " (" <> url <> ")"
-          , htmlText = "<a href=\"" <> htmlAttributeEscape url <> "\">" <> rendered.htmlText <> "</a>"
+          , htmlText = "<a href=\"" <> htmlEscape url <> "\">" <> rendered.htmlText <> "</a>"
           }
   Mention inline _ -> renderInline inline
   InlineQuote inline ->
@@ -184,9 +200,6 @@ htmlEscape =
     '"' -> "&quot;"
     '\'' -> "&#39;"
     char -> Text.singleton char
-
-htmlAttributeEscape :: Text -> Text
-htmlAttributeEscape = htmlEscape
 
 textBody :: Message -> Message
 textBody body = case nonEmpty (filter isText (toList body)) of
@@ -210,9 +223,6 @@ hasTextContent = any isText . toList
  where
   isText (Blob _ _) = False
   isText _ = True
-
-plainMessage :: Text -> Message
-plainMessage text = Text (Plain text :| []) :| []
 
 sniffExtension :: ByteString -> Text
 sniffExtension = fst . sniffType
@@ -275,6 +285,41 @@ submitMapped timeline mappingStore event = do
     mappingStore.insertMapping event.platformKey eventId
     pure (Right eventId)
 
+-- | Look up a timeline message that was sent by the timeline, for edits and
+-- retractions that need to reuse its sender context.
+lookupSendMessage :: Timeline timeline => timeline -> MessageId -> IO (Maybe SendMessageInfo)
+lookupSendMessage timeline message = do
+  original <- getEvent timeline (messageEventId message)
+  pure case fmap (.storedEvent.content) original of
+    Just (SendMessage info) -> Just info
+    _ -> Nothing
+
+-- | The first sighting of a platform user creates its timeline user.
+ensureUserMapped :: Timeline timeline => timeline -> MappingStore -> PlatformKey -> IO Text -> IO (Either SubmitError UserId)
+ensureUserMapped timeline mappingStore platformKey fetchName = do
+  existing <- mappingStore.lookupTimelineId platformKey
+  case existing of
+    Just eventId -> pure (Right (UserId eventId))
+    Nothing -> do
+      name <- fetchName
+      mapped <-
+        submitMapped
+          timeline
+          mappingStore
+          Event {platformKey, content = CreateUser UserInfo {name, avatar = Nothing}}
+      pure (UserId <$> mapped)
+
+-- | Keep reflecting the timeline from a persisted cursor, one batch at a time.
+reflectForever :: Timeline timeline => timeline -> MappingStore -> Text -> (StoredEvent -> IO ()) -> IO ()
+reflectForever timeline mappingStore stateKey reflectOne =
+  forever do
+    afterEventId <- fmap (fmap EventId) (mappingStore.lookupState stateKey)
+    storedEvents <- getEventsAfter timeline afterEventId
+    mapM_ reflectOne storedEvents
+    case storedEvents of
+      [] -> threadDelay 2000000
+      _ -> mappingStore.setState stateKey (renderEventId ((last storedEvents).storedId))
+
 submitMessageMapped :: Timeline timeline => timeline -> MappingStore -> Event -> IO (Either SubmitError EventId)
 submitMessageMapped timeline mappingStore event =
   case event.content of
@@ -313,7 +358,6 @@ openMappingStore path = do
       , insertMapping = insertMappingSql connection
       , lookupState = lookupStateSql connection
       , setState = setStateSql connection
-      , closeMappingStore = close connection
       }
 
 ensureInitialRooms ::
@@ -412,7 +456,7 @@ lookupTimelineIdSql connection platformKey = do
       (platformKey.platform, platformKey.entityType, platformKey.key)
   case rows of
     Only eventIdText : _ ->
-      case readEventId eventIdText of
+      case parsePersistedEventId eventIdText of
         Just mappedEventId -> pure (Just mappedEventId)
         Nothing -> ioError (userError ("invalid mapped event id: " <> Text.unpack eventIdText))
     [] -> pure Nothing
@@ -423,7 +467,7 @@ lookupPlatformKeysSql connection mappedEventId = do
     query
       connection
       "SELECT platform, entity_type, platform_key FROM bridge_mappings WHERE event_id = ? ORDER BY platform, entity_type, platform_key"
-      (Only (renderEventId mappedEventId))
+      (Only (persistedEventId mappedEventId))
   pure (map toPlatformKey rows)
 
 insertMappingSql :: Connection -> PlatformKey -> EventId -> IO ()
@@ -431,7 +475,7 @@ insertMappingSql connection platformKey mappedEventId =
   execute
     connection
     "INSERT OR IGNORE INTO bridge_mappings (platform, entity_type, platform_key, event_id) VALUES (?, ?, ?, ?)"
-    (platformKey.platform, platformKey.entityType, platformKey.key, renderEventId mappedEventId)
+    (platformKey.platform, platformKey.entityType, platformKey.key, persistedEventId mappedEventId)
 
 lookupStateSql :: Connection -> Text -> IO (Maybe Text)
 lookupStateSql connection key = do
@@ -451,9 +495,3 @@ setStateSql connection key value =
 toPlatformKey :: (Text, Text, Text) -> PlatformKey
 toPlatformKey (platform, entityType, key) =
   PlatformKey {platform, entityType, key}
-
-renderEventId :: EventId -> Text
-renderEventId = Text.pack . show
-
-readEventId :: Text -> Maybe EventId
-readEventId = readMaybe . Text.unpack
