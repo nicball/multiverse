@@ -17,6 +17,8 @@ module Multiverse.Bridge
   , submitMapped
   , submitMessageMapped
   , submitBlob
+  , logObserved
+  , logReflected
   , openMappingStore
   , ensureInitialRooms
   , startBridge
@@ -266,15 +268,15 @@ ensureRoomMembership logger timeline mappingStore platform room user = do
           platform
           "join"
           (renderId (roomEventId room) <> "/" <> renderId (userEventId user))
-  result <- submitMapped timeline mappingStore Event {platformKey, content = JoinRoom user room}
+  result <- submitMapped logger timeline mappingStore Event {platformKey, content = JoinRoom user room}
   case result of
     Left err -> logError logger ("membership submit error: " <> Text.pack (show err))
     Right _ -> pure ()
  where
   renderId (EventId value) = value
 
-submitMapped :: Timeline timeline => timeline -> MappingStore -> Event -> IO (Either SubmitError EventId)
-submitMapped timeline mappingStore event = do
+submitMapped :: Timeline timeline => Logger -> timeline -> MappingStore -> Event -> IO (Either SubmitError EventId)
+submitMapped logger timeline mappingStore event = do
   submitted <- submit timeline event
   case submitted of
     Right eventId -> record eventId
@@ -283,6 +285,7 @@ submitMapped timeline mappingStore event = do
  where
   record eventId = do
     mappingStore.insertMapping event.platformKey eventId
+    logObserved logger event.platformKey event.content eventId
     pure (Right eventId)
 
 -- | Look up a timeline message that was sent by the timeline, for edits and
@@ -295,8 +298,8 @@ lookupSendMessage timeline message = do
     _ -> Nothing
 
 -- | The first sighting of a platform user creates its timeline user.
-ensureUserMapped :: Timeline timeline => timeline -> MappingStore -> PlatformKey -> IO Text -> IO (Either SubmitError UserId)
-ensureUserMapped timeline mappingStore platformKey fetchName = do
+ensureUserMapped :: Timeline timeline => Logger -> timeline -> MappingStore -> PlatformKey -> IO Text -> IO (Either SubmitError UserId)
+ensureUserMapped logger timeline mappingStore platformKey fetchName = do
   existing <- mappingStore.lookupTimelineId platformKey
   case existing of
     Just eventId -> pure (Right (UserId eventId))
@@ -304,6 +307,7 @@ ensureUserMapped timeline mappingStore platformKey fetchName = do
       name <- fetchName
       mapped <-
         submitMapped
+          logger
           timeline
           mappingStore
           Event {platformKey, content = CreateUser UserInfo {name, avatar = Nothing}}
@@ -320,23 +324,64 @@ reflectForever timeline mappingStore stateKey reflectOne =
       [] -> threadDelay 2000000
       _ -> mappingStore.setState stateKey (renderEventId ((last storedEvents).storedId))
 
-submitMessageMapped :: Timeline timeline => timeline -> MappingStore -> Event -> IO (Either SubmitError EventId)
-submitMessageMapped timeline mappingStore event =
+submitMessageMapped :: Timeline timeline => Logger -> timeline -> MappingStore -> Event -> IO (Either SubmitError EventId)
+submitMessageMapped logger timeline mappingStore event =
   case event.content of
     SendMessage info -> do
-      submitted <- submitMapped timeline mappingStore event
+      submitted <- submitMapped logger timeline mappingStore event
       case submitted of
         Left (MissingReferences missing)
           | Just repliedMessage <- info.replyTo
           , messageEventId repliedMessage `elem` missing ->
-              submitMapped timeline mappingStore event {content = SendMessage info {replyTo = Nothing}}
+              submitMapped logger timeline mappingStore event {content = SendMessage info {replyTo = Nothing}}
         other -> pure other
-    _ -> submitMapped timeline mappingStore event
+    _ -> submitMapped logger timeline mappingStore event
+
+-- | Every event a bridge submits to the timeline and every event it reflects
+-- to a platform is reported at info level, so relay traffic can be followed
+-- without turning on debug logging for the HTTP traffic. Observed and
+-- reflected events name the same two ends of the trip in the order the event
+-- travelled.
+logObserved :: Logger -> PlatformKey -> EventContent -> EventId -> IO ()
+logObserved logger platformKey content eventId =
+  logInfo logger
+    ( "observed "
+        <> eventKind content
+        <> " "
+        <> renderPlatformKey platformKey
+        <> " -> "
+        <> renderEventId eventId
+    )
+
+logReflected :: Logger -> StoredEvent -> PlatformKey -> IO ()
+logReflected logger stored platformKey =
+  logInfo logger
+    ( "reflected "
+        <> eventKind stored.storedEvent.content
+        <> " "
+        <> renderEventId stored.storedId
+        <> " -> "
+        <> renderPlatformKey platformKey
+    )
+
+eventKind :: EventContent -> Text
+eventKind = \case
+  CreateRoom _ -> "room creation"
+  CreateUser _ -> "user creation"
+  CreateBlob _ -> "blob creation"
+  JoinRoom _ _ -> "room join"
+  LeaveRoom _ _ -> "room leave"
+  SendMessage _ -> "message"
+  RetractMessage _ -> "retraction"
+  EditMessage _ _ -> "edit"
+  ModifyUser _ _ -> "user modification"
+  ModifyRoom _ _ -> "room modification"
+  ChangeRoomNick _ _ _ -> "nick change"
 
 -- | Blobs are timeline-owned: their event platform key is derived from the
 -- content, while the bridge mapping records the platform-local source key.
-submitBlob :: Timeline timeline => timeline -> MappingStore -> PlatformKey -> ByteString -> IO (Either SubmitError BlobId)
-submitBlob timeline mappingStore sourceKey bytes = do
+submitBlob :: Timeline timeline => Logger -> timeline -> MappingStore -> PlatformKey -> ByteString -> IO (Either SubmitError BlobId)
+submitBlob logger timeline mappingStore sourceKey bytes = do
   submitted <- submit timeline Event {platformKey = blobPlatformKey bytes, content = CreateBlob bytes}
   case submitted of
     Right eventId -> record eventId
@@ -345,6 +390,7 @@ submitBlob timeline mappingStore sourceKey bytes = do
  where
   record eventId = do
     mappingStore.insertMapping sourceKey eventId
+    logObserved logger sourceKey (CreateBlob bytes) eventId
     pure (Right (BlobId eventId))
 
 openMappingStore :: FilePath -> IO MappingStore

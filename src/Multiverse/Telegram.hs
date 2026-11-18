@@ -126,7 +126,7 @@ observeUpdate context update = do
                               , body = messageBody
                               }
                       }
-              submitted <- submitMessageMapped context.timeline context.mappingStore event
+              submitted <- submitMessageMapped context.logger context.timeline context.mappingStore event
               case submitted of
                 Right _ -> pure ()
                 Left err -> fail ("telegram submit error: " <> show err)
@@ -141,7 +141,7 @@ observeTelegramMembership context message roomId = do
     let platformKey =
           PlatformKey "telegram" kind ((telegramMessageKey message).key <> "/" <> Text.pack (show member.userId))
         content = if kind == "join" then JoinRoom user roomId else LeaveRoom user roomId
-    result <- submitMapped context.timeline context.mappingStore Event {platformKey, content}
+    result <- submitMapped context.logger context.timeline context.mappingStore Event {platformKey, content}
     case result of
       Left err -> logError context.logger ("telegram membership submit error: " <> Text.pack (show err))
       Right _ -> pure ()
@@ -161,7 +161,7 @@ observeTelegramEdit context updateId message = do
             Nothing -> pure ()
             Just newBody -> do
               let key = PlatformKey "telegram" "edit" (Text.pack (show updateId))
-              result <- submitMapped context.timeline context.mappingStore Event {platformKey = key, content = EditMessage (MessageId targetId) newBody}
+              result <- submitMapped context.logger context.timeline context.mappingStore Event {platformKey = key, content = EditMessage (MessageId targetId) newBody}
               either (fail . show) (const (pure ())) result
 
 telegramReplyTo :: Context timeline -> TelegramMessage -> IO (Maybe MessageId)
@@ -174,7 +174,7 @@ telegramReplyTo context message =
 
 ensureUser :: Timeline timeline => Context timeline -> TelegramUser -> IO UserId
 ensureUser context user = do
-  mapped <- ensureUserMapped context.timeline context.mappingStore (telegramUserKey user) (pure (telegramUserName user))
+  mapped <- ensureUserMapped context.logger context.timeline context.mappingStore (telegramUserKey user) (pure (telegramUserName user))
   either (\err -> fail ("could not create telegram user: " <> show err)) pure mapped
 
 reflectEvent :: Timeline timeline => Context timeline -> StoredEvent -> IO ()
@@ -203,7 +203,12 @@ reflectEvent context stored =
                   case result of
                     Left err | not ("message is not modified" `Text.isInfixOf` Text.toLower (Text.pack err)) ->
                       logError context.logger ("telegram edit reflect error: " <> Text.pack err)
-                    _ -> context.mappingStore.insertMapping (telegramEditKey stored.storedId chatId messageId) stored.storedId
+                    Left _ ->
+                      context.mappingStore.insertMapping (telegramEditKey stored.storedId chatId messageId) stored.storedId
+                    Right _ -> do
+                      let platformKey = telegramEditKey stored.storedId chatId messageId
+                      context.mappingStore.insertMapping platformKey stored.storedId
+                      logReflected context.logger stored platformKey
             _ -> pure ()
       | otherwise -> pure ()
     RetractMessage message
@@ -229,8 +234,10 @@ reflectEvent context stored =
                   result <- telegramSendMessage context chatId Nothing text
                   case result of
                     Left err -> logError context.logger ("telegram nick reflect error: " <> Text.pack err)
-                    Right sentMessage ->
-                      context.mappingStore.insertMapping (telegramMessageKey sentMessage) stored.storedId
+                    Right sentMessage -> do
+                      let platformKey = telegramMessageKey sentMessage
+                      context.mappingStore.insertMapping platformKey stored.storedId
+                      logReflected context.logger stored platformKey
     _ -> pure ()
  where
   -- A message is reflected part by part; each part's mapping row is written as
@@ -249,8 +256,10 @@ reflectEvent context stored =
                 result <- action
                 case result of
                   Left err -> logError context.logger ("telegram reflect error: " <> Text.pack err)
-                  Right message ->
-                    context.mappingStore.insertMapping (telegramMessageKey message) stored.storedId
+                  Right message -> do
+                    let platformKey = telegramMessageKey message
+                    context.mappingStore.insertMapping platformKey stored.storedId
+                    logReflected context.logger stored platformKey
           sendPart (telegramSendMessage context chatId replyTo text)
           forM_ (messageBlobs info.body) \(kind, blobId) -> do
             blob <- getEvent context.timeline (blobEventId blobId)
@@ -261,7 +270,10 @@ reflectEvent context stored =
     result <- telegramDeleteMessage context chatId messageId
     case result of
       Left err -> logError context.logger ("telegram retract reflect error: " <> Text.pack err)
-      Right () -> context.mappingStore.insertMapping (telegramRetractionKey stored.storedId) stored.storedId
+      Right () -> do
+        let platformKey = telegramRetractionKey stored.storedId
+        context.mappingStore.insertMapping platformKey stored.storedId
+        logReflected context.logger stored platformKey
 
 -- | Telegram reports no identifier for an edit, so the applied edit is recorded
 -- under a key derived from the platform message it changed.
@@ -561,7 +573,7 @@ telegramMessageBody context message = do
     blob <- case existing of
       Just eventId -> pure (BlobId eventId)
       Nothing -> do
-        submitted <- submitBlob context.timeline context.mappingStore sourceKey content
+        submitted <- submitBlob context.logger context.timeline context.mappingStore sourceKey content
         either (fail . show) pure submitted
     let (methodName, _) = telegramMediaMethod kind content
     context.mappingStore.insertMapping (telegramBlobKey methodName media.fileId) (blobEventId blob)

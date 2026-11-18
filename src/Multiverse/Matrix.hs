@@ -131,7 +131,7 @@ observeEvent observer platformRoom room event
                       { platformKey = matrixRedactionKey platformRoom event.eventId
                       , content = RetractMessage (MessageId targetEventId)
                       }
-              submitted <- submitMapped observer.bridge.timeline observer.bridge.mappingStore timelineEvent
+              submitted <- submitMapped observer.bridge.logger observer.bridge.timeline observer.bridge.mappingStore timelineEvent
               case submitted of
                 Right _ -> pure ()
                 Left (MissingReferences missing)
@@ -163,7 +163,7 @@ observeMatrixMessage observer event platformRoom room messageContent = do
                   { platformKey = PlatformKey "matrix" "edit" (platformRoom <> "/" <> event.eventId)
                   , content = EditMessage (MessageId targetMessage) messageContent.messageBody
                   }
-          submitted <- submitMapped context.timeline context.mappingStore timelineEvent
+          submitted <- submitMapped context.logger context.timeline context.mappingStore timelineEvent
           case submitted of
             Right _ -> pure ()
             Left err -> logError context.logger ("matrix edit submit error: " <> Text.pack (show err))
@@ -182,7 +182,7 @@ observeMatrixMessage observer event platformRoom room messageContent = do
                       , body = messageContent.messageBody
                       }
               }
-      submitted <- submitMessageMapped context.timeline context.mappingStore timelineEvent
+      submitted <- submitMessageMapped context.logger context.timeline context.mappingStore timelineEvent
       case submitted of
         Right _ -> pure ()
         Left err -> logError context.logger ("matrix submit error: " <> Text.pack (show err))
@@ -201,7 +201,7 @@ observeMatrixMedia observer event platformRoom room mediaContent = do
       case downloaded of
         Nothing -> pure Nothing
         Just bytes -> do
-          submitted <- submitBlob context.timeline context.mappingStore blobKey bytes
+          submitted <- submitBlob context.logger context.timeline context.mappingStore blobKey bytes
           case submitted of
             Right blob -> pure (Just blob)
             Left err -> do
@@ -230,7 +230,7 @@ observeMatrixMedia observer event platformRoom room mediaContent = do
                       , body
                       }
               }
-      submitted <- submitMessageMapped context.timeline context.mappingStore timelineEvent
+      submitted <- submitMessageMapped context.logger context.timeline context.mappingStore timelineEvent
       case submitted of
         Right _ -> pure ()
         Left err -> logError context.logger ("matrix media message submit error: " <> Text.pack (show err))
@@ -265,7 +265,7 @@ observeMatrixMember observer room event member
   eventKey kind = PlatformKey "matrix" kind (event.eventId <> "/" <> member.memberUserId)
 
   submitEvent platformKey content = do
-    result <- submitMapped context.timeline context.mappingStore Event {platformKey, content}
+    result <- submitMapped context.logger context.timeline context.mappingStore Event {platformKey, content}
     case result of
       Left err -> logError context.logger ("matrix membership submit error: " <> Text.pack (show err))
       Right _ -> pure ()
@@ -288,6 +288,7 @@ ensureUser observer matrixUserId = do
   let context = observer.bridge
   mapped <-
     ensureUserMapped
+      context.logger
       context.timeline
       context.mappingStore
       (matrixUserKey matrixUserId)
@@ -321,7 +322,10 @@ reflectEvent context stored =
                   result <- matrixSendEdit context roomId txnId matrixEventId profile text
                   case result of
                     Left err -> logError context.logger ("matrix edit reflect error: " <> Text.pack err)
-                    Right editEventId -> context.mappingStore.insertMapping (matrixEventKey roomId editEventId) stored.storedId
+                    Right editEventId -> do
+                      let platformKey = matrixEventKey roomId editEventId
+                      context.mappingStore.insertMapping platformKey stored.storedId
+                      logReflected context.logger stored platformKey
             _ -> pure ()
     RetractMessage message
       | stored.storedEvent.platformKey.platform == "matrix" ->
@@ -345,8 +349,10 @@ reflectEvent context stored =
               result <- matrixSendMessage context roomKey.key txnId Nothing Nothing body
               case result of
                 Left err -> logError context.logger ("matrix nick reflect error: " <> Text.pack err)
-                Right matrixEventId ->
-                  context.mappingStore.insertMapping (matrixEventKey roomKey.key matrixEventId) stored.storedId
+                Right matrixEventId -> do
+                  let platformKey = matrixEventKey roomKey.key matrixEventId
+                  context.mappingStore.insertMapping platformKey stored.storedId
+                  logReflected context.logger stored platformKey
     _ -> pure ()
  where
   sendToRoom info profile body roomKey = do
@@ -359,8 +365,10 @@ reflectEvent context stored =
             result <- action
             case result of
               Left err -> logError context.logger ("matrix reflect error: " <> Text.pack err)
-              Right matrixEventId ->
-                context.mappingStore.insertMapping (matrixEventKey roomId matrixEventId) stored.storedId
+              Right matrixEventId -> do
+                let platformKey = matrixEventKey roomId matrixEventId
+                context.mappingStore.insertMapping platformKey stored.storedId
+                logReflected context.logger stored platformKey
           sendText = sendPart (matrixSendMessage context roomId (matrixTransactionId stored "text" roomId) replyTo (Just profile) body)
           sendBlob index (kind, blobId) = do
             blob <- getEvent context.timeline (blobEventId blobId)
@@ -398,7 +406,10 @@ reflectEvent context stored =
         fallback <- matrixSendMessage context roomId fallbackTxnId Nothing profile notice
         case fallback of
           Left fallbackErr -> logError context.logger ("matrix retract failure notice error: " <> Text.pack fallbackErr)
-          Right matrixEventId -> context.mappingStore.insertMapping (matrixEventKey roomId matrixEventId) stored.storedId
+          Right matrixEventId -> do
+            let platformKey = matrixEventKey roomId matrixEventId
+            context.mappingStore.insertMapping platformKey stored.storedId
+            logReflected context.logger stored platformKey
       Right redactionEventId -> do
         let mappingKey =
               maybe
@@ -406,6 +417,7 @@ reflectEvent context stored =
                 (matrixRedactionKey roomId)
                 redactionEventId
         context.mappingStore.insertMapping mappingKey stored.storedId
+        logReflected context.logger stored mappingKey
 
 -- | Transaction ids are idempotency keys scoped to the access token, so they
 -- must be unique per room and per part.

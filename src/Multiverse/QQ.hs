@@ -175,7 +175,7 @@ observeQQMessage context event =
                                   , body
                                   }
                           }
-                  submitted <- submitMessageMapped context.timeline context.mappingStore timelineEvent
+                  submitted <- submitMessageMapped context.logger context.timeline context.mappingStore timelineEvent
                   case submitted of
                     Right _ -> pure ()
                     Left err -> logError context.logger ("qq message submit error: " <> Text.pack (show err))
@@ -196,7 +196,7 @@ observeQQMembership context event joined =
               user <- ensureQQUser context userId name
               let key = PlatformKey "qq" (if joined then "join" else "leave") (noticeKey groupId userId event.qqTime)
                   content = if joined then JoinRoom user roomId else LeaveRoom user roomId
-              result <- submitMapped context.timeline context.mappingStore Event {platformKey = key, content}
+              result <- submitMapped context.logger context.timeline context.mappingStore Event {platformKey = key, content}
               case result of
                 Left err -> logError context.logger ("qq membership submit error: " <> Text.pack (show err))
                 Right _ -> pure ()
@@ -216,7 +216,7 @@ observeQQCard context event =
               let senderName = qqSenderName userId event.qqSender
               user <- ensureQQUser context userId (if senderName == userId then card else senderName)
               let key = PlatformKey "qq" "nick" (noticeKey groupId userId event.qqTime)
-              result <- submitMapped context.timeline context.mappingStore Event {platformKey = key, content = ChangeRoomNick user roomId card}
+              result <- submitMapped context.logger context.timeline context.mappingStore Event {platformKey = key, content = ChangeRoomNick user roomId card}
               case result of
                 Left err -> logError context.logger ("qq nickname submit error: " <> Text.pack (show err))
                 Right _ -> pure ()
@@ -259,7 +259,7 @@ observeQQRetraction context event =
             Just targetId -> do
               let key = PlatformKey "qq" "retraction" (groupId <> "/" <> targetMessageId)
                   eventToSubmit = Event {platformKey = key, content = RetractMessage (MessageId targetId)}
-              result <- submitMapped context.timeline context.mappingStore eventToSubmit
+              result <- submitMapped context.logger context.timeline context.mappingStore eventToSubmit
               case result of
                 Left err -> logError context.logger ("qq retraction submit error: " <> Text.pack (show err))
                 Right _ -> pure ()
@@ -274,7 +274,7 @@ qqReplyTo context groupId (Just messageId) = do
 ensureQQUser :: Timeline timeline => Context timeline -> Text -> Text -> IO UserId
 ensureQQUser context qqUserId displayName = do
   let name = if Text.null displayName then qqUserId else displayName
-  mapped <- ensureUserMapped context.timeline context.mappingStore (qqUserKey qqUserId) (pure name)
+  mapped <- ensureUserMapped context.logger context.timeline context.mappingStore (qqUserKey qqUserId) (pure name)
   either (\err -> fail ("could not create qq user: " <> show err)) pure mapped
 
 data QQContext timeline = QQContext
@@ -373,7 +373,7 @@ importQQSegmentBlob context index mediaUrl =
           case bytes of
             Nothing -> pure Nothing
             Just content -> do
-              result <- submitBlob context.bridge.timeline context.bridge.mappingStore blobKey content
+              result <- submitBlob context.bridge.logger context.bridge.timeline context.bridge.mappingStore blobKey content
               case result of
                 Right blob -> pure (Just blob)
                 Left err -> do
@@ -620,8 +620,10 @@ sendQQNickChange context stored user nick roomKey =
           Right result ->
             case valueTextField "message_id" result of
               Nothing -> logError context.logger "qq nick send_group_msg response lacked message_id"
-              Just messageId ->
-                context.mappingStore.insertMapping (qqMessageKey roomKey.key messageId) stored.storedId
+              Just messageId -> do
+                let platformKey = qqMessageKey roomKey.key messageId
+                context.mappingStore.insertMapping platformKey stored.storedId
+                logReflected context.logger stored platformKey
 
 sendToQQRoom :: Timeline timeline => Context timeline -> StoredEvent -> SendMessageInfo -> PlatformKey -> IO ()
 sendToQQRoom context stored info roomKey =
@@ -647,8 +649,10 @@ sendToQQRoom context stored info roomKey =
           Right result ->
             case valueTextField "message_id" result of
               Nothing -> logError context.logger "qq send_group_msg response lacked message_id"
-              Just messageId ->
-                context.mappingStore.insertMapping (qqMessageKey roomKey.key messageId) stored.storedId
+              Just messageId -> do
+                let platformKey = qqMessageKey roomKey.key messageId
+                context.mappingStore.insertMapping platformKey stored.storedId
+                logReflected context.logger stored platformKey
 
 qqMessageMappedToGroup :: Context timeline -> EventId -> Text -> IO Bool
 qqMessageMappedToGroup context eventId_ groupId = do
@@ -693,7 +697,9 @@ deleteQQMessage context stored (groupId, messageId) = do
       response <- qqApiCall context "delete_msg" (object ["message_id" .= qqIdJson messageId])
       case response of
         Left err -> logError context.logger ("qq delete_msg failed: " <> Text.pack err)
-        Right _ -> context.mappingStore.insertMapping key stored.storedId
+        Right _ -> do
+          context.mappingStore.insertMapping key stored.storedId
+          logReflected context.logger stored key
 
 renderQQMessage :: Timeline timeline => QQContext timeline -> SendMessageInfo -> IO [Value]
 renderQQMessage context info = do
