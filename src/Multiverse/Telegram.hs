@@ -383,10 +383,9 @@ telegramEditText context chatId messageId text = do
 
 sendMappedMedia :: Context timeline -> Integer -> Maybe Int -> BlobType -> BlobId -> ByteString.ByteString -> IO (Either String TelegramMessage)
 sendMappedMedia context chatId replyTo kind blobId bytes = do
-  let method = telegramMediaMethod kind bytes
-      stateKey = telegramBlobStateKey method blobId
+  let method@(methodName, _) = telegramMediaMethod kind bytes
       upload = telegramSendMedia context chatId replyTo method bytes
-  existing <- context.mappingStore.lookupState stateKey
+  existing <- telegramMappedFileId context methodName blobId
   result <- case existing of
     Nothing -> upload
     Just fileId -> do
@@ -399,15 +398,31 @@ sendMappedMedia context chatId replyTo kind blobId bytes = do
   case result of
     Right message -> case message.media of
       Just (returnedKind, media) | returnedKind == kind -> do
-        context.mappingStore.insertMapping (PlatformKey "telegram" "blob" media.fileId) (blobEventId blobId)
-        context.mappingStore.setState stateKey media.fileId
+        let blobEvent = blobEventId blobId
+        context.mappingStore.insertMapping (telegramSourceKey media) blobEvent
+        context.mappingStore.insertMapping (telegramBlobKey methodName media.fileId) blobEvent
       _ -> pure ()
     Left _ -> pure ()
   pure result
 
-telegramBlobStateKey :: (Text, ByteString.ByteString) -> BlobId -> Text
-telegramBlobStateKey (methodName, _) blobId =
-  "telegram.blob." <> renderEventId (blobEventId blobId) <> "." <> methodName
+-- | Media this bridge may send by file id instead of uploading it again. The key
+-- carries the upload method because a file id is only valid for the method that
+-- minted it.
+telegramBlobKey :: Text -> Text -> PlatformKey
+telegramBlobKey methodName fileId = PlatformKey "telegram" "blob" (methodName <> ":" <> fileId)
+
+telegramMappedFileId :: Context timeline -> Text -> BlobId -> IO (Maybe Text)
+telegramMappedFileId context methodName blobId = do
+  keys <- context.mappingStore.lookupPlatformKeys (blobEventId blobId)
+  pure case
+    [ fileId
+    | key <- keys
+    , key.platform == "telegram"
+    , key.entityType == "blob"
+    , Just fileId <- [Text.stripPrefix (methodName <> ":") key.key]
+    ] of
+    fileId : _ -> Just fileId
+    [] -> Nothing
 
 -- | Animated images have to go through @sendAnimation@; @sendPhoto@ would
 -- flatten them to a still frame.
@@ -545,6 +560,12 @@ telegramMessageKey :: TelegramMessage -> PlatformKey
 telegramMessageKey message =
   PlatformKey "telegram" "message" (Text.pack (show message.chat.chatId <> "/" <> show message.messageId))
 
+-- | @file_unique_id@ is stable across bots while @file_id@ is per-bot, so the
+-- stable one identifies the observed file and the fallback only stands in when
+-- the server omits it.
+telegramSourceKey :: TelegramMedia -> PlatformKey
+telegramSourceKey media = PlatformKey "telegram" "blob" (fromMaybe media.fileId media.fileUniqueId)
+
 telegramMessageRefKey :: TelegramMessageRef -> PlatformKey
 telegramMessageRefKey message =
   PlatformKey "telegram" "message" (Text.pack (show message.chat.chatId <> "/" <> show message.messageId))
@@ -569,7 +590,7 @@ telegramMessageBody context message = do
   pure (nonEmpty (textParts <> maybe [] (\(kind, blob) -> [Blob kind blob]) media))
  where
   importMedia (kind, media) = do
-    let sourceKey = PlatformKey "telegram" "blob" (fromMaybe media.fileId media.fileUniqueId)
+    let sourceKey = telegramSourceKey media
     existing <- context.mappingStore.lookupTimelineId sourceKey
     content <- case existing of
       Just blobEvent -> do
@@ -583,8 +604,8 @@ telegramMessageBody context message = do
       Nothing -> do
         submitted <- submitBlob context.timeline context.mappingStore sourceKey content
         either (fail . show) pure submitted
-    let method = telegramMediaMethod kind content
-    context.mappingStore.setState (telegramBlobStateKey method blob) media.fileId
+    let (methodName, _) = telegramMediaMethod kind content
+    context.mappingStore.insertMapping (telegramBlobKey methodName media.fileId) (blobEventId blob)
     pure (kind, blob)
 
 telegramDownloadFile :: Context timeline -> Text -> IO ByteString.ByteString

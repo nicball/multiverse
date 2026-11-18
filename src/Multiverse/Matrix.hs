@@ -191,7 +191,7 @@ observeMatrixMedia observer event platformRoom room mediaContent = do
   let context = observer.bridge
   userId <- ensureUser observer event.sender
   ensureRoomMembership context.logger context.timeline context.mappingStore "matrix" room userId
-  let blobKey = PlatformKey "matrix" "blob" mediaContent.mediaUri
+  let blobKey = matrixBlobKey mediaContent.mediaUri
   existing <- context.mappingStore.lookupTimelineId blobKey
   blobId <- case existing of
     Just blobEvent -> pure (Just (BlobId blobEvent))
@@ -383,15 +383,14 @@ reflectEvent context stored =
               Just (CreateBlob bytes) -> do
                 let name = "file-" <> Text.take 12 (renderEventId (blobEventId blobId)) <> sniffExtension bytes
                     mimeType = sniffMimeType bytes
-                    stateKey = "matrix.blob." <> renderEventId (blobEventId blobId)
-                cached <- context.mappingStore.lookupState stateKey
+                cached <- matrixUploadedMedia context blobId
                 uploaded <- case cached of
                   Just mediaUrl -> pure (Right mediaUrl)
                   Nothing -> matrixUploadMedia context name mimeType bytes
                 case uploaded of
                   Left err -> logError context.logger ("matrix media upload error: " <> Text.pack err)
                   Right mediaUrl -> do
-                    context.mappingStore.setState stateKey mediaUrl
+                    context.mappingStore.insertMapping (matrixBlobKey mediaUrl) (blobEventId blobId)
                     let blobReplyTo = if index == 1 && not (hasTextContent info.body) then replyTo else Nothing
                         content = matrixMediaContent kind name mimeType (ByteString.length bytes) mediaUrl
                         partTxnId = matrixTransactionId stored ("part" <> Text.pack (show index)) roomId
@@ -458,6 +457,16 @@ matrixMessageMappedToRoom :: Context timeline -> EventId -> Text -> IO Bool
 matrixMessageMappedToRoom context eventId_ roomId = do
   keys <- context.mappingStore.lookupPlatformKeys eventId_
   pure (any ((== Just roomId) . fmap fst . matrixMessageTarget) keys)
+
+-- | Media this bridge already uploaded for a blob, so that a blob reflected into
+-- several rooms is uploaded once. The mapper is keyed by the URI the homeserver
+-- returned, which is what the observer would record for the same media anyway.
+matrixUploadedMedia :: Context timeline -> BlobId -> IO (Maybe Text)
+matrixUploadedMedia context blobId = do
+  keys <- context.mappingStore.lookupPlatformKeys (blobEventId blobId)
+  pure case [key.key | key <- keys, key.platform == "matrix", key.entityType == "blob"] of
+    mediaUri : _ -> Just mediaUri
+    [] -> Nothing
 
 matrixReplyEventId :: Context timeline -> Text -> Maybe MessageId -> IO (Maybe Text)
 matrixReplyEventId _ _ Nothing = pure Nothing
@@ -861,6 +870,9 @@ matrixEventKey roomId matrixEventId = PlatformKey "matrix" "message" (roomId <> 
 
 matrixRedactionKey :: Text -> Text -> PlatformKey
 matrixRedactionKey roomId matrixEventId = PlatformKey "matrix" "redaction" (roomId <> "/" <> matrixEventId)
+
+matrixBlobKey :: Text -> PlatformKey
+matrixBlobKey mediaUri = PlatformKey "matrix" "blob" mediaUri
 
 renderEventId :: EventId -> Text
 renderEventId (EventId eventId_) = eventId_

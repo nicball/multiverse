@@ -20,7 +20,7 @@ A bridge mapping has two roles: platform messages/entities to timeline events, a
 
 A mapping key is the platform key of the entity, so it carries whatever the platform needs to identify that entity by itself: Telegram and QQ message keys are `<room id>/<message id>`, and Matrix message keys are `<room id>/<event id>` because a Matrix event id does not name its room. One timeline event therefore has one mapping row per platform entity it was reflected as, and the row is also the record that the side effect happened. Consequently a partially delivered multi-part message is not resumed where it stopped.
 
-The bridge state table holds only opaque platform cursors, such as a Matrix sync batch token or a Telegram update offset, and derived media handles such as an uploaded blob's URL or file id.
+The bridge state table holds only opaque platform cursors, such as a Matrix sync batch token or a Telegram update offset.
 
 Each bridge has two parts: Observer and Reflector.
 
