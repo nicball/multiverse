@@ -4,6 +4,7 @@ timeline_db = "multiverse.sqlite3"
 level = "info"
 
 [telegram]
+enable = true
 bot_token = "123456:replace-me"
 mapping_db = "telegram-mapping.sqlite3"
 poll_timeout_seconds = 30
@@ -14,6 +15,7 @@ enable = true
 # timeline_room = "existing-timeline-room-event-id"
 
 [matrix]
+enable = true
 homeserver = "https://matrix.example.org"
 access_token = "replace-me"
 mapping_db = "matrix-mapping.sqlite3"
@@ -25,6 +27,7 @@ enable = true
 # timeline_room = "existing-timeline-room-event-id"
 
 [qq]
+enable = true
 api_url = "http://127.0.0.1:3000"
 websocket_url = "ws://127.0.0.1:6700/event"
 access_token = "replace-me"

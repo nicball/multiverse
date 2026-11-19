@@ -3,11 +3,14 @@ module Multiverse.App
   )
 where
 
+import Control.Applicative ((<|>))
 import Control.Concurrent (threadDelay)
 import Control.Exception (bracket)
 import Control.Monad (forM_, forever, when)
 import Data.Maybe (catMaybes)
+import Data.Text (Text)
 import Data.Text qualified as Text
+import GHC.Records (HasField (getField))
 import System.Environment (getArgs)
 import Multiverse.Bridge
 import Multiverse.Config
@@ -26,21 +29,38 @@ run = do
     bracket (SQLite.openTimeline config.timelineDb) SQLite.closeTimeline \timeline -> do
       logInfo logger ("timeline opened " <> Text.pack config.timelineDb)
       let runtime = BridgeRuntime {timeline, logger}
-      telegram <- traverse (Telegram.telegramBridge runtime) config.telegram
-      matrix <- traverse (Matrix.matrixBridge runtime) config.matrix
-      qq <- traverse (QQ.qqBridge runtime) config.qq
+      telegram <- startIfEnabled logger "telegram" (Telegram.telegramBridge runtime) config.telegram
+      matrix <- startIfEnabled logger "matrix" (Matrix.matrixBridge runtime) config.matrix
+      qq <- startIfEnabled logger "qq" (QQ.qqBridge runtime) config.qq
       let bridges = catMaybes [fst <$> telegram, fst <$> matrix, fst <$> qq]
           updatedConfig =
             config
-              { telegram = snd <$> telegram
-              , matrix = snd <$> matrix
-              , qq = snd <$> qq
+              { telegram = (snd <$> telegram) <|> config.telegram
+              , matrix = (snd <$> matrix) <|> config.matrix
+              , qq = (snd <$> qq) <|> config.qq
               }
       when (updatedConfig /= config) (writeConfig configPath updatedConfig)
       forM_ bridges (startBridge logger)
       if null bridges
-        then logWarn logger "no bridges configured"
+        then logWarn logger "no bridges configured or enabled"
         else forever (threadDelay maxBound)
+
+-- | A disabled bridge is left untouched: its mapping database is not opened,
+-- its initial rooms are not ensured, and its config is written back as it was.
+startIfEnabled ::
+  HasField "enable" bridgeConfig Bool =>
+  Logger ->
+  Text ->
+  (bridgeConfig -> IO a) ->
+  Maybe bridgeConfig ->
+  IO (Maybe a)
+startIfEnabled logger name start = \case
+  Nothing -> pure Nothing
+  Just bridgeConfig
+    | getField @"enable" bridgeConfig -> Just <$> start bridgeConfig
+    | otherwise -> do
+        logInfo logger (name <> " bridge disabled, skipping")
+        pure Nothing
 
 configPathFromArgs :: IO FilePath
 configPathFromArgs = do

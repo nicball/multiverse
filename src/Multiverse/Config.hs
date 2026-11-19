@@ -35,7 +35,8 @@ data InitialRoomMapping = InitialRoomMapping
   deriving (Eq, Show)
 
 data TelegramBridgeConfig = TelegramBridgeConfig
-  { botToken :: Text
+  { enable :: Bool
+  , botToken :: Text
   , mappingDb :: FilePath
   , pollTimeoutSeconds :: Int
   , initialRooms :: [InitialRoomMapping]
@@ -43,7 +44,8 @@ data TelegramBridgeConfig = TelegramBridgeConfig
   deriving (Eq, Show)
 
 data MatrixBridgeConfig = MatrixBridgeConfig
-  { homeserver :: Text
+  { enable :: Bool
+  , homeserver :: Text
   , accessToken :: Text
   , mappingDb :: FilePath
   , syncTimeoutMs :: Int
@@ -52,7 +54,8 @@ data MatrixBridgeConfig = MatrixBridgeConfig
   deriving (Eq, Show)
 
 data QQBridgeConfig = QQBridgeConfig
-  { apiUrl :: Text
+  { enable :: Bool
+  , apiUrl :: Text
   , websocketUrl :: Text
   , accessToken :: Text
   , mappingDb :: FilePath
@@ -97,7 +100,8 @@ appConfigCodec =
 telegramConfigCodec :: TomlCodec TelegramBridgeConfig
 telegramConfigCodec =
   TelegramBridgeConfig
-    <$> Toml.text "bot_token" .= (.botToken)
+    <$> optionalWithDefault True (Toml.bool "enable") .= (.enable)
+    <*> Toml.text "bot_token" .= (.botToken)
     <*> optionalWithDefault "telegram-mapping.sqlite3" (filePathCodec "mapping_db") .= (.mappingDb)
     <*> optionalWithDefault 30 (Toml.int "poll_timeout_seconds") .= (.pollTimeoutSeconds)
     <*> optionalWithDefault [] (Toml.list (initialRoomCodec "telegram") "rooms") .= (.initialRooms)
@@ -105,7 +109,8 @@ telegramConfigCodec =
 matrixConfigCodec :: TomlCodec MatrixBridgeConfig
 matrixConfigCodec =
   MatrixBridgeConfig
-    <$> Toml.text "homeserver" .= (.homeserver)
+    <$> optionalWithDefault True (Toml.bool "enable") .= (.enable)
+    <*> Toml.text "homeserver" .= (.homeserver)
     <*> Toml.text "access_token" .= (.accessToken)
     <*> optionalWithDefault "matrix-mapping.sqlite3" (filePathCodec "mapping_db") .= (.mappingDb)
     <*> optionalWithDefault 30000 (Toml.int "sync_timeout_ms") .= (.syncTimeoutMs)
@@ -114,7 +119,8 @@ matrixConfigCodec =
 qqConfigCodec :: TomlCodec QQBridgeConfig
 qqConfigCodec =
   QQBridgeConfig
-    <$> Toml.text "api_url" .= (.apiUrl)
+    <$> optionalWithDefault True (Toml.bool "enable") .= (.enable)
+    <*> Toml.text "api_url" .= (.apiUrl)
     <*> Toml.text "websocket_url" .= (.websocketUrl)
     <*> Toml.text "access_token" .= (.accessToken)
     <*> optionalWithDefault "qq-mapping.sqlite3" (filePathCodec "mapping_db") .= (.mappingDb)
