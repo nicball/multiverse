@@ -11,7 +11,7 @@ import Data.ByteString qualified as ByteString
 import Data.ByteString.Char8 qualified as ByteString.Char8
 import Data.ByteString.Lazy qualified as LByteString
 import Data.Function (on)
-import Data.List (nubBy, sortOn)
+import Data.List (nub, nubBy, sortOn)
 import Data.List.NonEmpty (NonEmpty ((:|)), nonEmpty, toList)
 import Data.List.NonEmpty qualified as NonEmpty
 import Data.Maybe (catMaybes, fromMaybe, isNothing, listToMaybe, mapMaybe)
@@ -366,6 +366,7 @@ telegramSendRichMessage :: Timeline timeline => Context timeline -> Integer -> M
 telegramSendRichMessage context chatId replyTo body =
   telegramRichCall
     context
+    chatId
     "sendRichMessage"
     ( [("chat_id", ByteString.Char8.pack (show chatId))]
         <> maybe [] (\messageId -> [("reply_to_message_id", ByteString.Char8.pack (show messageId))]) replyTo
@@ -376,6 +377,7 @@ telegramEditRichMessage :: Timeline timeline => Context timeline -> Integer -> I
 telegramEditRichMessage context chatId messageId body =
   telegramRichCall
     context
+    chatId
     "editMessageText"
     [ ("chat_id", ByteString.Char8.pack (show chatId))
     , ("message_id", ByteString.Char8.pack (show messageId))
@@ -385,12 +387,13 @@ telegramEditRichMessage context chatId messageId body =
 -- | Send a whole message body as one rich message. Media stays where the
 -- timeline put it because the blocks reference it and the upload happens in the
 -- same multipart request, so a reflected message keeps its part order.
-telegramRichCall :: Timeline timeline => Context timeline -> Text -> [(ByteString.ByteString, ByteString.ByteString)] -> Message -> IO (Either String TelegramMessage)
-telegramRichCall context methodName fields body = do
+telegramRichCall :: Timeline timeline => Context timeline -> Integer -> Text -> [(ByteString.ByteString, ByteString.ByteString)] -> Message -> IO (Either String TelegramMessage)
+telegramRichCall context chatId methodName fields body = do
   attachments <- traverse attachment (messageBlobs body)
+  mentionRenderer <- telegramMentionRenderer context chatId body
   let indexed = zip [(0 :: Int) ..] attachments
       fileParts = [(attachName index, part) | (index, part) <- indexed, isNothing part.attachmentFileId]
-      blocks = Rich.messageBlocks (blockFor indexed) body
+      blocks = Rich.messageBlocks (blockFor indexed) mentionRenderer body
       boundary = foldl chooseBoundary "multiverse-telegram-rich" (map (\(_, part) -> part.attachmentBytes) fileParts)
       renderField name value =
         "--" <> boundary <> "\r\nContent-Disposition: form-data; name=\"" <> name <> "\"\r\n\r\n" <> value <> "\r\n"
@@ -557,7 +560,10 @@ decodeTelegramResponse :: FromJSON a => LByteString.ByteString -> Either String 
 decodeTelegramResponse = eitherDecode
 
 telegramUserKey :: TelegramUser -> PlatformKey
-telegramUserKey user = PlatformKey "telegram" "user" (Text.pack (show user.userId))
+telegramUserKey user = telegramUserKeyById user.userId
+
+telegramUserKeyById :: Integer -> PlatformKey
+telegramUserKeyById userId = PlatformKey "telegram" "user" (Text.pack (show userId))
 
 telegramRoomKey :: TelegramChat -> PlatformKey
 telegramRoomKey chat = PlatformKey "telegram" "room" (Text.pack (show chat.chatId))
@@ -583,8 +589,8 @@ telegramChatName :: TelegramChat -> Text
 telegramChatName chat = maybe (Text.pack (show chat.chatId)) id chat.title
 
 telegramMessageBody :: Timeline timeline => Context timeline -> TelegramMessage -> IO (Maybe Message)
-telegramMessageBody context message =
-  case message.richMessage of
+telegramMessageBody context message = do
+  body <- case message.richMessage of
     Just value ->
       case Rich.parseRichMessage value of
         Right rich -> Rich.renderRichMessage (importMediaSource context) rich
@@ -595,10 +601,96 @@ telegramMessageBody context message =
       media <- traverse importMessageMedia message.media
       let textParts = maybe [] (NonEmpty.toList . (`telegramMessageFromEntities` message.entities)) message.text
       pure (nonEmpty (textParts <> maybe [] (\(kind, blob) -> [Blob kind blob]) media))
+  traverse (mapMessageInlines (telegramObservedMention context)) body
  where
   importMessageMedia (kind, telegramMedia) = do
     blob <- importMediaSource context kind (telegramMediaRef telegramMedia)
     pure (kind, blob)
+
+-- | A text mention arrives as a @tg://user?id=@ link. The user becomes a
+-- timeline user so the mention can refer to its creation event; when that is
+-- not possible the link stays a link.
+telegramObservedMention :: Timeline timeline => Context timeline -> InlineTextPart -> IO InlineTextPart
+telegramObservedMention context = \case
+  Link label url
+    | Just telegramUserId <- telegramMentionUserId url -> do
+        let fallbackName = Text.pack (show telegramUserId)
+            name = if Text.null (inlineToText label) then fallbackName else inlineToText label
+        mapped <-
+          ensureUserMapped
+            context.logger
+            context.timeline
+            context.mappingStore
+            (telegramUserKeyById telegramUserId)
+            (pure name)
+        case mapped of
+          Right user -> pure (Mention label (userEventId user))
+          Left err -> do
+            logDebug context.logger ("telegram mention user submit error: " <> Text.pack (show err))
+            pure (Link label url)
+  part -> pure part
+
+-- | How a mention is rendered to the bot API rich message the reflector sends
+-- to one chat. Mentions keep their label text in every other case.
+telegramMentionRenderer :: Timeline timeline => Context timeline -> Integer -> Message -> IO Rich.MentionRenderer
+telegramMentionRenderer context chatId message = do
+  resolved <- catMaybes <$> traverse resolve (nub (messageMentionTargets message))
+  pure \target inline -> ($ inline) <$> lookup target resolved
+ where
+  resolve target = fmap ((,) target) <$> telegramMentionValue context chatId target
+
+telegramMentionValue :: Timeline timeline => Context timeline -> Integer -> EventId -> IO (Maybe (InlineText -> Value))
+telegramMentionValue context chatId target = do
+  stored <- getEvent context.timeline target
+  case fmap (.storedEvent.content) stored of
+    Just (CreateUser _) -> do
+      keys <- lookupMappedKeys context.mappingStore "telegram" "user" target
+      let render telegramUserId inline =
+            let label = if Text.null (inlineToText inline) then "@" <> Text.pack (show telegramUserId) else inlineToText inline
+             in object
+                  [ "type" .= ("text_mention" :: Text)
+                  , "text" .= label
+                  , "user"
+                      .= object
+                        [ "id" .= telegramUserId
+                        , "is_bot" .= False
+                        , "first_name" .= label
+                        ]
+                  ]
+      pure (render <$> listToMaybe (mapMaybe (readMaybe . Text.unpack) keys :: [Integer]))
+    Just (SendMessage _) -> do
+      keys <- lookupMappedKeys context.mappingStore "telegram" "message" target
+      let messageId =
+            listToMaybe
+              [ messageChatMessageId
+              | key <- keys
+              , Just (messageChatId, messageChatMessageId) <- [telegramMessageTarget key]
+              , messageChatId == chatId
+              ]
+      pure do
+        messageId_ <- messageId
+        url <- telegramConversationMessageLink chatId messageId_
+        pure \inline ->
+          object
+            [ "type" .= ("url" :: Text)
+            , "text" .= if Text.null (inlineToText inline) then String url else Rich.inlineValue inline
+            , "url" .= url
+            ]
+    _ -> pure Nothing
+
+telegramMentionUserId :: Text -> Maybe Integer
+telegramMentionUserId url = do
+  rest <- Text.stripPrefix "tg://user?id=" url
+  readMaybe (Text.unpack (Text.takeWhile (/= '&') rest))
+
+-- | @t.me/c@ links only exist for supergroups, which are the chats whose
+-- identifier carries the @-100@ prefix.
+telegramConversationMessageLink :: Integer -> Int -> Maybe Text
+telegramConversationMessageLink chatId messageId
+  | chatId >= 0 = Nothing
+  | otherwise = do
+      internalId <- Text.stripPrefix "100" (Text.pack (show (negate chatId)))
+      pure ("https://t.me/c/" <> internalId <> "/" <> Text.pack (show messageId))
 
 -- | A blob is content addressed, so a platform resource the bridge already knows
 -- is reused and only an unknown one is downloaded and submitted.
@@ -670,7 +762,8 @@ telegramInline text entities =
      in beforePart <> entityPart entity body <> go afterIndex rest
 
 supportedInlineEntity :: TelegramEntity -> Bool
-supportedInlineEntity entity = entity.entityType `elem` ["bold", "italic", "code", "text_link", "url"]
+supportedInlineEntity entity =
+  entity.entityType `elem` ["bold", "italic", "code", "text_link", "url", "text_mention"]
 
 sortTelegramEntities :: [TelegramEntity] -> [TelegramEntity]
 sortTelegramEntities = sortOn (.offset)
@@ -684,6 +777,9 @@ entityPart entity body =
         "code" -> [InlineQuote inline]
         "text_link" -> [Link inline (maybe body id entity.url)]
         "url" -> [Link inline body]
+        "text_mention" -> case entity.entityUser of
+          Just user -> [Link inline ("tg://user?id=" <> Text.pack (show user.userId))]
+          Nothing -> [Plain body]
         _ -> [Plain body]
 
 readTextInt :: Text -> Int
@@ -774,6 +870,7 @@ data TelegramEntity = TelegramEntity
   , offset :: Int
   , length :: Int
   , url :: Maybe Text
+  , entityUser :: Maybe TelegramUser
   }
 
 instance FromJSON TelegramEntity where
@@ -783,6 +880,7 @@ instance FromJSON TelegramEntity where
       <*> obj .: "offset"
       <*> obj .: "length"
       <*> obj .:? "url"
+      <*> obj .:? "user"
 
 data TelegramMessageRef = TelegramMessageRef
   { messageId :: Int

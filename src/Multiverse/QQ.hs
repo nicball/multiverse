@@ -364,11 +364,11 @@ qqBlobParts _ Nothing label = oneTextPart ("[" <> label <> "]")
 decodeQQMention :: Timeline timeline => QQContext timeline -> Value -> IO [MessagePart]
 decodeQQMention context segmentData =
   case valueTextField "qq" segmentData of
-    Just "all" -> pure (oneInlinePart (Mention (plainInline "@all") (Right context.room)))
+    Just "all" -> pure (oneInlinePart (Mention (plainInline "@all") (roomEventId context.room)))
     Just userId -> do
       let name = fromMaybe userId (firstNonempty [valueTextField "name" segmentData])
       user <- ensureQQUser context.bridge userId name
-      pure (oneInlinePart (Mention (plainInline ("@" <> name)) (Left user)))
+      pure (oneInlinePart (Mention (plainInline ("@" <> name)) (userEventId user)))
     Nothing -> pure (oneTextPart "[mention]")
 
 importQQSegmentBlob :: Timeline timeline => QQContext timeline -> Int -> Maybe Text -> IO (Maybe BlobId)
@@ -859,15 +859,7 @@ renderQQInlinePart context = \case
   Link inline url -> do
     rendered <- renderQQInline context inline
     pure (rendered <> [qqTextSegment " (", qqTextSegment url, qqTextSegment ")"])
-  Mention inline (Left user) -> do
-    keys <- lookupMappedKeys context.bridge.mappingStore "qq" "user" (userEventId user)
-    case keys of
-      qqUserId : _ -> pure [object ["type" .= ("at" :: Text), "data" .= object ["qq" .= qqIdJson qqUserId]]]
-      [] -> renderQQInline context inline
-  Mention inline (Right mentionedRoom)
-    | roomEventId mentionedRoom == roomEventId context.room ->
-        pure [object ["type" .= ("at" :: Text), "data" .= object ["qq" .= ("all" :: Text)]]]
-    | otherwise -> renderQQInline context inline
+  Mention inline target -> renderQQMention context inline target
   InlineQuote inline -> do
     rendered <- renderQQInline context inline
     pure ([qqTextSegment "\""] <> rendered <> [qqTextSegment "\""])
@@ -876,6 +868,27 @@ renderQQInlinePart context = \case
   wrapInline marker inline = do
     rendered <- renderQQInline context inline
     pure ([qqTextSegment marker] <> rendered <> [qqTextSegment marker])
+
+-- | A mention is only a QQ @-mention when the target has a QQ counterpart: a
+-- user the bridge knows, or the room the message is being reflected into.
+-- Everything else (message links, other rooms, unknown events) keeps the
+-- mention's label text.
+renderQQMention :: Timeline timeline => QQContext timeline -> InlineText -> EventId -> IO [Value]
+renderQQMention context inline target = do
+  stored <- getEvent context.bridge.timeline target
+  case fmap (.storedEvent.content) stored of
+    Just (CreateUser _) -> do
+      keys <- lookupMappedKeys context.bridge.mappingStore "qq" "user" target
+      case keys of
+        qqUserId : _ -> pure [qqAtSegment qqUserId]
+        [] -> renderQQInline context inline
+    Just (CreateRoom _)
+      | target == roomEventId context.room -> pure [qqAtSegment "all"]
+    _ -> renderQQInline context inline
+
+qqAtSegment :: Text -> Value
+qqAtSegment qqUserId =
+  object ["type" .= ("at" :: Text), "data" .= object ["qq" .= qqIdJson qqUserId]]
 
 renderQQBlob :: Timeline timeline => QQContext timeline -> BlobType -> BlobId -> IO [Value]
 renderQQBlob context blobType blobId = do

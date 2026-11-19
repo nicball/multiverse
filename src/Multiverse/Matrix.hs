@@ -152,6 +152,7 @@ observeMatrixMessage observer event platformRoom room messageContent = do
   let context = observer.bridge
   userId <- ensureUser observer event.sender
   ensureRoomMembership context.logger context.timeline context.mappingStore "matrix" room userId
+  body <- matrixObservedBody observer messageContent.messageBody
   case messageContent.messageEditOf of
     Just targetEventId -> do
       target <- context.mappingStore.lookupTimelineId (matrixEventKey platformRoom targetEventId)
@@ -161,7 +162,7 @@ observeMatrixMessage observer event platformRoom room messageContent = do
           let timelineEvent =
                 Event
                   { platformKey = PlatformKey "matrix" "edit" (platformRoom <> "/" <> event.eventId)
-                  , content = EditMessage (MessageId targetMessage) messageContent.messageBody
+                  , content = EditMessage (MessageId targetMessage) body
                   }
           submitted <- submitMapped context.logger context.timeline context.mappingStore timelineEvent
           case submitted of
@@ -179,13 +180,61 @@ observeMatrixMessage observer event platformRoom room messageContent = do
                       , room
                       , replyTo
                       , forwardOf = Nothing
-                      , body = messageContent.messageBody
+                      , body
                       }
               }
       submitted <- submitMessageMapped context.logger context.timeline context.mappingStore timelineEvent
       case submitted of
         Right _ -> pure ()
         Left err -> logError context.logger ("matrix submit error: " <> Text.pack (show err))
+
+-- | Matrix mentions are links to @matrix.to@. A user link names a user the
+-- timeline can create, while room and message links only become mentions when
+-- the bridge already mapped the target.
+matrixObservedBody :: Timeline timeline => Observer timeline -> Message -> IO Message
+matrixObservedBody observer = mapMessageInlines \case
+  Link label url -> case matrixLinkTarget url of
+    Just (MatrixUserTarget matrixUserId) -> do
+      let name = if Text.null (inlineToText label) then matrixUserId else inlineToText label
+      mapped <-
+        ensureUserMapped
+          context.logger
+          context.timeline
+          context.mappingStore
+          (matrixUserKey matrixUserId)
+          (pure name)
+      case mapped of
+        Right user -> pure (Mention label (userEventId user))
+        Left err -> do
+          logDebug context.logger ("matrix mention user submit error: " <> Text.pack (show err))
+          pure (Link label url)
+    Just (MatrixRoomTarget roomId) -> do
+      mapped <- context.mappingStore.lookupTimelineId (matrixRoomKey roomId)
+      pure (maybe (Link label url) (Mention label) mapped)
+    Just (MatrixMessageTarget roomId messageId) -> do
+      mapped <- context.mappingStore.lookupTimelineId (matrixEventKey roomId messageId)
+      pure (maybe (Link label url) (Mention label) mapped)
+    Nothing -> pure (Link label url)
+  part -> pure part
+ where
+  context = observer.bridge
+
+data MatrixLinkTarget
+  = MatrixUserTarget Text
+  | MatrixRoomTarget Text
+  | MatrixMessageTarget Text Text
+
+matrixLinkTarget :: Text -> Maybe MatrixLinkTarget
+matrixLinkTarget url = do
+  rest <- Text.stripPrefix "https://matrix.to/#/" url
+  case Text.splitOn "/" (Text.takeWhile (/= '?') rest) of
+    [recipient]
+      | "@" `Text.isPrefixOf` recipient -> Just (MatrixUserTarget recipient)
+      | "!" `Text.isPrefixOf` recipient -> Just (MatrixRoomTarget recipient)
+    [recipient, matrixEventId]
+      | "!" `Text.isPrefixOf` recipient, "$" `Text.isPrefixOf` matrixEventId ->
+          Just (MatrixMessageTarget recipient matrixEventId)
+    _ -> Nothing
 
 observeMatrixMedia :: Timeline timeline => Observer timeline -> MatrixEvent -> Text -> RoomId -> MatrixMediaContent -> IO ()
 observeMatrixMedia observer event platformRoom room mediaContent = do
@@ -305,9 +354,7 @@ reflectEvent context stored =
           logDebug context.logger ("matrix not reflecting own-origin event " <> renderEventId stored.storedId)
       | otherwise -> do
           roomKeys <- context.mappingStore.lookupPlatformKeys (roomEventId info.room)
-          let matrixRooms = filter (enabledRoom context.config.initialRooms) roomKeys
-          (profile, body) <- renderMatrixRelayMessage context info {body = textBody info.body}
-          mapM_ (sendToRoom info profile body) matrixRooms
+          mapM_ (sendToRoom info) (filter (enabledRoom context.config.initialRooms) roomKeys)
     EditMessage message body
       | stored.storedEvent.platformKey.platform /= "matrix" -> do
           original <- lookupSendMessage context.timeline message
@@ -315,11 +362,12 @@ reflectEvent context stored =
             Just info -> do
               unless (messageBlobs info.body == messageBlobs body) do
                 logWarn context.logger "matrix cannot reflect changes to message attachments"
-              (profile, text) <- matrixRelayBody context info (renderMessageBody (textBody body))
               targets <- matrixEditTargets context message
               alreadyMapped <- hasPlatformMapping context.mappingStore "matrix" stored.storedId
               unless alreadyMapped do
                 forM_ targets \(roomId, matrixEventId) -> do
+                  resolved <- matrixReflectedBody context roomId (textBody body)
+                  (profile, text) <- matrixRelayBody context info (renderMessageBody resolved)
                   let txnId = matrixTransactionId stored "edit" roomId
                   result <- matrixSendEdit context roomId txnId matrixEventId profile text
                   case result of
@@ -357,9 +405,11 @@ reflectEvent context stored =
                   logReflected context.logger stored platformKey
     _ -> pure ()
  where
-  sendToRoom info profile body roomKey = do
+  sendToRoom info roomKey = do
     alreadySent <- matrixMessageMappedToRoom context stored.storedId roomKey.key
     unless alreadySent do
+      resolved <- matrixReflectedBody context roomKey.key (textBody info.body)
+      (profile, body) <- matrixRelayBody context info (renderMessageBody resolved)
       replyTo <- matrixReplyEventId context roomKey.key info.replyTo
       let roomId = roomKey.key
           blobs = messageBlobs info.body
@@ -506,8 +556,38 @@ matrixGetDisplayName context matrixUserId =
     (context.config.homeserver <> "/_matrix/client/v3/profile/" <> escapePathSegment matrixUserId <> "/displayname")
     id
 
-renderMatrixRelayMessage :: Timeline timeline => Context timeline -> SendMessageInfo -> IO (Value, RenderedMessage)
-renderMatrixRelayMessage context info = matrixRelayBody context info (renderMessageBody info.body)
+-- | Mentions become platform links when the target exists in the room the
+-- message is being reflected into; otherwise the mention keeps its label text.
+matrixReflectedBody :: Timeline timeline => Context timeline -> Text -> Message -> IO Message
+matrixReflectedBody context platformRoom = mapMessageInlines \case
+  Mention label target -> do
+    url <- matrixMentionUrl context platformRoom target
+    pure (maybe (Mention label target) (Link label) url)
+  part -> pure part
+
+matrixMentionUrl :: Timeline timeline => Context timeline -> Text -> EventId -> IO (Maybe Text)
+matrixMentionUrl context platformRoom target = do
+  stored <- getEvent context.timeline target
+  case fmap (.storedEvent.content) stored of
+    Just (CreateUser _) -> matrixEntityUrl "user" target
+    Just (SendMessage _) -> do
+      keys <- lookupMappedKeys context.mappingStore "matrix" "message" target
+      let matching =
+            listToMaybe
+              [ roomTarget
+              | key <- keys
+              , Just roomTarget <- [matrixMessageTarget key]
+              , fst roomTarget == platformRoom
+              ]
+      pure case matching of
+        Just (roomId, messageId) -> Just ("https://matrix.to/#/" <> roomId <> "/" <> messageId)
+        Nothing -> Nothing
+    Just (CreateRoom _) -> matrixEntityUrl "room" target
+    _ -> pure Nothing
+ where
+  matrixEntityUrl entityType target_ = do
+    keys <- lookupMappedKeys context.mappingStore "matrix" entityType target_
+    pure (("https://matrix.to/#/" <>) <$> listToMaybe keys)
 
 -- | Attaches the sender's MSC4144 profile to a message body. Edits and retraction
 -- notices reuse the profile of the message they act on, so a relayed message keeps

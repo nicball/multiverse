@@ -7,6 +7,8 @@ module Multiverse.Event
   , Message
   , plainInline
   , plainMessage
+  , inlineToText
+  , messageMentionTargets
   , SendMessageInfo (..)
   , UserInfo (..)
   , RoomInfo (..)
@@ -46,7 +48,11 @@ data InlineTextPart
   = Bold InlineText
   | Italic InlineText
   | Link InlineText Text
-  | Mention InlineText (Either UserId RoomId)
+  -- The target is the event the mention refers to, so a bridge interprets it
+  -- by the target's content: a user creation event is a user mention, a message
+  -- is a message link, and a room creation event can stand for @all when it is
+  -- the room the message is being reflected into.
+  | Mention InlineText EventId
   | InlineQuote InlineText
   | Plain Text
   deriving (Eq, Ord, Read, Show)
@@ -60,6 +66,17 @@ plainInline text = Plain text :| []
 
 plainMessage :: Text -> Message
 plainMessage text = Text (plainInline text) :| []
+
+inlineToText :: InlineText -> Text
+inlineToText = Text.concat . map partText . toList
+ where
+  partText = \case
+    Plain text -> text
+    Bold inline -> inlineToText inline
+    Italic inline -> inlineToText inline
+    Link inline _ -> inlineToText inline
+    Mention inline _ -> inlineToText inline
+    InlineQuote inline -> inlineToText inline
 
 data SendMessageInfo = SendMessageInfo
   { sender :: UserId
@@ -145,14 +162,33 @@ inlinePartReferences = \case
   Bold inline -> inlineReferences inline
   Italic inline -> inlineReferences inline
   Link inline _ -> inlineReferences inline
-  Mention inline target ->
-    (case target of
-      Left user -> [userEventId user]
-      Right room -> [roomEventId room]
-    )
-      <> inlineReferences inline
+  Mention inline target -> target : inlineReferences inline
   InlineQuote inline -> inlineReferences inline
   Plain _ -> []
+
+-- | The events mentioned by a message, in message order. Reflectors resolve
+-- each distinct target once instead of once per occurrence.
+messageMentionTargets :: Message -> [EventId]
+messageMentionTargets = concatMap partTargets . toList
+ where
+  partTargets = \case
+    Text inline -> inlineTargets inline
+    Emote inline -> inlineTargets inline
+    Blob _ _ -> []
+    List messages -> concatMap messageMentionTargets (toList messages)
+    BlockQuote message -> messageMentionTargets message
+    Heading _ inline -> inlineTargets inline
+
+inlineTargets :: InlineText -> [EventId]
+inlineTargets = concatMap partTargets . toList
+ where
+  partTargets = \case
+    Bold inline -> inlineTargets inline
+    Italic inline -> inlineTargets inline
+    Link inline _ -> inlineTargets inline
+    Mention _ target -> [target]
+    InlineQuote inline -> inlineTargets inline
+    Plain _ -> []
 
 blobPlatformKey :: ByteString -> PlatformKey
 blobPlatformKey bytes = PlatformKey "multiverse" "blob" (sha256HexBytes bytes)

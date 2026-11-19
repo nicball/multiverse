@@ -33,7 +33,10 @@ data InlineTextPart
   = Bold InlineText
   | Italic InlineText
   | Link InlineText Text
-  | Mention InlineText UserId
+  | Mention InlineText EventId
+  -- A mention's target is any timeline event: a user creation event is a
+  -- user mention, a message is a message link, and a room creation event
+  -- can stand for @all when it is the current room.
   -- Monospace/code span.
   | InlineQuote InlineText
   | Plain Text

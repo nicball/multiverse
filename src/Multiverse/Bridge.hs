@@ -10,6 +10,7 @@ module Multiverse.Bridge
   , renderRelayedMessage
   , renderMessageBody
   , renderNickChange
+  , mapMessageInlines
   , htmlEscape
   , ensureRoomMembership
   , ensureUserMapped
@@ -192,6 +193,32 @@ renderInlinePart = \case
     let rendered = renderInline inline
      in RenderedMessage ("\"" <> rendered.plainText <> "\"") ("<code>" <> rendered.htmlText <> "</code>")
   Plain text -> RenderedMessage text (htmlEscape text)
+
+-- | Rewrite every inline part of a message, including the ones nested in
+-- lists, quotes and headings. The transform sees a part after its own nested
+-- inline text has been rewritten.
+mapMessageInlines :: (InlineTextPart -> IO InlineTextPart) -> Message -> IO Message
+mapMessageInlines transform = traverse messagePart
+ where
+  messagePart = \case
+    Text inline -> Text <$> inlineText inline
+    Blob kind blob -> pure (Blob kind blob)
+    Emote inline -> Emote <$> inlineText inline
+    List messages -> List <$> traverse (mapMessageInlines transform) messages
+    BlockQuote message -> BlockQuote <$> mapMessageInlines transform message
+    Heading level inline -> Heading level <$> inlineText inline
+
+  inlineText = traverse inlinePart
+
+  inlinePart given = do
+    rebuilt <- case given of
+      Bold inner -> Bold <$> inlineText inner
+      Italic inner -> Italic <$> inlineText inner
+      Link inner url -> Link <$> inlineText inner <*> pure url
+      Mention inner target -> Mention <$> inlineText inner <*> pure target
+      InlineQuote inner -> InlineQuote <$> inlineText inner
+      Plain text -> pure (Plain text)
+    transform rebuilt
 
 htmlEscape :: Text -> Text
 htmlEscape =

@@ -4,9 +4,11 @@
 -- so the rest of the program never sees a rich message.
 module Multiverse.Telegram.Rich
   ( MediaRef (..)
+  , MentionRenderer
   , RichBlock (..)
   , RichMedia (..)
   , RichMessage (..)
+  , inlineValue
   , messageBlocks
   , parseRichMessage
   , renderRichMessage
@@ -22,11 +24,11 @@ import Data.Aeson.Types (Parser, parseEither, parseMaybe)
 import Data.Foldable (toList)
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import Data.List.NonEmpty qualified as NonEmpty
-import Data.Maybe (catMaybes)
+import Data.Maybe (catMaybes, fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Multiverse.Event
-import Multiverse.Types (BlobId, BlobType (..))
+import Multiverse.Types (BlobId, BlobType (..), EventId)
 
 -- | A platform resource inside a rich message. @file_unique_id@ is stable
 -- across bots, so it identifies the resource when the server provides it.
@@ -202,7 +204,9 @@ parseRichInlineObject obj =
     "url" -> linked (textAt "url")
     "email_address" -> linked ("mailto:" <> textAt "email_address")
     "phone_number" -> linked ("tel:" <> textAt "phone_number")
-    "text_mention" -> htmlWrapped ("<a href=\"tg://user?id=" <> mentionedUserId <> "\">") "</a>"
+    "text_mention"
+      | Text.null mentionedUserId -> inner
+      | otherwise -> Link inner ("tg://user?id=" <> mentionedUserId) :| []
     "date_time" ->
       htmlWrapped
         ("<tg-time unix=\"" <> textAt "unix_time" <> "\" format=\"" <> textAt "date_time_format" <> "\">")
@@ -230,18 +234,6 @@ scalarText = \case
   Bool True -> "true"
   Bool False -> "false"
   _ -> ""
-
--- | The unformatted text of a rich text, for blocks that hold text only.
-inlineToText :: InlineText -> Text
-inlineToText = Text.concat . map partText . toList
- where
-  partText = \case
-    Plain text -> text
-    Bold text -> inlineToText text
-    Italic text -> inlineToText text
-    Link text _ -> inlineToText text
-    Mention text _ -> inlineToText text
-    InlineQuote text -> inlineToText text
 
 -- | Turn blocks into timeline message parts. Media resolution is a callback
 -- because downloading and submitting blobs is the bridge's business.
@@ -292,11 +284,16 @@ richMessageMedia = concatMap blockMedia . (.blocks)
 
 -- Rendering: timeline message -> bot API blocks -------------------------------
 
+-- | Render the rich text of a mention. 'Nothing' keeps the mention's label
+-- text as plain rich text.
+type MentionRenderer = EventId -> InlineText -> Maybe Value
+
 -- | Render a message as rich blocks. Blobs are addressed through the given
 -- function, which is how the bridge chooses between a reused file id and an
--- upload.
-messageBlocks :: (BlobType -> BlobId -> Value) -> Message -> [Value]
-messageBlocks blobBlock = concatMap partBlocks . toList
+-- upload. Mentions are rendered by the callback, which is how the bridge
+-- resolves them to platform users and links.
+messageBlocks :: (BlobType -> BlobId -> Value) -> MentionRenderer -> Message -> [Value]
+messageBlocks blobBlock renderMention = concatMap partBlocks . toList
  where
   partBlocks = \case
     Text inline -> [paragraph inline]
@@ -305,41 +302,41 @@ messageBlocks blobBlock = concatMap partBlocks . toList
       [ object
           [ "type" .= ("heading" :: Text)
           , "size" .= max 1 (min 6 level)
-          , "text" .= inlineValue inline
+          , "text" .= inlineValueWith renderMention inline
           ]
       ]
     List items ->
       [ object
           [ "type" .= ("list" :: Text)
-          , "items" .= map (\item -> object ["blocks" .= messageBlocks blobBlock item]) (toList items)
+          , "items" .= map (\item -> object ["blocks" .= messageBlocks blobBlock renderMention item]) (toList items)
           ]
       ]
     BlockQuote inline ->
-      [object ["type" .= ("blockquote" :: Text), "blocks" .= messageBlocks blobBlock inline]]
+      [object ["type" .= ("blockquote" :: Text), "blocks" .= messageBlocks blobBlock renderMention inline]]
     Blob kind blob -> [blobBlock kind blob]
   paragraph inline =
-    object ["type" .= ("paragraph" :: Text), "text" .= inlineValue inline]
+    object ["type" .= ("paragraph" :: Text), "text" .= inlineValueWith renderMention inline]
 
 inlineValue :: InlineText -> Value
-inlineValue inline = case toList inline of
+inlineValue = inlineValueWith \_ _ -> Nothing
+
+inlineValueWith :: MentionRenderer -> InlineText -> Value
+inlineValueWith renderMention inline = case toList inline of
   [part] -> partValue part
   parts -> toJSON (map partValue parts)
-
-partValue :: InlineTextPart -> Value
-partValue = \case
-  Plain text -> String text
-  Bold inline -> tagged "bold" inline
-  Italic inline -> tagged "italic" inline
-  InlineQuote inline -> tagged "code" inline
-  Link inline url ->
-    object
-      [ "type" .= ("url" :: Text)
-      , "text" .= inlineValue inline
-      , "url" .= url
-      ]
-  -- A timeline mention has no platform-independent target, so it keeps its
-  -- text; the bridges that know the platform user can relink it.
-  Mention inline _ -> inlineValue inline
  where
-  tagged name inline =
-    object ["type" .= (name :: Text), "text" .= inlineValue inline]
+  partValue = \case
+    Plain text -> String text
+    Bold inner -> tagged "bold" inner
+    Italic inner -> tagged "italic" inner
+    InlineQuote inner -> tagged "code" inner
+    Link inner url ->
+      object
+        [ "type" .= ("url" :: Text)
+        , "text" .= inlineValueWith renderMention inner
+        , "url" .= url
+        ]
+    Mention inner target ->
+      fromMaybe (inlineValueWith renderMention inner) (renderMention target inner)
+  tagged name inner =
+    object ["type" .= (name :: Text), "text" .= inlineValueWith renderMention inner]
