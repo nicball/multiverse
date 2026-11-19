@@ -6,7 +6,7 @@ module Multiverse.HTTP
 where
 
 import Control.Concurrent (threadDelay)
-import Control.Exception (try)
+import Control.Exception (throwIO, try)
 import Data.ByteString.Char8 qualified as ByteString.Char8
 import Data.ByteString.Lazy qualified as LByteString
 import Data.Char (toLower)
@@ -40,22 +40,27 @@ loggedHttp logger options request manager = do
 
 httpLbsWithBackoff :: Logger -> Request -> Manager -> IO (Response LByteString.ByteString)
 httpLbsWithBackoff logger request manager =
-  go initialHttpBackoffMicros
+  go maxHttpRetries initialHttpBackoffMicros
  where
-  go delayMicros = do
+  go retriesLeft delayMicros = do
     result <- try (httpLbs request manager)
     case result of
       Right response -> pure response
       Left (err :: HttpException) -> do
-        logWarn logger ("http request failed, retrying in " <> delayText delayMicros <> ": " <> Text.pack (show err))
-        threadDelay delayMicros
-        go (min maxHttpBackoffMicros (delayMicros * 2))
+        case retriesLeft of
+          0 -> do
+            logWarn logger ("http request failed, giving up: " <> Text.pack (show err))
+            throwIO err
+          _ -> do
+            logWarn logger ("http request failed, retrying in " <> delayText delayMicros <> ": " <> Text.pack (show err))
+            threadDelay delayMicros
+            go (retriesLeft - 1) (delayMicros * 2)
 
 initialHttpBackoffMicros :: Int
 initialHttpBackoffMicros = 1000000
 
-maxHttpBackoffMicros :: Int
-maxHttpBackoffMicros = 60000000
+maxHttpRetries :: Int
+maxHttpRetries = 5
 
 delayText :: Int -> Text
 delayText micros = Text.pack (show (micros `div` 1000000)) <> "s"
