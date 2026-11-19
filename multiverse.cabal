@@ -66,6 +66,7 @@ library
                     , Multiverse.QQ
                     , Multiverse.SQLite
                     , Multiverse.Telegram
+                    , Multiverse.Telegram.Rich
                     , Multiverse.Timeline
                     , Multiverse.Types
     default-extensions: DuplicateRecordFields

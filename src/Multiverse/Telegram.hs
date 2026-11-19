@@ -5,16 +5,16 @@ where
 
 import Control.Applicative ((<|>))
 import Control.Concurrent (threadDelay)
-import Control.Monad (forM_, forever, unless)
+import Control.Monad (forM_, forever, unless, when)
 import Data.Aeson
 import Data.ByteString qualified as ByteString
 import Data.ByteString.Char8 qualified as ByteString.Char8
 import Data.ByteString.Lazy qualified as LByteString
 import Data.Function (on)
 import Data.List (nubBy, sortOn)
-import Data.List.NonEmpty (NonEmpty ((:|)), nonEmpty)
+import Data.List.NonEmpty (NonEmpty ((:|)), nonEmpty, toList)
 import Data.List.NonEmpty qualified as NonEmpty
-import Data.Maybe (catMaybes, fromMaybe, listToMaybe, mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isNothing, listToMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text.Encoding
@@ -27,6 +27,7 @@ import Multiverse.Event hiding (eventId)
 import Multiverse.HTTP (HttpLogOptions (..), defaultHttpLogOptions)
 import Multiverse.HTTP qualified as HTTP
 import Multiverse.Log
+import Multiverse.Telegram.Rich qualified as Rich
 import Multiverse.Timeline
 import Multiverse.Types
 
@@ -195,12 +196,12 @@ reflectEvent context stored =
             Just info -> do
               unless (messageBlobs info.body == messageBlobs body) do
                 logWarn context.logger "telegram cannot reflect changes to message attachments"
-              text <- renderRelayedMessage context.timeline info {body = textBody body}
+              editBody <- relayedBody context info {body = textBody body}
               alreadyMapped <- hasPlatformMapping context.mappingStore "telegram" stored.storedId
               unless alreadyMapped do
                 targets <- telegramTextTargets context message
                 forM_ (filter (enabledTelegramTarget context) targets) \(chatId, messageId) -> do
-                  result <- telegramEditText context chatId messageId text
+                  result <- telegramEditRichMessage context chatId messageId editBody
                   case result of
                     Left err | not ("message is not modified" `Text.isInfixOf` Text.toLower (Text.pack err)) ->
                       logError context.logger ("telegram edit reflect error: " <> Text.pack err)
@@ -224,7 +225,7 @@ reflectEvent context stored =
       | stored.storedEvent.platformKey.platform == "telegram" ->
           logDebug context.logger ("telegram not reflecting own-origin nick change " <> renderEventId stored.storedId)
       | otherwise -> do
-          text <- renderNickChange context.timeline user nick
+          body <- nickBody context user nick
           roomKeys <- context.mappingStore.lookupPlatformKeys (roomEventId room)
           forM_ (filter (enabledRoom context.config.initialRooms) roomKeys) \roomKey ->
             case readMaybe (Text.unpack roomKey.key) of
@@ -232,7 +233,7 @@ reflectEvent context stored =
               Just chatId -> do
                 alreadySent <- telegramMessageMappedToChat context stored.storedId chatId
                 unless alreadySent do
-                  result <- telegramSendMessage context chatId Nothing text
+                  result <- telegramSendRichMessage context chatId Nothing body
                   case result of
                     Left err -> logError context.logger ("telegram nick reflect error: " <> Text.pack err)
                     Right sentMessage -> do
@@ -241,32 +242,23 @@ reflectEvent context stored =
                       logReflected context.logger stored platformKey
     _ -> pure ()
  where
-  -- A message is reflected part by part; each part's mapping row is written as
-  -- soon as that part is delivered, and the room's mapping row is what stops the
-  -- event from being reflected into the same chat twice. An interrupted message
-  -- is therefore not resumed where it stopped.
+  -- A whole message body is reflected as one rich message: the room's mapping
+  -- row is what stops the event from being reflected into the same chat twice.
   sendToRoom info roomKey =
     case readMaybe (Text.unpack roomKey.key) of
       Nothing -> pure ()
       Just chatId -> do
         alreadySent <- telegramMessageMappedToChat context stored.storedId chatId
         unless alreadySent do
-          text <- renderRelayedMessage context.timeline info {body = textBody info.body}
+          body <- relayedBody context info
           replyTo <- telegramReplyMessageId context roomKey info.replyTo
-          let sendPart action = do
-                result <- action
-                case result of
-                  Left err -> logError context.logger ("telegram reflect error: " <> Text.pack err)
-                  Right message -> do
-                    let platformKey = telegramMessageKey message
-                    context.mappingStore.insertMapping platformKey stored.storedId
-                    logReflected context.logger stored platformKey
-          sendPart (telegramSendMessage context chatId replyTo text)
-          forM_ (messageBlobs info.body) \(kind, blobId) -> do
-            blob <- getEvent context.timeline (blobEventId blobId)
-            case fmap (.storedEvent.content) blob of
-              Just (CreateBlob bytes) -> sendPart (sendMappedMedia context chatId replyTo kind blobId bytes)
-              _ -> logError context.logger "telegram media blob is missing"
+          result <- telegramSendRichMessage context chatId replyTo body
+          case result of
+            Left err -> logError context.logger ("telegram reflect error: " <> Text.pack err)
+            Right message -> do
+              let platformKey = telegramMessageKey message
+              context.mappingStore.insertMapping platformKey stored.storedId
+              logReflected context.logger stored platformKey
   deleteInChat (chatId, messageId) = do
     result <- telegramDeleteMessage context chatId messageId
     case result of
@@ -275,6 +267,20 @@ reflectEvent context stored =
         let platformKey = telegramRetractionKey stored.storedId
         context.mappingStore.insertMapping platformKey stored.storedId
         logReflected context.logger stored platformKey
+
+-- | The relayed message is attributed to the relaying account, so the sender is
+-- part of the body instead.
+relayedBody :: Timeline timeline => Context timeline -> SendMessageInfo -> IO Message
+relayedBody context info = do
+  user <- getUserInfo context.timeline info.sender (Just info.room)
+  let sender = maybe "unknown" (.name) user
+  pure (Text (Bold (plainInline sender) :| [Plain ": "]) :| toList info.body)
+
+nickBody :: Timeline timeline => Context timeline -> UserId -> Text -> IO Message
+nickBody context user nick = do
+  userInfo <- getUserInfo context.timeline user Nothing
+  let previous = maybe "unknown" (.name) userInfo
+  pure (Text (Italic (plainInline ("* " <> previous <> " is now known as " <> nick)) :| []) :| [])
 
 -- | Telegram reports no identifier for an edit, so the applied edit is recorded
 -- under a key derived from the platform message it changed.
@@ -346,52 +352,127 @@ telegramCall context method modify = do
   response <- loggedHttp context.logger (modify request0) context.manager
   pure (decodeResponse response)
 
-telegramSendMessage :: Context timeline -> Integer -> Maybe Int -> RenderedMessage -> IO (Either String TelegramMessage)
-telegramSendMessage context chatId replyTo text =
-  telegramCall context "sendMessage"
-    ( urlEncodedBody
-        ( [ ("chat_id", ByteString.Char8.pack (show chatId))
-          , ("text", Text.Encoding.encodeUtf8 (telegramHtml text))
-          , ("parse_mode", "HTML")
+-- | One media part of a rich message. A blob the bridge already uploaded is
+-- referenced by its file id; anything else travels with the request.
+data RichAttachment = RichAttachment
+  { attachmentBlob :: BlobId
+  , attachmentMethod :: Text
+  , attachmentField :: Text
+  , attachmentBytes :: ByteString.ByteString
+  , attachmentFileId :: Maybe Text
+  }
+
+telegramSendRichMessage :: Timeline timeline => Context timeline -> Integer -> Maybe Int -> Message -> IO (Either String TelegramMessage)
+telegramSendRichMessage context chatId replyTo body =
+  telegramRichCall
+    context
+    "sendRichMessage"
+    ( [("chat_id", ByteString.Char8.pack (show chatId))]
+        <> maybe [] (\messageId -> [("reply_to_message_id", ByteString.Char8.pack (show messageId))]) replyTo
+    )
+    body
+
+telegramEditRichMessage :: Timeline timeline => Context timeline -> Integer -> Int -> Message -> IO (Either String TelegramMessage)
+telegramEditRichMessage context chatId messageId body =
+  telegramRichCall
+    context
+    "editMessageText"
+    [ ("chat_id", ByteString.Char8.pack (show chatId))
+    , ("message_id", ByteString.Char8.pack (show messageId))
+    ]
+    body
+
+-- | Send a whole message body as one rich message. Media stays where the
+-- timeline put it because the blocks reference it and the upload happens in the
+-- same multipart request, so a reflected message keeps its part order.
+telegramRichCall :: Timeline timeline => Context timeline -> Text -> [(ByteString.ByteString, ByteString.ByteString)] -> Message -> IO (Either String TelegramMessage)
+telegramRichCall context methodName fields body = do
+  attachments <- traverse attachment (messageBlobs body)
+  let indexed = zip [(0 :: Int) ..] attachments
+      fileParts = [(attachName index, part) | (index, part) <- indexed, isNothing part.attachmentFileId]
+      blocks = Rich.messageBlocks (blockFor indexed) body
+      boundary = foldl chooseBoundary "multiverse-telegram-rich" (map (\(_, part) -> part.attachmentBytes) fileParts)
+      renderField name value =
+        "--" <> boundary <> "\r\nContent-Disposition: form-data; name=\"" <> name <> "\"\r\n\r\n" <> value <> "\r\n"
+      renderFile (name, part) =
+        ByteString.concat
+          [ "--"
+          , boundary
+          , "\r\nContent-Disposition: form-data; name=\""
+          , Text.Encoding.encodeUtf8 name
+          , "\"; filename=\""
+          , Text.Encoding.encodeUtf8 name
+          , "\"\r\nContent-Type: "
+          , Text.Encoding.encodeUtf8 (sniffMimeType part.attachmentBytes)
+          , "\r\n\r\n"
+          , part.attachmentBytes
+          , "\r\n"
           ]
-            <> maybe [] (\messageId -> [("reply_to_message_id", ByteString.Char8.pack (show messageId))]) replyTo
-        )
-    )
-
-telegramEditText :: Context timeline -> Integer -> Int -> RenderedMessage -> IO (Either String TelegramMessage)
-telegramEditText context chatId messageId text =
-  telegramCall context "editMessageText"
-    ( urlEncodedBody
-        [ ("chat_id", ByteString.Char8.pack (show chatId))
-        , ("message_id", ByteString.Char8.pack (show messageId))
-        , ("text", Text.Encoding.encodeUtf8 (telegramHtml text))
-        , ("parse_mode", "HTML")
-        ]
-    )
-
-sendMappedMedia :: Context timeline -> Integer -> Maybe Int -> BlobType -> BlobId -> ByteString.ByteString -> IO (Either String TelegramMessage)
-sendMappedMedia context chatId replyTo kind blobId bytes = do
-  let method@(methodName, _) = telegramMediaMethod kind bytes
-      upload = telegramSendMedia context chatId replyTo method bytes
-  existing <- telegramMappedFileId context methodName blobId
-  result <- case existing of
-    Nothing -> upload
-    Just fileId -> do
-      sent <- telegramSendMediaId context chatId replyTo method fileId
-      case sent of
-        Right message -> pure (Right message)
-        Left err -> do
-          logWarn context.logger ("telegram file ID rejected; uploading again: " <> Text.pack err)
-          upload
+      formBody =
+        ByteString.concat
+          ( map (uncurry renderField) fields
+              <> [renderField "rich_message" (LByteString.toStrict (encode (object ["blocks" .= blocks])))]
+              <> map renderFile fileParts
+              <> ["--", boundary, "--\r\n"]
+          )
+  result <- telegramCall context methodName \request ->
+    request
+      { method = "POST"
+      , requestBody = RequestBodyBS formBody
+      , requestHeaders = [("Content-Type", "multipart/form-data; boundary=" <> boundary)]
+      }
   case result of
-    Right message -> case message.media of
-      Just (returnedKind, media) | returnedKind == kind -> do
-        let blobEvent = blobEventId blobId
-        context.mappingStore.insertMapping (telegramSourceKey media) blobEvent
-        context.mappingStore.insertMapping (telegramBlobKey methodName media.fileId) blobEvent
-      _ -> pure ()
-    Left _ -> pure ()
-  pure result
+    Left err -> pure (Left err)
+    Right sent -> do
+      recordUploadedFiles context attachments sent
+      pure (Right sent)
+ where
+  attachment :: (BlobType, BlobId) -> IO RichAttachment
+  attachment (kind, blobId) = do
+    stored <- getEvent context.timeline (blobEventId blobId)
+    bytes <- case fmap (.storedEvent.content) stored of
+      Just (CreateBlob content) -> pure content
+      _ -> fail "telegram rich message blob is missing"
+    let (mediaMethod, mediaField) = telegramMediaMethod kind bytes
+    fileId <- telegramMappedFileId context mediaMethod blobId
+    pure
+      RichAttachment
+        { attachmentBlob = blobId
+        , attachmentMethod = mediaMethod
+        , attachmentField = mediaField
+        , attachmentBytes = bytes
+        , attachmentFileId = fileId
+        }
+  -- A block only names its media, so the lookup keeps the upload reference or
+  -- file id next to the blob the timeline named.
+  blockFor indexed _ blob =
+    case [mediaBlockValue index part | (index, part) <- indexed, blobEventId part.attachmentBlob == blobEventId blob] of
+      blockValue : _ -> blockValue
+      [] -> object ["type" .= ("document" :: Text), "media" .= ("" :: Text)]
+   where
+    mediaBlockValue index part =
+      object
+        [ "type" .= part.attachmentField
+        , "media" .= maybe (attachName index) id part.attachmentFileId
+        ]
+
+attachName :: Int -> Text
+attachName index = "file_" <> Text.pack (show index)
+
+-- | The bot API answers with the media it ingested, in block order, so the file
+-- ids of freshly uploaded blobs can be remembered for later messages.
+recordUploadedFiles :: Context timeline -> [RichAttachment] -> TelegramMessage -> IO ()
+recordUploadedFiles context attachments sent =
+  case sent.richMessage >>= either (const Nothing) Just . Rich.parseRichMessage of
+    Nothing -> pure ()
+    Just rich -> do
+      let refs = Rich.richMessageMedia rich
+      when (length refs == length attachments) do
+        forM_ (zip attachments refs) \(part, ref) ->
+          when (isNothing part.attachmentFileId) do
+            let blobEvent = blobEventId part.attachmentBlob
+            forM_ ref.fileUniqueId \uniqueId -> context.mappingStore.insertMapping (telegramSourceKey uniqueId) blobEvent
+            forM_ ref.fileId \fileId -> context.mappingStore.insertMapping (telegramBlobKey part.attachmentMethod fileId) blobEvent
 
 -- | Media this bridge may send by file id instead of uploading it again. The key
 -- carries the upload method because a file id is only valid for the method that
@@ -399,14 +480,17 @@ sendMappedMedia context chatId replyTo kind blobId bytes = do
 telegramBlobKey :: Text -> Text -> PlatformKey
 telegramBlobKey methodName fileId = PlatformKey "telegram" "blob" (methodName <> ":" <> fileId)
 
+telegramSourceKey :: Text -> PlatformKey
+telegramSourceKey uniqueId = PlatformKey "telegram" "blob" uniqueId
+
 telegramMappedFileId :: Context timeline -> Text -> BlobId -> IO (Maybe Text)
 telegramMappedFileId context methodName blobId = do
   keys <- lookupMappedKeys context.mappingStore "telegram" "blob" (blobEventId blobId)
   pure (listToMaybe [fileId | Just fileId <- map (Text.stripPrefix (methodName <> ":")) keys])
 
--- | Animated images have to go through @sendAnimation@; @sendPhoto@ would
--- flatten them to a still frame.
-telegramMediaMethod :: BlobType -> ByteString.ByteString -> (Text, ByteString.ByteString)
+-- | Animated images have to be sent as animations; a photo would flatten them
+-- to a still frame. The method name doubles as the mapping key for file ids.
+telegramMediaMethod :: BlobType -> ByteString.ByteString -> (Text, Text)
 telegramMediaMethod kind bytes = case kind of
   ImageBlob
     | isAnimatedImage bytes -> ("sendAnimation", "animation")
@@ -415,61 +499,10 @@ telegramMediaMethod kind bytes = case kind of
   AudioBlob -> ("sendAudio", "audio")
   FileBlob -> ("sendDocument", "document")
 
-telegramSendMediaId :: Context timeline -> Integer -> Maybe Int -> (Text, ByteString.ByteString) -> Text -> IO (Either String TelegramMessage)
-telegramSendMediaId context chatId replyTo (methodName, fieldName) fileId =
-  telegramCall context methodName
-    ( urlEncodedBody
-        ( [("chat_id", ByteString.Char8.pack (show chatId)), (fieldName, Text.Encoding.encodeUtf8 fileId)]
-            <> maybe [] (\messageId -> [("reply_to_message_id", ByteString.Char8.pack (show messageId))]) replyTo
-        )
-    )
-
-telegramSendMedia :: Context timeline -> Integer -> Maybe Int -> (Text, ByteString.ByteString) -> ByteString.ByteString -> IO (Either String TelegramMessage)
-telegramSendMedia context chatId replyTo (methodName, fieldName) bytes = do
-  let boundary = chooseBoundary "multiverse-telegram" bytes
-      field name value = "--" <> boundary <> "\r\nContent-Disposition: form-data; name=\"" <> name <> "\"\r\n\r\n" <> value <> "\r\n"
-      body = ByteString.concat
-        ( [field "chat_id" (ByteString.Char8.pack (show chatId))]
-          <> maybe [] (\messageId -> [field "reply_to_message_id" (ByteString.Char8.pack (show messageId))]) replyTo
-          <> [ "--" <> boundary <> "\r\nContent-Disposition: form-data; name=\"" <> fieldName <> "\"; filename=\"upload\"\r\nContent-Type: application/octet-stream\r\n\r\n"
-             , bytes, "\r\n--", boundary, "--\r\n" ] )
-  telegramCall context methodName \request ->
-    request
-      { method = "POST"
-      , requestBody = RequestBodyBS body
-      , requestHeaders = [("Content-Type", "multipart/form-data; boundary=" <> boundary)]
-      }
-
 chooseBoundary :: ByteString.ByteString -> ByteString.ByteString -> ByteString.ByteString
 chooseBoundary boundary bytes
   | boundary `ByteString.isInfixOf` bytes = chooseBoundary (boundary <> "x") bytes
   | otherwise = boundary
-
-telegramHtml :: RenderedMessage -> Text
-telegramHtml message =
-  telegramSupportedHtml message.htmlText
-
-telegramSupportedHtml :: Text -> Text
-telegramSupportedHtml =
-  Text.replace "<strong>" "<b>"
-    . Text.replace "</strong>" "</b>"
-    . Text.replace "<ul>" ""
-    . Text.replace "</ul>" ""
-    . Text.replace "<li>" "- "
-    . Text.replace "</li>" "\n"
-    . replaceHeading 1
-    . replaceHeading 2
-    . replaceHeading 3
-    . replaceHeading 4
-    . replaceHeading 5
-    . replaceHeading 6
-
-replaceHeading :: Int -> Text -> Text
-replaceHeading level =
-  Text.replace ("<h" <> label <> ">") "<b>"
-    . Text.replace ("</h" <> label <> ">") "</b>"
- where
-  label = Text.pack (show level)
 
 telegramDeleteMessage :: Context timeline -> Integer -> Int -> IO (Either String ())
 telegramDeleteMessage context chatId messageId =
@@ -539,12 +572,6 @@ telegramChatMessageKey :: Integer -> Int -> PlatformKey
 telegramChatMessageKey chatId messageId =
   PlatformKey "telegram" "message" (Text.pack (show chatId) <> "/" <> Text.pack (show messageId))
 
--- | @file_unique_id@ is stable across bots while @file_id@ is per-bot, so the
--- stable one identifies the observed file and the fallback only stands in when
--- the server omits it.
-telegramSourceKey :: TelegramMedia -> PlatformKey
-telegramSourceKey media = PlatformKey "telegram" "blob" (fromMaybe media.fileId media.fileUniqueId)
-
 telegramRetractionKey :: EventId -> PlatformKey
 telegramRetractionKey eventId_ = PlatformKey "telegram" "retraction" (renderEventId eventId_)
 
@@ -556,29 +583,49 @@ telegramChatName :: TelegramChat -> Text
 telegramChatName chat = maybe (Text.pack (show chat.chatId)) id chat.title
 
 telegramMessageBody :: Timeline timeline => Context timeline -> TelegramMessage -> IO (Maybe Message)
-telegramMessageBody context message = do
-  media <- traverse importMedia message.media
-  let textParts = maybe [] (NonEmpty.toList . (`telegramMessageFromEntities` message.entities)) message.text
-  pure (nonEmpty (textParts <> maybe [] (\(kind, blob) -> [Blob kind blob]) media))
+telegramMessageBody context message =
+  case message.richMessage of
+    Just value ->
+      case Rich.parseRichMessage value of
+        Right rich -> Rich.renderRichMessage (importMediaSource context) rich
+        Left err -> do
+          logDebug context.logger ("telegram rich message could not be parsed: " <> err)
+          pure Nothing
+    Nothing -> do
+      media <- traverse importMessageMedia message.media
+      let textParts = maybe [] (NonEmpty.toList . (`telegramMessageFromEntities` message.entities)) message.text
+      pure (nonEmpty (textParts <> maybe [] (\(kind, blob) -> [Blob kind blob]) media))
  where
-  importMedia (kind, media) = do
-    let sourceKey = telegramSourceKey media
-    existing <- context.mappingStore.lookupTimelineId sourceKey
-    content <- case existing of
-      Just blobEvent -> do
-        stored <- getEvent context.timeline blobEvent
-        case fmap (.storedEvent.content) stored of
-          Just (CreateBlob bytes) -> pure bytes
-          _ -> telegramDownloadFile context media.fileId
-      Nothing -> telegramDownloadFile context media.fileId
-    blob <- case existing of
-      Just eventId -> pure (BlobId eventId)
-      Nothing -> do
-        submitted <- submitBlob context.logger context.timeline context.mappingStore sourceKey content
-        either (fail . show) pure submitted
-    let (methodName, _) = telegramMediaMethod kind content
-    context.mappingStore.insertMapping (telegramBlobKey methodName media.fileId) (blobEventId blob)
+  importMessageMedia (kind, telegramMedia) = do
+    blob <- importMediaSource context kind (telegramMediaRef telegramMedia)
     pure (kind, blob)
+
+-- | A blob is content addressed, so a platform resource the bridge already knows
+-- is reused and only an unknown one is downloaded and submitted.
+importMediaSource :: Timeline timeline => Context timeline -> BlobType -> Rich.MediaRef -> IO BlobId
+importMediaSource context kind ref = do
+  fileId <- maybe (fail "telegram media lacks file_id") pure ref.fileId
+  let sourceKey = telegramSourceKey (fromMaybe fileId ref.fileUniqueId)
+  existing <- context.mappingStore.lookupTimelineId sourceKey
+  content <- case existing of
+    Just blobEvent -> do
+      stored <- getEvent context.timeline blobEvent
+      case fmap (.storedEvent.content) stored of
+        Just (CreateBlob bytes) -> pure bytes
+        _ -> telegramDownloadFile context fileId
+    Nothing -> telegramDownloadFile context fileId
+  blob <- case existing of
+    Just eventId -> pure (BlobId eventId)
+    Nothing ->
+      either (fail . show) pure
+        =<< submitBlob context.logger context.timeline context.mappingStore sourceKey content
+  let (methodName, _) = telegramMediaMethod kind content
+  context.mappingStore.insertMapping (telegramBlobKey methodName fileId) (blobEventId blob)
+  pure blob
+
+telegramMediaRef :: TelegramMedia -> Rich.MediaRef
+telegramMediaRef media =
+  Rich.MediaRef {fileId = Just media.fileId, fileUniqueId = media.fileUniqueId}
 
 telegramDownloadFile :: Context timeline -> Text -> IO ByteString.ByteString
 telegramDownloadFile context fileId = do
@@ -676,6 +723,7 @@ data TelegramMessage = TelegramMessage
   , entities :: [TelegramEntity]
   , replyToMessage :: Maybe TelegramMessageRef
   , media :: Maybe (BlobType, TelegramMedia)
+  , richMessage :: Maybe Value
   , newChatMembers :: [TelegramUser]
   , leftChatMember :: Maybe TelegramUser
   }
@@ -704,6 +752,7 @@ instance FromJSON TelegramMessage where
       <*> ((maybe [] id) <$> ((<|>) <$> obj .:? "entities" <*> obj .:? "caption_entities"))
       <*> obj .:? "reply_to_message"
       <*> pure ((ImageBlob,) <$> (photo <|> sticker <|> imageAnimation) <|> (VideoBlob,) <$> (video <|> videoNote <|> videoAnimation) <|> (AudioBlob,) <$> (audio <|> voice) <|> (FileBlob,) <$> document)
+      <*> obj .:? "rich_message"
       <*> obj .:? "new_chat_members" .!= []
       <*> obj .:? "left_chat_member"
 
