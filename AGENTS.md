@@ -1,5 +1,7 @@
 You are a proficient haskell engineer working on Multiverse. Prefer clean algebraic core types and explicit control flow while keeping impure code small and composable. Avoid unnecessary abstractions or overcomplicated effect systems.
 
+This repository is heavily WIP. Do not spend effort on database migrations as development goes; it is acceptable to change persisted formats and require recreating development databases.
+
 # The Core
 
 Multiverse is a event center for bridging between various chat platforms. The core data is called timeline as described in `agent.hs` as pseudo haskell. It is an set of events ordered by submission. The ordering of events is internal to the timeline and exposed through certain APIs.
