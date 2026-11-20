@@ -15,6 +15,13 @@ module Multiverse.Bridge
   , ensureRoomMembership
   , ensureUserMapped
   , lookupSendMessage
+  , lookupBlobBytes
+  , importAvatar
+  , modifyUserKey
+  , modifyRoomKey
+  , roomOriginPlatform
+  , syncUserProfile
+  , syncRoomProfile
   , submitMapped
   , submitMessageMapped
   , submitBlob
@@ -33,9 +40,10 @@ module Multiverse.Bridge
   )
 where
 
+import Control.Applicative ((<|>))
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Exception (SomeException, try)
-import Control.Monad (forever, unless, void)
+import Control.Monad (forever, unless, void, when)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as ByteString
 import Data.List.NonEmpty (nonEmpty, toList)
@@ -339,21 +347,155 @@ lookupSendMessage timeline message = do
     Just (SendMessage info) -> Just info
     _ -> Nothing
 
--- | The first sighting of a platform user creates its timeline user.
-ensureUserMapped :: Timeline timeline => Logger -> timeline -> MappingStore -> PlatformKey -> IO Text -> IO (Either SubmitError UserId)
-ensureUserMapped logger timeline mappingStore platformKey fetchName = do
+-- | The first sighting of a platform user creates its timeline user. Profile
+-- updates after that are submitted through 'syncUserProfile'.
+ensureUserMapped :: Timeline timeline => Logger -> timeline -> MappingStore -> PlatformKey -> IO UserInfo -> IO (Either SubmitError UserId)
+ensureUserMapped logger timeline mappingStore platformKey fetchInfo = do
   existing <- mappingStore.lookupTimelineId platformKey
   case existing of
     Just eventId -> pure (Right (UserId eventId))
     Nothing -> do
-      name <- fetchName
-      mapped <-
-        submitMapped
-          logger
-          timeline
-          mappingStore
-          Event {platformKey, content = CreateUser UserInfo {name, avatar = Nothing}}
-      pure (UserId <$> mapped)
+      info <- fetchInfo
+      submitted <- submit timeline Event {platformKey, content = CreateUser info}
+      case submitted of
+        Right eventId -> do
+          mappingStore.insertMapping platformKey eventId
+          logObserved logger platformKey (CreateUser info) eventId
+          pure (Right (UserId eventId))
+        Left (ConflictingPlatformKey _ eventId) -> do
+          let userId = UserId eventId
+          mappingStore.insertMapping platformKey eventId
+          syncUserProfile logger timeline mappingStore platformKey userId (pure (Just info))
+          pure (Right userId)
+        Left err -> pure (Left err)
+
+-- | A modification is keyed by its predecessor and the resulting profile. The
+-- predecessor alone is not enough: independent changes (for example a name and
+-- an avatar) can share the same predecessor.
+modifyUserKey :: PlatformKey -> UserId -> EventId -> UserInfo -> PlatformKey
+modifyUserKey base user previous info =
+  base
+    { entityType = "user-modify"
+    , key =
+        renderEventId (userEventId user)
+          <> "/"
+          <> renderEventId previous
+          <> "/"
+          <> contentDigest (Text.pack (show info))
+    }
+
+modifyRoomKey :: PlatformKey -> RoomId -> EventId -> RoomInfo -> PlatformKey
+modifyRoomKey base room previous info =
+  base
+    { entityType = "room-modify"
+    , key =
+        renderEventId (roomEventId room)
+          <> "/"
+          <> renderEventId previous
+          <> "/"
+          <> contentDigest (Text.pack (show info))
+    }
+
+-- | The platform whose creation event owns a room's metadata. Shared timeline
+-- rooms must not have several bridges overwriting each other's room profile.
+roomOriginPlatform :: Timeline timeline => timeline -> RoomId -> IO (Maybe Text)
+roomOriginPlatform timeline room = do
+  stored <- getEvent timeline (roomEventId room)
+  pure (stored >>= \event -> Just event.storedEvent.platformKey.platform)
+
+-- | Apply a fetched profile only when the fetch succeeded. A failed avatar
+-- download must not clear an existing avatar.
+syncUserProfile ::
+  Timeline timeline =>
+  Logger ->
+  timeline ->
+  MappingStore ->
+  PlatformKey ->
+  UserId ->
+  IO (Maybe UserInfo) ->
+  IO ()
+syncUserProfile logger timeline mappingStore platformKey user fetchInfo = do
+  fetched <- fetchInfo
+  case fetched of
+    Nothing -> pure ()
+    Just info -> do
+      current <- getUserInfo timeline user Nothing
+      unless (current == Just info) do
+        previous <- getUserProfileEvent timeline user
+        case previous of
+          Nothing -> logError logger ("cannot modify missing user " <> renderEventId (userEventId user))
+          Just previousEventId -> do
+            let content = ModifyUser user info previousEventId
+                key = modifyUserKey platformKey user previousEventId info
+            result <- submitMapped logger timeline mappingStore Event {platformKey = key, content}
+            case result of
+              Left err -> logError logger ("user modification submit error: " <> Text.pack (show err))
+              Right _ -> pure ()
+
+syncRoomProfile ::
+  Timeline timeline =>
+  Logger ->
+  timeline ->
+  MappingStore ->
+  PlatformKey ->
+  RoomId ->
+  IO (Maybe RoomInfo) ->
+  IO ()
+syncRoomProfile logger timeline mappingStore platformKey room fetchInfo = do
+  fetched <- fetchInfo
+  case fetched of
+    Nothing -> pure ()
+    Just info -> do
+      current <- getRoomInfo timeline room
+      unless (current == Just info) do
+        previous <- getRoomProfileEvent timeline room
+        case previous of
+          Nothing -> logError logger ("cannot modify missing room " <> renderEventId (roomEventId room))
+          Just previousEventId -> do
+            let content = ModifyRoom room info previousEventId
+                key = modifyRoomKey platformKey room previousEventId info
+            result <- submitMapped logger timeline mappingStore Event {platformKey = key, content}
+            case result of
+              Left err -> logError logger ("room modification submit error: " <> Text.pack (show err))
+              Right _ -> pure ()
+
+lookupBlobBytes :: Timeline timeline => timeline -> BlobId -> IO (Maybe ByteString)
+lookupBlobBytes timeline blob = do
+  stored <- getEvent timeline (blobEventId blob)
+  pure case fmap (.storedEvent.content) stored of
+    Just (CreateBlob bytes) -> Just bytes
+    _ -> Nothing
+
+-- | Avatars are best-effort image blobs. Any failure is logged and becomes
+-- 'Nothing' so the caller can still create the user or room.
+importAvatar ::
+  Timeline timeline =>
+  Logger ->
+  timeline ->
+  MappingStore ->
+  PlatformKey ->
+  ByteString ->
+  IO (Maybe BlobId)
+importAvatar logger timeline mappingStore sourceKey bytes
+  | ByteString.null bytes = do
+      logDebug logger ("ignoring empty avatar " <> renderPlatformKey sourceKey)
+      pure Nothing
+  | ByteString.length bytes > maxAvatarBytes = do
+      logDebug logger ("ignoring oversized avatar " <> renderPlatformKey sourceKey)
+      pure Nothing
+  | not ("image/" `Text.isPrefixOf` sniffMimeType bytes) = do
+      logDebug logger ("ignoring non-image avatar " <> renderPlatformKey sourceKey)
+      pure Nothing
+  | otherwise = do
+      result <- submitBlob logger timeline mappingStore sourceKey bytes
+      case result of
+        Right blob -> pure (Just blob)
+        Left err -> do
+          logWarn logger ("avatar submit error: " <> Text.pack (show err))
+          pure Nothing
+
+maxAvatarBytes :: Int
+maxAvatarBytes = 8 * 1024 * 1024
 
 -- | Keep reflecting the timeline from a persisted cursor, one batch at a time.
 reflectForever :: Timeline timeline => timeline -> MappingStore -> Text -> (StoredEvent -> IO ()) -> IO ()
@@ -416,8 +558,8 @@ eventKind = \case
   SendMessage _ -> "message"
   RetractMessage _ -> "retraction"
   EditMessage _ _ -> "edit"
-  ModifyUser _ _ -> "user modification"
-  ModifyRoom _ _ -> "room modification"
+  ModifyUser _ _ _ -> "user modification"
+  ModifyRoom _ _ _ -> "room modification"
   ChangeRoomNick _ _ _ -> "nick change"
 
 -- | Blobs are timeline-owned: their event platform key is derived from the
@@ -475,14 +617,16 @@ ensureInitialRoom ::
 ensureInitialRoom logger timeline mappingStore fetchRoomInfo mapping = do
   existing <- mappingStore.lookupTimelineId mapping.platformKey
   case existing of
-    Just _ -> do
+    Just mappedEventId -> do
       logDebug logger ("initial room already mapped " <> renderPlatformKey mapping.platformKey)
+      refreshExisting mappedEventId
       pure mapping
     Nothing ->
       case mapping.timelineRoom of
         Just room -> do
           mappingStore.insertMapping mapping.platformKey (roomEventId room)
           logInfo logger ("mapped initial room " <> renderPlatformKey mapping.platformKey)
+          refreshExisting (roomEventId room)
           pure mapping
         Nothing -> do
           roomInfo <- fetchRoomInfo mapping
@@ -499,6 +643,29 @@ ensureInitialRoom logger timeline mappingStore fetchRoomInfo mapping = do
   record mappedEventId = do
     mappingStore.insertMapping mapping.platformKey mappedEventId
     pure mapping {timelineRoom = Just (RoomId mappedEventId)}
+
+  -- Only the platform that created the timeline room owns its metadata. A
+  -- failed fetch must not clear an avatar already stored in the timeline.
+  refreshExisting mappedEventId = do
+    let roomId = RoomId mappedEventId
+    origin <- roomOriginPlatform timeline roomId
+    when (origin == Just mapping.platformKey.platform) do
+      fetched <- try (fetchRoomInfo mapping) :: IO (Either SomeException RoomInfo)
+      case fetched of
+        Left err ->
+          logWarn logger ("could not refresh initial room profile: " <> Text.pack (show err))
+        Right (RoomInfo platformName platformDescription platformAvatar) -> do
+          current <- getRoomInfo timeline roomId
+          case current of
+            Nothing -> pure ()
+            Just (RoomInfo _ _ currentAvatar) -> do
+              let merged =
+                    RoomInfo
+                      { name = platformName
+                      , description = platformDescription
+                      , avatar = platformAvatar <|> currentAvatar
+                      }
+              syncRoomProfile logger timeline mappingStore mapping.platformKey roomId (pure (Just merged))
 
 renderPlatformKey :: PlatformKey -> Text
 renderPlatformKey platformKey =

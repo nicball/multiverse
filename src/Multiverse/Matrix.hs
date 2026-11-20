@@ -139,12 +139,14 @@ observeEvent observer platformRoom room event
                       logDebug observer.bridge.logger ("matrix ignoring redaction for missing timeline event " <> renderEventId targetEventId)
                 Left err -> logError observer.bridge.logger ("matrix retraction submit error: " <> Text.pack (show err))
         MatrixMember member -> observeMatrixMember observer room event member
+        MatrixRoomAvatar mxc -> observeMatrixRoomAvatar observer platformRoom room mxc
         MatrixIgnored reason
           | reason == "m.room.encrypted" ->
               logWarn observer.bridge.logger ("matrix cannot decrypt event " <> event.eventId <> ": encrypted rooms are not supported")
           | otherwise -> logDebug observer.bridge.logger ("matrix ignoring " <> reason <> " event " <> event.eventId)
  where
   isMember (MatrixMember _) = True
+  isMember (MatrixRoomAvatar _) = True
   isMember _ = False
 
 observeMatrixMessage :: Timeline timeline => Observer timeline -> MatrixEvent -> Text -> RoomId -> MatrixMessageContent -> IO ()
@@ -202,7 +204,7 @@ matrixObservedBody observer = mapMessageInlines \case
           context.timeline
           context.mappingStore
           (matrixUserKey matrixUserId)
-          (pure name)
+          (pure UserInfo {name, avatar = Nothing})
       case mapped of
         Right user -> pure (Mention label (userEventId user))
         Left err -> do
@@ -298,6 +300,7 @@ observeMatrixMember observer room event member
   | otherwise = case member.membership of
       "join" -> withUser \user -> do
         submitMembership "join" user
+        syncUserProfile context.logger context.timeline context.mappingStore (matrixUserKey member.memberUserId) user (matrixUserProfile context member.memberUserId)
         case (member.memberPreviousDisplayName, member.memberDisplayName) of
           (Just previous, Just nick)
             | nick /= previous -> submitNick user nick
@@ -326,6 +329,22 @@ observeMatrixMember observer room event member
 
   submitNick user nick = submitEvent (eventKey "nick") (ChangeRoomNick user room nick)
 
+observeMatrixRoomAvatar :: Timeline timeline => Observer timeline -> Text -> RoomId -> Text -> IO ()
+observeMatrixRoomAvatar observer platformRoom room mxc = do
+  let context = observer.bridge
+  origin <- roomOriginPlatform context.timeline room
+  when (origin == Just "matrix") do
+    current <- getRoomInfo context.timeline room
+    case current of
+      Nothing -> pure ()
+      Just (RoomInfo currentName currentDescription _) -> do
+        avatarResult <- matrixAvatarBlob context mxc
+        case avatarResult of
+          Nothing -> pure ()
+          Just avatar -> do
+            let updated = RoomInfo currentName currentDescription avatar
+            syncRoomProfile context.logger context.timeline context.mappingStore (matrixRoomKey platformRoom) room (pure (Just updated))
+
 matrixReplyTo :: Context timeline -> Text -> Maybe Text -> IO (Maybe MessageId)
 matrixReplyTo context platformRoom replyToEvent =
   case replyToEvent of
@@ -343,7 +362,7 @@ ensureUser observer matrixUserId = do
       context.timeline
       context.mappingStore
       (matrixUserKey matrixUserId)
-      (maybe matrixUserId id <$> matrixUserDisplayName context matrixUserId)
+      (matrixUserInfoForCreate context matrixUserId)
   either (\err -> fail ("could not create matrix user: " <> show err)) pure mapped
 
 reflectEvent :: Timeline timeline => Context timeline -> StoredEvent -> IO ()
@@ -516,6 +535,32 @@ matrixUploadedMedia :: Context timeline -> BlobId -> IO (Maybe Text)
 matrixUploadedMedia context blobId =
   listToMaybe <$> lookupMappedKeys context.mappingStore "matrix" "blob" (blobEventId blobId)
 
+-- | Upload a timeline avatar once and reuse the resulting mxc URI for every
+-- message from that user.
+matrixAvatarUrl :: Timeline timeline => Context timeline -> Maybe BlobId -> IO (Maybe Text)
+matrixAvatarUrl _ Nothing = pure Nothing
+matrixAvatarUrl context (Just blobId) = do
+  cached <- matrixUploadedMedia context blobId
+  case cached of
+    Just mediaUrl -> pure (Just mediaUrl)
+    Nothing -> do
+      bytes <- lookupBlobBytes context.timeline blobId
+      case bytes of
+        Nothing -> do
+          logWarn context.logger ("matrix avatar blob is missing " <> renderEventId (blobEventId blobId))
+          pure Nothing
+        Just content -> do
+          let name = "avatar-" <> Text.take 12 (renderEventId (blobEventId blobId)) <> sniffExtension content
+              mimeType = sniffMimeType content
+          uploaded <- matrixUploadMedia context name mimeType content
+          case uploaded of
+            Left err -> do
+              logWarn context.logger ("matrix avatar upload error: " <> Text.pack err)
+              pure Nothing
+            Right mediaUrl -> do
+              context.mappingStore.insertMapping (matrixBlobKey mediaUrl) (blobEventId blobId)
+              pure (Just mediaUrl)
+
 matrixReplyEventId :: Context timeline -> Text -> Maybe MessageId -> IO (Maybe Text)
 matrixReplyEventId _ _ Nothing = pure Nothing
 matrixReplyEventId context roomId (Just message) = do
@@ -540,21 +585,87 @@ matrixWhoami :: Context timeline -> IO (Either String MatrixWhoami)
 matrixWhoami context =
   matrixCall context (context.config.homeserver <> "/_matrix/client/v3/account/whoami") id
 
-matrixUserDisplayName :: Context timeline -> Text -> IO (Maybe Text)
-matrixUserDisplayName context matrixUserId = do
-  result <- matrixGetDisplayName context matrixUserId
-  case result of
-    Right value -> pure value.displayName
-    Left err -> do
-      logDebug context.logger ("matrix display name lookup failed for " <> matrixUserId <> ": " <> Text.pack err)
-      pure Nothing
-
 matrixGetDisplayName :: Context timeline -> Text -> IO (Either String MatrixDisplayName)
 matrixGetDisplayName context matrixUserId =
   matrixCall
     context
     (context.config.homeserver <> "/_matrix/client/v3/profile/" <> escapePathSegment matrixUserId <> "/displayname")
     id
+
+data MatrixAvatar = MatrixAvatar
+  { avatarUrl :: Maybe Text
+  }
+
+instance FromJSON MatrixAvatar where
+  parseJSON = withObject "MatrixAvatar" \obj ->
+    MatrixAvatar <$> obj .:? "avatar_url"
+
+matrixGetAvatarUrl :: Context timeline -> Text -> IO (Either String MatrixAvatar)
+matrixGetAvatarUrl context matrixUserId =
+  matrixCall
+    context
+    (context.config.homeserver <> "/_matrix/client/v3/profile/" <> escapePathSegment matrixUserId <> "/avatar_url")
+    id
+
+matrixUserInfoForCreate :: Timeline timeline => Context timeline -> Text -> IO UserInfo
+matrixUserInfoForCreate context matrixUserId = do
+  displayResult <- matrixGetDisplayName context matrixUserId
+  let name = case displayResult of
+        Right display -> fromMaybe matrixUserId display.displayName
+        Left _ -> matrixUserId
+  avatar <- matrixUserAvatar context matrixUserId
+  pure UserInfo {name, avatar}
+
+matrixUserAvatar :: Timeline timeline => Context timeline -> Text -> IO (Maybe BlobId)
+matrixUserAvatar context matrixUserId = do
+  avatarResult <- matrixGetAvatarUrl context matrixUserId
+  case avatarResult of
+    Left _ -> pure Nothing
+    Right avatarInfo -> case avatarInfo.avatarUrl of
+      Nothing -> pure Nothing
+      Just mxc -> do
+        result <- matrixAvatarBlob context mxc
+        pure (result >>= id)
+
+-- | A profile fetch returns 'Nothing' on lookup failure, so synchronization
+-- never clears an avatar just because the homeserver was unreachable.
+matrixUserProfile :: Timeline timeline => Context timeline -> Text -> IO (Maybe UserInfo)
+matrixUserProfile context matrixUserId = do
+  displayResult <- matrixGetDisplayName context matrixUserId
+  avatarResult <- matrixGetAvatarUrl context matrixUserId
+  case (displayResult, avatarResult) of
+    (Right display, Right avatarInfo) -> do
+      avatar <- case avatarInfo.avatarUrl of
+        Nothing -> pure (Just Nothing)
+        Just mxc -> matrixAvatarBlob context mxc
+      pure do
+        blob <- avatar
+        pure
+          UserInfo
+            { name = fromMaybe matrixUserId display.displayName
+            , avatar = blob
+            }
+    (Left err, _) -> do
+      logDebug context.logger ("matrix display name lookup failed for " <> matrixUserId <> ": " <> Text.pack err)
+      pure Nothing
+    (_, Left err) -> do
+      logDebug context.logger ("matrix avatar lookup failed for " <> matrixUserId <> ": " <> Text.pack err)
+      pure Nothing
+
+-- | The outer 'Maybe' is fetch success; the inner one is whether the avatar
+-- exists. That distinction lets a failed download preserve the current avatar.
+matrixAvatarBlob :: Timeline timeline => Context timeline -> Text -> IO (Maybe (Maybe BlobId))
+matrixAvatarBlob context mxc = do
+  existing <- context.mappingStore.lookupTimelineId (matrixBlobKey mxc)
+  case existing of
+    Just eventId -> pure (Just (Just (BlobId eventId)))
+    Nothing -> do
+      downloaded <- matrixDownloadMedia context mxc
+      case downloaded of
+        Nothing -> pure Nothing
+        Just bytes -> do
+          imported <- importAvatar context.logger context.timeline context.mappingStore (matrixBlobKey mxc) bytes
+          pure (Just imported)
 
 -- | Mentions become platform links when the target exists in the room the
 -- message is being reflected into; otherwise the mention keeps its label text.
@@ -596,12 +707,13 @@ matrixMentionUrl context platformRoom target = do
 matrixRelayBody :: Timeline timeline => Context timeline -> SendMessageInfo -> RenderedMessage -> IO (Value, RenderedMessage)
 matrixRelayBody context info body = do
   user <- getUserInfo context.timeline info.sender (Just info.room)
+  avatarUrl <- matrixAvatarUrl context (user >>= (.avatar))
   let displayName = matrixProfileDisplayName (maybe "unknown" (.name) user)
       profile =
         object
           [ "id" .= renderEventId (userEventId info.sender)
           , "displayname" .= displayName
-          , "avatar_url" .= ("" :: Text)
+          , "avatar_url" .= fromMaybe "" avatarUrl
           ]
       fallback =
         RenderedMessage
@@ -820,15 +932,21 @@ instance FromJSON MatrixUploadResponse where
   parseJSON = withObject "MatrixUploadResponse" \obj ->
     MatrixUploadResponse <$> obj .: "content_uri"
 
-fetchInitialRoomInfo :: Context timeline -> InitialRoomMapping -> IO RoomInfo
+fetchInitialRoomInfo :: Timeline timeline => Context timeline -> InitialRoomMapping -> IO RoomInfo
 fetchInitialRoomInfo context mapping = do
   name <- matrixStateField context mapping.platformKey.key "m.room.name" "name"
   topic <- matrixStateField context mapping.platformKey.key "m.room.topic" "topic"
+  avatarUrl <- matrixStateField context mapping.platformKey.key "m.room.avatar" "url"
+  avatar <- case avatarUrl of
+    Nothing -> pure Nothing
+    Just mxc -> do
+      result <- matrixAvatarBlob context mxc
+      pure (result >>= id)
   pure
     RoomInfo
       { name = maybe mapping.platformKey.key id name
       , description = fromMaybe "" topic
-      , avatar = Nothing
+      , avatar
       }
 
 matrixStateField :: Context timeline -> Text -> Text -> Text -> IO (Maybe Text)
@@ -931,6 +1049,7 @@ data MatrixEventContent
   | MatrixMedia MatrixMediaContent
   | MatrixRedaction Text
   | MatrixMember MatrixMembership
+  | MatrixRoomAvatar Text
   | MatrixIgnored Text
 
 data MatrixMessageContent = MatrixMessageContent
@@ -951,6 +1070,8 @@ data MatrixMembership = MatrixMembership
   , memberUserId :: Text
   , memberDisplayName :: Maybe Text
   , memberPreviousDisplayName :: Maybe Text
+  , memberAvatarUrl :: Maybe Text
+  , memberPreviousAvatarUrl :: Maybe Text
   }
 
 usableEvent :: Value -> Maybe MatrixEvent
@@ -996,6 +1117,7 @@ usableEvent value = do
               >>= Aeson.KeyMap.lookup "prev_content"
               >>= asObject
           previousDisplayName = previousContent >>= Aeson.KeyMap.lookup "displayname" >>= asText
+          previousAvatarUrl = previousContent >>= Aeson.KeyMap.lookup "avatar_url" >>= asText
       event
         ( MatrixMember
             MatrixMembership
@@ -1003,8 +1125,13 @@ usableEvent value = do
               , memberUserId
               , memberDisplayName = Aeson.KeyMap.lookup "displayname" content >>= asText
               , memberPreviousDisplayName = previousDisplayName
+              , memberAvatarUrl = Aeson.KeyMap.lookup "avatar_url" content >>= asText
+              , memberPreviousAvatarUrl = previousAvatarUrl
               }
         )
+    "m.room.avatar" -> do
+      content <- eventContent
+      MatrixEvent matrixEventId sender . MatrixRoomAvatar <$> (Aeson.KeyMap.lookup "url" content >>= asText)
     _ -> ignored eventType
 
 messageEvent :: (MatrixEventContent -> Maybe MatrixEvent) -> Object -> Maybe MatrixEvent

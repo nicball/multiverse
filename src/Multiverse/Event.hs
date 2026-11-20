@@ -15,6 +15,8 @@ module Multiverse.Event
   , eventId
   , eventReferences
   , blobPlatformKey
+  , contentDigest
+  , contentDigestBytes
   )
 where
 
@@ -109,8 +111,8 @@ data EventContent
   | SendMessage SendMessageInfo
   | RetractMessage MessageId
   | EditMessage MessageId Message
-  | ModifyUser UserId UserInfo
-  | ModifyRoom RoomId RoomInfo
+  | ModifyUser UserId UserInfo EventId
+  | ModifyRoom RoomId RoomInfo EventId
   | ChangeRoomNick UserId RoomId Text
   deriving (Eq, Ord, Read, Show)
 
@@ -136,10 +138,10 @@ eventReferences event =
     RetractMessage message -> [messageEventId message]
     EditMessage message body ->
       messageEventId message : messageReferences body
-    ModifyUser user info ->
-      userEventId user : maybe [] ((: []) . blobEventId) info.avatar
-    ModifyRoom room info ->
-      roomEventId room : maybe [] ((: []) . blobEventId) info.avatar
+    ModifyUser user info previous ->
+      userEventId user : (maybe [] ((: []) . blobEventId) info.avatar <> [previous])
+    ModifyRoom room info previous ->
+      roomEventId room : (maybe [] ((: []) . blobEventId) info.avatar <> [previous])
     ChangeRoomNick user room _ -> [userEventId user, roomEventId room]
 
 messageReferences :: Message -> [EventId]
@@ -192,6 +194,14 @@ inlineTargets = concatMap partTargets . toList
 
 blobPlatformKey :: ByteString -> PlatformKey
 blobPlatformKey bytes = PlatformKey "multiverse" "blob" (sha256HexBytes bytes)
+
+-- | A stable digest for values that only have content identity, such as
+-- synthetic profile-modification platform keys.
+contentDigest :: Text -> Text
+contentDigest = sha256Hex
+
+contentDigestBytes :: ByteString -> Text
+contentDigestBytes = sha256HexBytes
 
 showContent :: EventContent -> Text
 showContent = \case

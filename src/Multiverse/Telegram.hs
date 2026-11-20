@@ -5,6 +5,7 @@ where
 
 import Control.Applicative ((<|>))
 import Control.Concurrent (threadDelay)
+import Control.Exception (SomeException, try)
 import Control.Monad (forM_, forever, unless, when)
 import Data.Aeson
 import Data.ByteString qualified as ByteString
@@ -176,8 +177,23 @@ telegramReplyTo context message =
 
 ensureUser :: Timeline timeline => Context timeline -> TelegramUser -> IO UserId
 ensureUser context user = do
-  mapped <- ensureUserMapped context.logger context.timeline context.mappingStore (telegramUserKey user) (pure (telegramUserName user))
-  either (\err -> fail ("could not create telegram user: " <> show err)) pure mapped
+  mapped <- ensureUserMapped context.logger context.timeline context.mappingStore (telegramUserKey user) (telegramUserInfoForCreate context user)
+  userId <- either (\err -> fail ("could not create telegram user: " <> show err)) pure mapped
+  backfillTelegramAvatar context user userId
+  pure userId
+
+-- | Existing users created before avatar support, or via a mention stub, get
+-- one profile attempt. The marker prevents a user without an avatar from being
+-- looked up again on every message.
+backfillTelegramAvatar :: Timeline timeline => Context timeline -> TelegramUser -> UserId -> IO ()
+backfillTelegramAvatar context user userId = do
+  current <- getUserInfo context.timeline userId Nothing
+  when (maybe True (isNothing . (.avatar)) current) do
+    let stateKey = "telegram.avatar_checked." <> renderEventId (userEventId userId)
+    checked <- context.mappingStore.lookupState stateKey
+    when (isNothing checked) do
+      syncUserProfile context.logger context.timeline context.mappingStore (telegramUserKey user) userId (telegramUserProfile context user)
+      context.mappingStore.setState stateKey "done"
 
 reflectEvent :: Timeline timeline => Context timeline -> StoredEvent -> IO ()
 reflectEvent context stored =
@@ -516,7 +532,7 @@ telegramDeleteMessage context chatId messageId =
         ]
     )
 
-fetchInitialRoomInfo :: Context timeline -> InitialRoomMapping -> IO RoomInfo
+fetchInitialRoomInfo :: Timeline timeline => Context timeline -> InitialRoomMapping -> IO RoomInfo
 fetchInitialRoomInfo context mapping =
   case readMaybe (Text.unpack mapping.platformKey.key) of
     Nothing -> fail ("telegram room key is not a chat id: " <> Text.unpack mapping.platformKey.key)
@@ -524,7 +540,67 @@ fetchInitialRoomInfo context mapping =
       result <- telegramGetChat context chatId
       case result of
         Left err -> fail ("telegram getChat failed: " <> err)
-        Right chat -> pure RoomInfo {name = telegramChatName chat, description = "", avatar = Nothing}
+        Right chat -> do
+          avatar <- telegramChatAvatar context chat
+          pure RoomInfo {name = telegramChatName chat, description = "", avatar}
+
+telegramUserInfoForCreate :: Timeline timeline => Context timeline -> TelegramUser -> IO UserInfo
+telegramUserInfoForCreate context user = do
+  let fallback = UserInfo {name = telegramUserName user, avatar = Nothing}
+  maybe fallback id <$> telegramUserProfile context user
+
+-- | A profile fetch returns 'Nothing' when the avatar could not be fetched.
+-- The caller then keeps the current avatar instead of clearing it.
+telegramUserProfile :: Timeline timeline => Context timeline -> TelegramUser -> IO (Maybe UserInfo)
+telegramUserProfile context user = do
+  result <- telegramGetUserProfilePhotos context user.userId
+  case result of
+    Left err -> do
+      logDebug context.logger ("telegram profile photo lookup failed for " <> Text.pack (show user.userId) <> ": " <> Text.pack err)
+      pure Nothing
+    Right profile ->
+      case largestTelegramPhoto profile of
+        Nothing -> pure (Just UserInfo {name = telegramUserName user, avatar = Nothing})
+        Just photo -> do
+          downloaded <- try (telegramDownloadFile context photo.fileId) :: IO (Either SomeException ByteString.ByteString)
+          case downloaded of
+            Left err -> do
+              logDebug context.logger ("telegram avatar download failed for " <> Text.pack (show user.userId) <> ": " <> Text.pack (show err))
+              pure Nothing
+            Right bytes -> do
+              avatar <- importAvatar context.logger context.timeline context.mappingStore (telegramAvatarKey "user" photo.fileUniqueId) bytes
+              case avatar of
+                Nothing -> pure Nothing
+                Just blob -> pure (Just UserInfo {name = telegramUserName user, avatar = Just blob})
+
+largestTelegramPhoto :: TelegramUserProfilePhotos -> Maybe TelegramPhotoSize
+largestTelegramPhoto profile =
+  listToMaybe (reverse (sortOn (\photo -> (maybe 0 id photo.fileSize, photo.width * photo.height)) (concat profile.photos)))
+
+telegramChatAvatar :: Timeline timeline => Context timeline -> TelegramChat -> IO (Maybe BlobId)
+telegramChatAvatar context chat =
+  case chat.photo of
+    Nothing -> pure Nothing
+    Just photo -> do
+      downloaded <- try (telegramDownloadFile context photo.bigFileId) :: IO (Either SomeException ByteString.ByteString)
+      case downloaded of
+        Left err -> do
+          logDebug context.logger ("telegram room avatar download failed for " <> Text.pack (show chat.chatId) <> ": " <> Text.pack (show err))
+          pure Nothing
+        Right bytes ->
+          importAvatar context.logger context.timeline context.mappingStore (telegramAvatarKey "room" photo.bigFileUniqueId) bytes
+
+telegramAvatarKey :: Text -> Text -> PlatformKey
+telegramAvatarKey kind uniqueId = PlatformKey "telegram" "blob" ("avatar:" <> kind <> ":" <> uniqueId)
+
+telegramGetUserProfilePhotos :: Context timeline -> Integer -> IO (Either String TelegramUserProfilePhotos)
+telegramGetUserProfilePhotos context userId =
+  telegramCall context "getUserProfilePhotos"
+    ( setQueryString
+        [ ("user_id", Just (ByteString.Char8.pack (show userId)))
+        , ("limit", Just "1")
+        ]
+    )
 
 telegramGetChat :: Context timeline -> Integer -> IO (Either String TelegramChat)
 telegramGetChat context chatId =
@@ -622,7 +698,7 @@ telegramObservedMention context = \case
             context.timeline
             context.mappingStore
             (telegramUserKeyById telegramUserId)
-            (pure name)
+            (pure UserInfo {name, avatar = Nothing})
         case mapped of
           Right user -> pure (Mention label (userEventId user))
           Left err -> do
@@ -906,9 +982,46 @@ instance FromJSON TelegramUser where
       <*> obj .:? "first_name"
       <*> obj .:? "last_name"
 
+data TelegramPhotoSize = TelegramPhotoSize
+  { fileId :: Text
+  , fileUniqueId :: Text
+  , width :: Int
+  , height :: Int
+  , fileSize :: Maybe Integer
+  }
+
+instance FromJSON TelegramPhotoSize where
+  parseJSON = withObject "TelegramPhotoSize" \obj ->
+    TelegramPhotoSize
+      <$> obj .: "file_id"
+      <*> obj .: "file_unique_id"
+      <*> obj .: "width"
+      <*> obj .: "height"
+      <*> obj .:? "file_size"
+
+newtype TelegramUserProfilePhotos = TelegramUserProfilePhotos
+  { photos :: [[TelegramPhotoSize]]
+  }
+
+instance FromJSON TelegramUserProfilePhotos where
+  parseJSON = withObject "TelegramUserProfilePhotos" \obj ->
+    TelegramUserProfilePhotos <$> obj .: "photos"
+
+data TelegramChatPhoto = TelegramChatPhoto
+  { bigFileId :: Text
+  , bigFileUniqueId :: Text
+  }
+
+instance FromJSON TelegramChatPhoto where
+  parseJSON = withObject "TelegramChatPhoto" \obj ->
+    TelegramChatPhoto
+      <$> obj .: "big_file_id"
+      <*> obj .: "big_file_unique_id"
+
 data TelegramChat = TelegramChat
   { chatId :: Integer
   , title :: Maybe Text
+  , photo :: Maybe TelegramChatPhoto
   }
 
 instance FromJSON TelegramChat where
@@ -916,3 +1029,4 @@ instance FromJSON TelegramChat where
     TelegramChat
       <$> obj .: "id"
       <*> obj .:? "title"
+      <*> obj .:? "photo"

@@ -75,8 +75,8 @@ data EventContent
   | SendMessage SendMessageInfo
   | RetractMessage MessageId
   | EditMessage MessageId Message
-  | ModifyUser UserId UserInfo
-  | ModifyRoom RoomId RoomInfo
+  | ModifyUser UserId UserInfo EventId
+  | ModifyRoom RoomId RoomInfo EventId
   | ChangeRoomNick UserId RoomId Text
 
 class Timeline timeline where
@@ -85,6 +85,8 @@ class Timeline timeline where
   getEventsAfter :: timeline -> Maybe EventId -> IO [StoredEvent]
   getUserInfo :: timeline -> UserId -> Maybe RoomId -> IO (Maybe UserInfo)
   getRoomInfo :: timeline -> RoomId -> IO (Maybe RoomInfo)
+  getUserProfileEvent :: timeline -> UserId -> IO (Maybe EventId)
+  getRoomProfileEvent :: timeline -> RoomId -> IO (Maybe EventId)
   getRoomMembers :: timeline -> RoomId -> IO [UserId]
   getMembership :: timeline -> UserId -> RoomId -> IO (Maybe EventId)
   getMessage :: timeline -> MessageId -> IO (Maybe Message)

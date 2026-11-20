@@ -6,17 +6,18 @@ where
 import Control.Applicative ((<|>))
 import Control.Concurrent (threadDelay)
 import Control.Exception (SomeException, try)
-import Control.Monad (forever, unless)
+import Control.Monad (forever, unless, when)
 import Data.Aeson
 import Data.Aeson.Key qualified as Aeson.Key
 import Data.Aeson.KeyMap qualified as Aeson.KeyMap
 import Data.Aeson.Types (parseMaybe)
 import Data.ByteString (ByteString)
+import Data.ByteString qualified as ByteString
 import Data.ByteString.Base64 qualified as Base64
 import Data.ByteString.Lazy qualified as LByteString
 import Data.Foldable (toList)
 import Data.List.NonEmpty (NonEmpty ((:|)), nonEmpty)
-import Data.Maybe (catMaybes, fromMaybe, listToMaybe, mapMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isNothing, listToMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text.Encoding
@@ -150,7 +151,7 @@ observeQQMessage context event =
                 Just _ -> logDebug context.logger ("qq ignoring duplicate message " <> messageId)
                 Nothing -> do
                   let senderName = qqSenderName userId event.qqSender
-                  sender <- ensureQQUser context userId senderName
+                  sender <- ensureQQUser context userId senderName event.qqSender
                   ensureRoomMembership context.logger context.timeline context.mappingStore "qq" roomId sender
                   let messageContext =
                         QQContext
@@ -195,7 +196,7 @@ observeQQMembership context event joined =
             Nothing -> pure ()
             Just roomId -> do
               name <- qqGroupMemberName context groupId userId (qqSenderName userId event.qqSender)
-              user <- ensureQQUser context userId name
+              user <- ensureQQUser context userId name event.qqSender
               previous <- getMembership context.timeline user roomId
               let key = PlatformKey "qq" (if joined then "join" else "leave") (noticeKey groupId userId event.qqTime)
                   content = if joined then JoinRoom user roomId previous else LeaveRoom user roomId previous
@@ -217,7 +218,8 @@ observeQQCard context event =
             Nothing -> pure ()
             Just roomId -> do
               let senderName = qqSenderName userId event.qqSender
-              user <- ensureQQUser context userId (if senderName == userId then card else senderName)
+              user <- ensureQQUser context userId (if senderName == userId then card else senderName) event.qqSender
+              syncUserProfile context.logger context.timeline context.mappingStore (qqUserKey userId) user (qqUserProfile context userId (if senderName == userId then card else senderName) event.qqSender)
               let key = PlatformKey "qq" "nick" (noticeKey groupId userId event.qqTime)
               result <- submitMapped context.logger context.timeline context.mappingStore Event {platformKey = key, content = ChangeRoomNick user roomId card}
               case result of
@@ -274,11 +276,81 @@ qqReplyTo context groupId (Just messageId) = do
   mapped <- context.mappingStore.lookupTimelineId (qqMessageKey groupId messageId)
   pure (MessageId <$> mapped)
 
-ensureQQUser :: Timeline timeline => Context timeline -> Text -> Text -> IO UserId
-ensureQQUser context qqUserId displayName = do
+ensureQQUser :: Timeline timeline => Context timeline -> Text -> Text -> Maybe QQSender -> IO UserId
+ensureQQUser context qqUserId displayName sender = do
   let name = if Text.null displayName then qqUserId else displayName
-  mapped <- ensureUserMapped context.logger context.timeline context.mappingStore (qqUserKey qqUserId) (pure name)
-  either (\err -> fail ("could not create qq user: " <> show err)) pure mapped
+      fallback = UserInfo {name, avatar = Nothing}
+  mapped <- ensureUserMapped context.logger context.timeline context.mappingStore (qqUserKey qqUserId) (maybe fallback id <$> qqUserProfile context qqUserId name sender)
+  userId <- either (\err -> fail ("could not create qq user: " <> show err)) pure mapped
+  backfillQQAvatar context qqUserId name sender userId
+  pure userId
+
+-- | Existing users get one profile attempt; the marker avoids retrying on every
+-- message when QQ simply has no avatar available.
+backfillQQAvatar :: Timeline timeline => Context timeline -> Text -> Text -> Maybe QQSender -> UserId -> IO ()
+backfillQQAvatar context qqUserId name sender userId = do
+  current <- getUserInfo context.timeline userId Nothing
+  when (maybe True (isNothing . (.avatar)) current) do
+    let stateKey = "qq.avatar_checked." <> renderEventId (userEventId userId)
+    checked <- context.mappingStore.lookupState stateKey
+    when (isNothing checked) do
+      syncUserProfile context.logger context.timeline context.mappingStore (qqUserKey qqUserId) userId (qqUserProfile context qqUserId name sender)
+      context.mappingStore.setState stateKey "done"
+
+qqUserProfile :: Timeline timeline => Context timeline -> Text -> Text -> Maybe QQSender -> IO (Maybe UserInfo)
+qqUserProfile context qqUserId name sender =
+  case sender >>= (.qqAvatar) of
+    Just url -> qqAvatarUserInfo context name "user" url
+    Nothing -> do
+      response <- qqApiCall context "get_stranger_info" (object ["user_id" .= qqIdJson qqUserId])
+      case response of
+        Left err -> do
+          logDebug context.logger ("qq get_stranger_info failed for " <> qqUserId <> ": " <> Text.pack err)
+          pure Nothing
+        Right info ->
+          case valueTextField "avatar" info of
+            Nothing -> pure Nothing
+            Just url -> qqAvatarUserInfo context name "user" url
+
+qqAvatarUserInfo :: Timeline timeline => Context timeline -> Text -> Text -> Text -> IO (Maybe UserInfo)
+qqAvatarUserInfo context name kind url = do
+  avatar <- qqAvatarBlob context (kind <> ":" <> url) url
+  case avatar of
+    Nothing -> pure Nothing
+    Just blob -> pure (Just (UserInfo name (Just blob)))
+
+qqAvatarBlob :: Timeline timeline => Context timeline -> Text -> Text -> IO (Maybe BlobId)
+qqAvatarBlob context source url = do
+  downloaded <- qqDownloadAvatar context url
+  case downloaded of
+    Nothing -> pure Nothing
+    Just bytes ->
+      importAvatar
+        context.logger
+        context.timeline
+        context.mappingStore
+        (PlatformKey "qq" "blob" ("avatar:" <> source <> ":" <> contentDigestBytes bytes))
+        bytes
+
+qqDownloadAvatar :: Context timeline -> Text -> IO (Maybe ByteString.ByteString)
+qqDownloadAvatar context url = do
+  result <- try (do
+    request <- parseRequest (Text.unpack url)
+    response <- HTTP.loggedHttp context.logger defaultHttpLogOptions request context.manager
+    let body = LByteString.toStrict response.responseBody
+    pure (statusCode response.responseStatus, body)) :: IO (Either SomeException (Int, ByteString.ByteString))
+  case result of
+    Left err -> do
+      logDebug context.logger ("qq avatar download failed for " <> url <> ": " <> Text.pack (show err))
+      pure Nothing
+    Right (status, body)
+      | status >= 200, status < 300, not (ByteString.null body), ByteString.length body <= maxQQAvatarBytes -> pure (Just body)
+      | otherwise -> do
+          logDebug context.logger ("qq avatar download rejected for " <> url <> " with status " <> Text.pack (show status))
+          pure Nothing
+
+maxQQAvatarBytes :: Int
+maxQQAvatarBytes = 8 * 1024 * 1024
 
 data QQContext timeline = QQContext
   { bridge :: Context timeline
@@ -367,7 +439,7 @@ decodeQQMention context segmentData =
     Just "all" -> pure (oneInlinePart (Mention (plainInline "@all") (roomEventId context.room)))
     Just userId -> do
       let name = fromMaybe userId (firstNonempty [valueTextField "name" segmentData])
-      user <- ensureQQUser context.bridge userId name
+      user <- ensureQQUser context.bridge userId name Nothing
       pure (oneInlinePart (Mention (plainInline ("@" <> name)) (userEventId user)))
     Nothing -> pure (oneTextPart "[mention]")
 
@@ -926,18 +998,25 @@ uploadQQFile context blobId bytes = do
       logError context.bridge.logger ("qq upload_group_file failed: " <> Text.pack err)
       pure [qqTextSegment "[file]"]
 
-fetchInitialRoomInfo :: Context timeline -> InitialRoomMapping -> IO RoomInfo
+fetchInitialRoomInfo :: Timeline timeline => Context timeline -> InitialRoomMapping -> IO RoomInfo
 fetchInitialRoomInfo context mapping = do
   response <- qqApiCall context "get_group_info" (object ["group_id" .= qqIdJson mapping.platformKey.key])
   case response of
     Left err -> fail ("qq get_group_info failed: " <> err)
-    Right info ->
+    Right info -> do
+      avatar <- qqGroupAvatar context mapping.platformKey.key info
       pure
         RoomInfo
           { name = fromMaybe mapping.platformKey.key (valueTextField "group_name" info)
           , description = ""
-          , avatar = Nothing
+          , avatar
           }
+
+qqGroupAvatar :: Timeline timeline => Context timeline -> Text -> Value -> IO (Maybe BlobId)
+qqGroupAvatar context groupId info =
+  case valueTextField "avatar" info of
+    Nothing -> pure Nothing
+    Just url -> qqAvatarBlob context ("group:" <> groupId <> ":" <> url) url
 
 qqApiCall :: Context timeline -> Text -> Value -> IO (Either String Value)
 qqApiCall context action parameters = do
@@ -1011,11 +1090,12 @@ instance FromJSON QQEvent where
 data QQSender = QQSender
   { qqNickname :: Maybe Text
   , qqCard :: Maybe Text
+  , qqAvatar :: Maybe Text
   }
 
 instance FromJSON QQSender where
   parseJSON = withObject "OneBot sender" \obj ->
-    QQSender <$> obj .:? "nickname" <*> obj .:? "card"
+    QQSender <$> obj .:? "nickname" <*> obj .:? "card" <*> obj .:? "avatar"
 
 messageSegments :: Value -> [Value]
 messageSegments = \case

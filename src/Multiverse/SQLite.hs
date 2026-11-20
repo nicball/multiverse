@@ -40,6 +40,8 @@ instance Timeline SQLiteTimeline where
   getEventsAfter (SQLiteTimeline connection) = eventsAfter connection
   getUserInfo (SQLiteTimeline connection) = lookupUserInfo connection
   getRoomInfo (SQLiteTimeline connection) = lookupRoomInfo connection
+  getUserProfileEvent (SQLiteTimeline connection) = lookupUserProfileEvent connection
+  getRoomProfileEvent (SQLiteTimeline connection) = lookupRoomProfileEvent connection
   getRoomMembers (SQLiteTimeline connection) = lookupRoomMembers connection
   getMembership (SQLiteTimeline connection) = lookupMembership connection
   getMessage (SQLiteTimeline connection) = lookupMessage connection
@@ -161,6 +163,16 @@ lookupRoomInfo :: Connection -> RoomId -> IO (Maybe RoomInfo)
 lookupRoomInfo connection room =
   foldEvents connection (applyRoom room) Nothing
 
+-- | The latest profile-state event for a user: the creation event until the
+-- first modification, then the latest modification.
+lookupUserProfileEvent :: Connection -> UserId -> IO (Maybe EventId)
+lookupUserProfileEvent connection user =
+  foldEvents connection (applyUserProfileEvent user) Nothing
+
+lookupRoomProfileEvent :: Connection -> RoomId -> IO (Maybe EventId)
+lookupRoomProfileEvent connection room =
+  foldEvents connection (applyRoomProfileEvent room) Nothing
+
 lookupMessage :: Connection -> MessageId -> IO (Maybe Message)
 lookupMessage connection message =
   foldEvents connection (applyMessage message) Nothing
@@ -182,11 +194,20 @@ applyUser user room (current, roomName) stored =
   case stored.storedEvent.content of
     CreateUser info
       | UserId stored.storedId == user -> (Just info, Nothing)
-    ModifyUser modifiedUser info
+    ModifyUser modifiedUser info _
       | modifiedUser == user -> (Just info, roomName)
     ChangeRoomNick changedUser changedRoom nick
       | changedUser == user, room == Just changedRoom -> (current, Just nick)
     _ -> (current, roomName)
+
+applyUserProfileEvent :: UserId -> Maybe EventId -> StoredEvent -> Maybe EventId
+applyUserProfileEvent user current stored =
+  case stored.storedEvent.content of
+    CreateUser _
+      | UserId stored.storedId == user -> Just stored.storedId
+    ModifyUser modifiedUser _ _
+      | modifiedUser == user -> Just stored.storedId
+    _ -> current
 
 applyMembershipEvent :: UserId -> RoomId -> Maybe EventId -> StoredEvent -> Maybe EventId
 applyMembershipEvent user room current stored =
@@ -211,8 +232,17 @@ applyRoom room current stored =
   case stored.storedEvent.content of
     CreateRoom info
       | RoomId stored.storedId == room -> Just info
-    ModifyRoom modifiedRoom info
+    ModifyRoom modifiedRoom info _
       | modifiedRoom == room -> Just info
+    _ -> current
+
+applyRoomProfileEvent :: RoomId -> Maybe EventId -> StoredEvent -> Maybe EventId
+applyRoomProfileEvent room current stored =
+  case stored.storedEvent.content of
+    CreateRoom _
+      | RoomId stored.storedId == room -> Just stored.storedId
+    ModifyRoom modifiedRoom _ _
+      | modifiedRoom == room -> Just stored.storedId
     _ -> current
 
 applyMessage :: MessageId -> Maybe Message -> StoredEvent -> Maybe Message
