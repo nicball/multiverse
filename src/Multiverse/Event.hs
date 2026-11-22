@@ -109,11 +109,15 @@ data EventContent
   | JoinRoom UserId RoomId (Maybe EventId)
   | LeaveRoom UserId RoomId (Maybe EventId)
   | SendMessage SendMessageInfo
-  | RetractMessage MessageId
-  | EditMessage MessageId Message
+  -- | The previous state event in the message chain. The chain root is the
+  -- message identity.
+  | RetractMessage EventId
+  | EditMessage EventId Message
   | ModifyUser UserId UserInfo EventId
   | ModifyRoom RoomId RoomInfo EventId
-  | ChangeRoomNick UserId RoomId Text
+  -- | A complete room-scoped profile. 'Nothing' clears the override so the
+  -- room falls back to the global profile.
+  | ModifyUserPerRoom UserId RoomId (Maybe UserInfo) EventId
   deriving (Eq, Ord, Read, Show)
 
 eventId :: Event -> EventId
@@ -135,14 +139,17 @@ eventReferences event =
         : foldMap ((: []) . messageEventId) info.replyTo
         <> foldMap ((: []) . messageEventId) info.forwardOf
         <> messageReferences info.body
-    RetractMessage message -> [messageEventId message]
-    EditMessage message body ->
-      messageEventId message : messageReferences body
+    RetractMessage previous -> [previous]
+    EditMessage previous body ->
+      previous : messageReferences body
     ModifyUser user info previous ->
       userEventId user : (maybe [] ((: []) . blobEventId) info.avatar <> [previous])
     ModifyRoom room info previous ->
       roomEventId room : (maybe [] ((: []) . blobEventId) info.avatar <> [previous])
-    ChangeRoomNick user room _ -> [userEventId user, roomEventId room]
+    ModifyUserPerRoom user room info previous ->
+      userEventId user
+        : roomEventId room
+        : (maybe [] ((: []) . blobEventId) (info >>= \value -> value.avatar) <> [previous])
 
 messageReferences :: Message -> [EventId]
 messageReferences = concatMap messagePartReferences . toList

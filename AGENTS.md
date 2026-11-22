@@ -4,7 +4,7 @@ This repository is heavily WIP. Do not spend effort on database migrations as de
 
 # The Core
 
-Multiverse is a event center for bridging between various chat platforms. The core data is called timeline as described in `agent.hs` as pseudo haskell. It is an set of events ordered by submission. The ordering of events is internal to the timeline and exposed through certain APIs.
+Multiverse is a event center for bridging between various chat platforms. The core data is called timeline. It is an set of events ordered by submission. The ordering of events is internal to the timeline and exposed through certain APIs.
 
 Each entity (message, user, room, blob, etc) is identified by its creation event id. There could be various state changing events for the entity. The timeline provides APIs for querying the calculated state.
 

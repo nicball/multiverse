@@ -9,19 +9,23 @@ module Multiverse.Bridge
   , hasPlatformMapping
   , renderRelayedMessage
   , renderMessageBody
-  , renderNickChange
+  , renderUserPerRoomChange
   , mapMessageInlines
   , htmlEscape
   , ensureRoomMembership
   , ensureUserMapped
   , lookupSendMessage
+  , resolveMessageId
   , lookupBlobBytes
   , importAvatar
   , modifyUserKey
+  , modifyUserPerRoomKey
   , modifyRoomKey
   , roomOriginPlatform
   , syncUserProfile
+  , syncUserPerRoom
   , syncRoomProfile
+  , submitUserPerRoom
   , submitMapped
   , submitMessageMapped
   , submitBlob
@@ -133,15 +137,21 @@ renderMessageBody message =
         , htmlText = Text.intercalate "\n" (map (.htmlText) parts)
         }
 
-renderNickChange :: Timeline timeline => timeline -> UserId -> Text -> IO RenderedMessage
-renderNickChange timeline user nick = do
-  userInfo <- getUserInfo timeline user Nothing
-  let previous = maybe "unknown" (.name) userInfo
+renderUserPerRoomChange :: Timeline timeline => timeline -> UserId -> RoomId -> EventId -> Maybe UserInfo -> IO (Maybe RenderedMessage)
+renderUserPerRoomChange timeline user room previous newInfo = do
+  previousInfo <- getUserInfoAt timeline user (Just room) previous
+  globalInfo <- getUserInfo timeline user Nothing
+  let previousName = maybe "unknown" (.name) previousInfo
+      newName = maybe (maybe "unknown" (.name) globalInfo) (.name) newInfo
   pure
-    RenderedMessage
-      { plainText = "* " <> previous <> " is now known as " <> nick
-      , htmlText = "<em>" <> htmlEscape previous <> " is now known as " <> htmlEscape nick <> "</em>"
-      }
+    if previousName == newName
+      then Nothing
+      else
+        Just
+          RenderedMessage
+            { plainText = "* " <> previousName <> " is now known as " <> newName
+            , htmlText = "<em>" <> htmlEscape previousName <> " is now known as " <> htmlEscape newName <> "</em>"
+            }
 
 renderMessagePart :: MessagePart -> RenderedMessage
 renderMessagePart = \case
@@ -347,6 +357,11 @@ lookupSendMessage timeline message = do
     Just (SendMessage info) -> Just info
     _ -> Nothing
 
+-- | A platform target may have been mapped to any event in a message chain.
+-- Normalise it to the chain root, which is the message identity.
+resolveMessageId :: Timeline timeline => timeline -> EventId -> IO (Maybe MessageId)
+resolveMessageId timeline target = getMessageRoot timeline target
+
 -- | The first sighting of a platform user creates its timeline user. Profile
 -- updates after that are submitted through 'syncUserProfile'.
 ensureUserMapped :: Timeline timeline => Logger -> timeline -> MappingStore -> PlatformKey -> IO UserInfo -> IO (Either SubmitError UserId)
@@ -378,6 +393,22 @@ modifyUserKey base user previous info =
     { entityType = "user-modify"
     , key =
         renderEventId (userEventId user)
+          <> "/"
+          <> renderEventId previous
+          <> "/"
+          <> contentDigest (Text.pack (show info))
+    }
+
+-- | A room-scoped profile modification. The predecessor and the resulting
+-- profile distinguish repeated transitions with the same platform key.
+modifyUserPerRoomKey :: PlatformKey -> UserId -> RoomId -> EventId -> Maybe UserInfo -> PlatformKey
+modifyUserPerRoomKey base user room previous info =
+  base
+    { entityType = "user-room-modify"
+    , key =
+        renderEventId (userEventId user)
+          <> "/"
+          <> renderEventId (roomEventId room)
           <> "/"
           <> renderEventId previous
           <> "/"
@@ -431,6 +462,57 @@ syncUserProfile logger timeline mappingStore platformKey user fetchInfo = do
             case result of
               Left err -> logError logger ("user modification submit error: " <> Text.pack (show err))
               Right _ -> pure ()
+
+-- | Submit a room-scoped profile update under a stable platform key.
+submitUserPerRoom ::
+  Timeline timeline =>
+  Logger ->
+  timeline ->
+  MappingStore ->
+  PlatformKey ->
+  UserId ->
+  RoomId ->
+  Maybe UserInfo ->
+  IO ()
+submitUserPerRoom logger timeline mappingStore platformKey user room info = do
+  current <- getRoomUserInfo timeline user room
+  unless (current == info) do
+    previous <- getUserProfileEvent timeline user
+    case previous of
+      Nothing -> logError logger ("cannot modify missing user " <> renderEventId (userEventId user))
+      Just previousEventId -> do
+        let content = ModifyUserPerRoom user room info previousEventId
+        result <- submitMapped logger timeline mappingStore Event {platformKey, content}
+        case result of
+          Left err -> logError logger ("room user modification submit error: " <> Text.pack (show err))
+          Right _ -> pure ()
+
+-- | Submit a room-scoped profile update whose platform key is derived from the
+-- predecessor and the new value. Used when the platform event has no stable
+-- per-transition key of its own.
+syncUserPerRoom ::
+  Timeline timeline =>
+  Logger ->
+  timeline ->
+  MappingStore ->
+  PlatformKey ->
+  UserId ->
+  RoomId ->
+  Maybe UserInfo ->
+  IO ()
+syncUserPerRoom logger timeline mappingStore baseKey user room info = do
+  current <- getRoomUserInfo timeline user room
+  unless (current == info) do
+    previous <- getUserProfileEvent timeline user
+    case previous of
+      Nothing -> logError logger ("cannot modify missing user " <> renderEventId (userEventId user))
+      Just previousEventId -> do
+        let content = ModifyUserPerRoom user room info previousEventId
+            key = modifyUserPerRoomKey baseKey user room previousEventId info
+        result <- submitMapped logger timeline mappingStore Event {platformKey = key, content}
+        case result of
+          Left err -> logError logger ("room user modification submit error: " <> Text.pack (show err))
+          Right _ -> pure ()
 
 syncRoomProfile ::
   Timeline timeline =>
@@ -559,8 +641,8 @@ eventKind = \case
   RetractMessage _ -> "retraction"
   EditMessage _ _ -> "edit"
   ModifyUser _ _ _ -> "user modification"
+  ModifyUserPerRoom _ _ _ _ -> "room user modification"
   ModifyRoom _ _ _ -> "room modification"
-  ChangeRoomNick _ _ _ -> "nick change"
 
 -- | Blobs are timeline-owned: their event platform key is derived from the
 -- content, while the bridge mapping records the platform-local source key.

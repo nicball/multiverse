@@ -6,7 +6,7 @@ where
 import Control.Applicative ((<|>))
 import Control.Concurrent (threadDelay)
 import Control.Exception (SomeException, try)
-import Control.Monad (forever, unless, when)
+import Control.Monad (forM_, forever, unless, when)
 import Data.Aeson
 import Data.Aeson.Key qualified as Aeson.Key
 import Data.Aeson.KeyMap qualified as Aeson.KeyMap
@@ -150,9 +150,10 @@ observeQQMessage context event =
               case existing of
                 Just _ -> logDebug context.logger ("qq ignoring duplicate message " <> messageId)
                 Nothing -> do
-                  let senderName = qqSenderName userId event.qqSender
+                  let senderName = qqGlobalName userId event.qqSender
                   sender <- ensureQQUser context userId senderName event.qqSender
                   ensureRoomMembership context.logger context.timeline context.mappingStore "qq" roomId sender
+                  syncQQRoomCard context groupId roomId sender event.qqSender
                   let messageContext =
                         QQContext
                           { bridge = context
@@ -195,7 +196,8 @@ observeQQMembership context event joined =
           case room of
             Nothing -> pure ()
             Just roomId -> do
-              name <- qqGroupMemberName context groupId userId (qqSenderName userId event.qqSender)
+              let nickname = fromMaybe userId (event.qqSender >>= (.qqNickname))
+              name <- qqGroupMemberName context groupId userId nickname
               user <- ensureQQUser context userId name event.qqSender
               previous <- getMembership context.timeline user roomId
               let key = PlatformKey "qq" (if joined then "join" else "leave") (noticeKey groupId userId event.qqTime)
@@ -212,20 +214,48 @@ observeQQCard context event =
     (Just groupId, Just userId, Just card)
       | event.qqSelfId == Just userId ->
           logDebug context.logger ("qq ignoring own nickname change " <> userId)
-      | not (Text.null card) -> do
+      | otherwise -> do
           room <- lookupConfiguredRoom context.mappingStore context.config.initialRooms (qqRoomKey groupId)
           case room of
             Nothing -> pure ()
             Just roomId -> do
-              let senderName = qqSenderName userId event.qqSender
-              user <- ensureQQUser context userId (if senderName == userId then card else senderName) event.qqSender
-              syncUserProfile context.logger context.timeline context.mappingStore (qqUserKey userId) user (qqUserProfile context userId (if senderName == userId then card else senderName) event.qqSender)
-              let key = PlatformKey "qq" "nick" (noticeKey groupId userId event.qqTime)
-              result <- submitMapped context.logger context.timeline context.mappingStore Event {platformKey = key, content = ChangeRoomNick user roomId card}
-              case result of
-                Left err -> logError context.logger ("qq nickname submit error: " <> Text.pack (show err))
-                Right _ -> pure ()
+              let nickname = fromMaybe userId (event.qqSender >>= (.qqNickname))
+              name <- qqGroupMemberName context groupId userId nickname
+              user <- ensureQQUser context userId name event.qqSender
+              roomInfo <- qqRoomUserInfo context user (nonEmptyText card)
+              let key = PlatformKey "qq" "user-room" (noticeKey groupId userId event.qqTime <> "/" <> maybe "none" id (nonEmptyText card))
+              submitUserPerRoom context.logger context.timeline context.mappingStore key user roomId roomInfo
     _ -> logDebug context.logger "qq ignored card notice with incomplete identifiers"
+
+-- | Refresh the room-scoped card from a message sender. Card clear notices are
+-- handled by 'observeQQCard'; messages only assert a non-empty card.
+syncQQRoomCard :: Timeline timeline => Context timeline -> Text -> RoomId -> UserId -> Maybe QQSender -> IO ()
+syncQQRoomCard context groupId roomId user sender =
+  case sender >>= (.qqCard) >>= nonEmptyText of
+    Nothing -> pure ()
+    Just _ -> do
+      roomInfo <- qqRoomUserInfo context user (sender >>= (.qqCard) >>= nonEmptyText)
+      syncUserPerRoom
+        context.logger
+        context.timeline
+        context.mappingStore
+        (PlatformKey "qq" "user-room" groupId)
+        user
+        roomId
+        roomInfo
+
+qqRoomUserInfo :: Timeline timeline => Context timeline -> UserId -> Maybe Text -> IO (Maybe UserInfo)
+qqRoomUserInfo context user card =
+  case card of
+    Nothing -> pure Nothing
+    Just name -> do
+      globalInfo <- getUserInfo context.timeline user Nothing
+      pure (Just (UserInfo name (globalInfo >>= \info -> info.avatar)))
+
+nonEmptyText :: Text -> Maybe Text
+nonEmptyText value
+  | Text.null value = Nothing
+  | otherwise = Just value
 
 noticeKey :: Text -> Text -> Maybe Text -> Text
 noticeKey groupId userId time =
@@ -248,7 +278,7 @@ qqGroupMemberName context groupId userId fallback
           logDebug context.logger ("qq get_group_member_info failed: " <> Text.pack err)
           pure fallback
         Right info ->
-          pure (fromMaybe fallback (firstNonempty [valueTextField "card" info, valueTextField "nickname" info]))
+          pure (fromMaybe fallback (firstNonempty [valueTextField "nickname" info, valueTextField "card" info]))
 
 observeQQRetraction :: Timeline timeline => Context timeline -> QQEvent -> IO ()
 observeQQRetraction context event =
@@ -262,19 +292,29 @@ observeQQRetraction context event =
           case target of
             Nothing -> logDebug context.logger ("qq ignoring recall for unknown message " <> targetMessageId)
             Just targetId -> do
-              let key = PlatformKey "qq" "retraction" (groupId <> "/" <> targetMessageId)
-                  eventToSubmit = Event {platformKey = key, content = RetractMessage (MessageId targetId)}
-              result <- submitMapped context.logger context.timeline context.mappingStore eventToSubmit
-              case result of
-                Left err -> logError context.logger ("qq retraction submit error: " <> Text.pack (show err))
-                Right _ -> pure ()
+              root <- resolveMessageId context.timeline targetId
+              case root of
+                Nothing -> logDebug context.logger ("qq ignoring recall for unknown timeline message " <> renderEventId targetId)
+                Just messageId -> do
+                  state <- getMessageState context.timeline messageId
+                  case state of
+                    Nothing -> logDebug context.logger ("qq ignoring recall for unknown timeline message " <> renderEventId targetId)
+                    Just current -> do
+                      let key = PlatformKey "qq" "retraction" (groupId <> "/" <> targetMessageId)
+                          eventToSubmit = Event {platformKey = key, content = RetractMessage current.messageHead}
+                      result <- submitMapped context.logger context.timeline context.mappingStore eventToSubmit
+                      case result of
+                        Left err -> logError context.logger ("qq retraction submit error: " <> Text.pack (show err))
+                        Right _ -> pure ()
     _ -> logDebug context.logger "qq ignored recall event with incomplete identifiers"
 
-qqReplyTo :: Context timeline -> Text -> Maybe Text -> IO (Maybe MessageId)
+qqReplyTo :: Timeline timeline => Context timeline -> Text -> Maybe Text -> IO (Maybe MessageId)
 qqReplyTo _ _ Nothing = pure Nothing
 qqReplyTo context groupId (Just messageId) = do
   mapped <- context.mappingStore.lookupTimelineId (qqMessageKey groupId messageId)
-  pure (MessageId <$> mapped)
+  case mapped of
+    Nothing -> pure Nothing
+    Just target -> resolveMessageId context.timeline target
 
 ensureQQUser :: Timeline timeline => Context timeline -> Text -> Text -> Maybe QQSender -> IO UserId
 ensureQQUser context qqUserId displayName sender = do
@@ -790,33 +830,38 @@ reflectQQEvent context stored =
       | otherwise -> do
           roomKeys <- context.mappingStore.lookupPlatformKeys (roomEventId info.room)
           mapM_ (sendToQQRoom context stored info) (filter (enabledRoom context.config.initialRooms) roomKeys)
-    RetractMessage message
+    RetractMessage previous
       | stored.storedEvent.platformKey.platform == "qq" ->
           logDebug context.logger ("qq not reflecting own-origin retraction " <> renderEventId stored.storedId)
-      | otherwise -> retractQQMessages context stored message
-    ChangeRoomNick user room nick
-      | stored.storedEvent.platformKey.platform == "qq" ->
-          logDebug context.logger ("qq not reflecting own-origin nick change " <> renderEventId stored.storedId)
       | otherwise -> do
-          roomKeys <- context.mappingStore.lookupPlatformKeys (roomEventId room)
-          mapM_ (sendQQNickChange context stored user nick) (filter (enabledRoom context.config.initialRooms) roomKeys)
+          root <- getMessageRoot context.timeline previous
+          case root of
+            Nothing -> logError context.logger ("qq retraction references unknown message " <> renderEventId previous)
+            Just message -> retractQQMessages context stored message
+    ModifyUserPerRoom user room info previous
+      | stored.storedEvent.platformKey.platform == "qq" ->
+          logDebug context.logger ("qq not reflecting own-origin room profile change " <> renderEventId stored.storedId)
+      | otherwise -> do
+          rendered <- renderUserPerRoomChange context.timeline user room previous info
+          forM_ rendered \body -> do
+            roomKeys <- context.mappingStore.lookupPlatformKeys (roomEventId room)
+            mapM_ (sendQQRoomProfileChange context stored body) (filter (enabledRoom context.config.initialRooms) roomKeys)
     _ -> pure ()
 
-sendQQNickChange :: Timeline timeline => Context timeline -> StoredEvent -> UserId -> Text -> PlatformKey -> IO ()
-sendQQNickChange context stored user nick roomKey =
+sendQQRoomProfileChange :: Context timeline -> StoredEvent -> RenderedMessage -> PlatformKey -> IO ()
+sendQQRoomProfileChange context stored body roomKey =
   case readMaybe (Text.unpack roomKey.key) :: Maybe Integer of
     Nothing -> logWarn context.logger ("qq ignoring invalid group id " <> roomKey.key)
     Just groupId -> do
       alreadySent <- qqMessageMappedToGroup context stored.storedId roomKey.key
       unless alreadySent do
-        text <- renderNickChange context.timeline user nick
-        let params = object ["group_id" .= groupId, "message" .= [qqTextSegment text.plainText]]
+        let params = object ["group_id" .= groupId, "message" .= [qqTextSegment body.plainText]]
         response <- qqApiCall context "send_group_msg" params
         case response of
-          Left err -> logError context.logger ("qq nick send_group_msg failed: " <> Text.pack err)
+          Left err -> logError context.logger ("qq room profile send_group_msg failed: " <> Text.pack err)
           Right result ->
             case valueTextField "message_id" result of
-              Nothing -> logError context.logger "qq nick send_group_msg response lacked message_id"
+              Nothing -> logError context.logger "qq room profile send_group_msg response lacked message_id"
               Just messageId -> do
                 let platformKey = qqMessageKey roomKey.key messageId
                 context.mappingStore.insertMapping platformKey stored.storedId
@@ -1160,12 +1205,14 @@ scalarText = \case
           else Nothing
   _ -> Nothing
 
-qqSenderName :: Text -> Maybe QQSender -> Text
-qqSenderName userId sender =
+-- | The account-level display name. A group card is a room override, not the
+-- global name.
+qqGlobalName :: Text -> Maybe QQSender -> Text
+qqGlobalName userId sender =
   fromMaybe userId
     ( firstNonempty
-        [ sender >>= (.qqCard)
-        , sender >>= (.qqNickname)
+        [ sender >>= (.qqNickname)
+        , sender >>= (.qqCard)
         ]
     )
 

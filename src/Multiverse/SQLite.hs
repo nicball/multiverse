@@ -5,8 +5,10 @@ module Multiverse.SQLite
   )
 where
 
+import Control.Applicative ((<|>))
 import Control.Exception (Exception, throwIO)
 import Control.Monad (filterM)
+import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Database.SQLite.Simple
@@ -39,12 +41,15 @@ instance Timeline SQLiteTimeline where
   getEvent (SQLiteTimeline connection) = lookupEvent connection
   getEventsAfter (SQLiteTimeline connection) = eventsAfter connection
   getUserInfo (SQLiteTimeline connection) = lookupUserInfo connection
+  getUserInfoAt (SQLiteTimeline connection) = lookupUserInfoAt connection
+  getRoomUserInfo (SQLiteTimeline connection) = lookupRoomUserInfo connection
   getRoomInfo (SQLiteTimeline connection) = lookupRoomInfo connection
   getUserProfileEvent (SQLiteTimeline connection) = lookupUserProfileEvent connection
   getRoomProfileEvent (SQLiteTimeline connection) = lookupRoomProfileEvent connection
   getRoomMembers (SQLiteTimeline connection) = lookupRoomMembers connection
   getMembership (SQLiteTimeline connection) = lookupMembership connection
-  getMessage (SQLiteTimeline connection) = lookupMessage connection
+  getMessageState (SQLiteTimeline connection) = lookupMessageState connection
+  getMessageRoot (SQLiteTimeline connection) = lookupMessageRoot connection
 
 migrate :: Connection -> IO ()
 migrate connection = do
@@ -138,16 +143,43 @@ eventsAfter connection afterEventId = do
           (Only (persistedEventId eventId_))
   either throwIO pure (decodeStoredRows rows)
 
+eventsThrough :: Connection -> EventId -> IO [StoredEvent]
+eventsThrough connection upperEventId = do
+  rows <-
+    query
+      connection
+      "SELECT event_id, event FROM events\
+      \ WHERE seq <= (SELECT seq FROM events WHERE event_id = ?)\
+      \ ORDER BY seq ASC"
+      (Only (persistedEventId upperEventId))
+  either throwIO pure (decodeStoredRows rows)
+
 -- | State queries replay the event log, so they all share this fold.
 foldEvents :: Connection -> (a -> StoredEvent -> a) -> a -> IO a
 foldEvents connection step initial = foldl' step initial <$> eventsAfter connection Nothing
 
+data UserView = UserView
+  { globalInfo :: Maybe UserInfo
+  , roomInfo :: Maybe UserInfo
+  }
+
+emptyUserView :: UserView
+emptyUserView = UserView Nothing Nothing
+
+effectiveUserInfo :: UserView -> Maybe UserInfo
+effectiveUserInfo view = view.roomInfo <|> view.globalInfo
+
 lookupUserInfo :: Connection -> UserId -> Maybe RoomId -> IO (Maybe UserInfo)
 lookupUserInfo connection user room =
-  uncurry applyRoomName <$> foldEvents connection (applyUser user room) (Nothing, Nothing)
- where
-  applyRoomName (Just value) (Just roomName) = Just UserInfo {name = roomName, avatar = value.avatar}
-  applyRoomName info _ = info
+  effectiveUserInfo <$> foldEvents connection (applyUser user room) emptyUserView
+
+lookupUserInfoAt :: Connection -> UserId -> Maybe RoomId -> EventId -> IO (Maybe UserInfo)
+lookupUserInfoAt connection user room upper =
+  effectiveUserInfo <$> foldEventsThrough connection upper (applyUser user room) emptyUserView
+
+lookupRoomUserInfo :: Connection -> UserId -> RoomId -> IO (Maybe UserInfo)
+lookupRoomUserInfo connection user room =
+  fmap (\view -> view.roomInfo) (foldEvents connection (applyUser user (Just room)) emptyUserView)
 
 lookupRoomMembers :: Connection -> RoomId -> IO [UserId]
 lookupRoomMembers connection room =
@@ -164,7 +196,7 @@ lookupRoomInfo connection room =
   foldEvents connection (applyRoom room) Nothing
 
 -- | The latest profile-state event for a user: the creation event until the
--- first modification, then the latest modification.
+-- first modification, then the latest global or room-scoped modification.
 lookupUserProfileEvent :: Connection -> UserId -> IO (Maybe EventId)
 lookupUserProfileEvent connection user =
   foldEvents connection (applyUserProfileEvent user) Nothing
@@ -173,9 +205,17 @@ lookupRoomProfileEvent :: Connection -> RoomId -> IO (Maybe EventId)
 lookupRoomProfileEvent connection room =
   foldEvents connection (applyRoomProfileEvent room) Nothing
 
-lookupMessage :: Connection -> MessageId -> IO (Maybe Message)
-lookupMessage connection message =
-  foldEvents connection (applyMessage message) Nothing
+lookupMessageState :: Connection -> MessageId -> IO (Maybe MessageState)
+lookupMessageState connection message = do
+  stored <- eventsAfter connection Nothing
+  let msgFold = foldMessages stored
+  pure (Map.lookup message msgFold.messageStates)
+
+lookupMessageRoot :: Connection -> EventId -> IO (Maybe MessageId)
+lookupMessageRoot connection headEventId = do
+  stored <- eventsAfter connection Nothing
+  let msgFold = foldMessages stored
+  pure (Map.lookup headEventId msgFold.messageRoots)
 
 missingReferences :: Connection -> Event -> IO [EventId]
 missingReferences connection event = filterM (fmap not . eventExists connection) (eventReferences event)
@@ -189,16 +229,20 @@ decodeStoredRow row =
     <$> parseWith parsePersistedEventId "event id" row.rowEventId
     <*> parseWith parseEvent "event" row.rowEvent
 
-applyUser :: UserId -> Maybe RoomId -> (Maybe UserInfo, Maybe Text) -> StoredEvent -> (Maybe UserInfo, Maybe Text)
-applyUser user room (current, roomName) stored =
+foldEventsThrough :: Connection -> EventId -> (a -> StoredEvent -> a) -> a -> IO a
+foldEventsThrough connection upper step initial =
+  foldl' step initial <$> eventsThrough connection upper
+
+applyUser :: UserId -> Maybe RoomId -> UserView -> StoredEvent -> UserView
+applyUser user room view stored =
   case stored.storedEvent.content of
     CreateUser info
-      | UserId stored.storedId == user -> (Just info, Nothing)
+      | UserId stored.storedId == user -> view {globalInfo = Just info}
     ModifyUser modifiedUser info _
-      | modifiedUser == user -> (Just info, roomName)
-    ChangeRoomNick changedUser changedRoom nick
-      | changedUser == user, room == Just changedRoom -> (current, Just nick)
-    _ -> (current, roomName)
+      | modifiedUser == user -> view {globalInfo = Just info}
+    ModifyUserPerRoom modifiedUser modifiedRoom info _
+      | modifiedUser == user, room == Just modifiedRoom -> view {roomInfo = info}
+    _ -> view
 
 applyUserProfileEvent :: UserId -> Maybe EventId -> StoredEvent -> Maybe EventId
 applyUserProfileEvent user current stored =
@@ -206,6 +250,8 @@ applyUserProfileEvent user current stored =
     CreateUser _
       | UserId stored.storedId == user -> Just stored.storedId
     ModifyUser modifiedUser _ _
+      | modifiedUser == user -> Just stored.storedId
+    ModifyUserPerRoom modifiedUser _ _ _
       | modifiedUser == user -> Just stored.storedId
     _ -> current
 
@@ -245,16 +291,44 @@ applyRoomProfileEvent room current stored =
       | modifiedRoom == room -> Just stored.storedId
     _ -> current
 
-applyMessage :: MessageId -> Maybe Message -> StoredEvent -> Maybe Message
-applyMessage message current stored =
-  case stored.storedEvent.content of
-    SendMessage info
-      | MessageId stored.storedId == message -> Just info.body
-    EditMessage editedMessage body
-      | editedMessage == message -> Just body
-    RetractMessage retractedMessage
-      | retractedMessage == message -> Nothing
-    _ -> current
+data MessageFold = MessageFold
+  { messageRoots :: Map.Map EventId MessageId
+  , messageStates :: Map.Map MessageId MessageState
+  }
+
+emptyMessageFold :: MessageFold
+emptyMessageFold = MessageFold Map.empty Map.empty
+
+foldMessages :: [StoredEvent] -> MessageFold
+foldMessages = foldl' step emptyMessageFold
+ where
+  step msgFold stored =
+    case stored.storedEvent.content of
+      SendMessage info ->
+        let root = MessageId stored.storedId
+         in msgFold
+              { messageRoots = Map.insert stored.storedId root msgFold.messageRoots
+              , messageStates = Map.insert root (MessageState stored.storedId (Just info.body)) msgFold.messageStates
+              }
+      EditMessage previous body ->
+        case Map.lookup previous msgFold.messageRoots of
+          Nothing -> msgFold
+          Just root ->
+            let currentBody = Map.lookup root msgFold.messageStates >>= (.messageBody)
+                nextBody = body <$ currentBody
+             in msgFold
+                  { messageRoots = Map.insert stored.storedId root msgFold.messageRoots
+                  , messageStates = Map.insert root (MessageState stored.storedId nextBody) msgFold.messageStates
+                  }
+      RetractMessage previous ->
+        case Map.lookup previous msgFold.messageRoots of
+          Nothing -> msgFold
+          Just root ->
+            msgFold
+              { messageRoots = Map.insert stored.storedId root msgFold.messageRoots
+              , messageStates = Map.insert root (MessageState stored.storedId Nothing) msgFold.messageStates
+              }
+      _ -> msgFold
 
 renderEvent :: Event -> Text
 renderEvent = Text.pack . show

@@ -80,6 +80,7 @@ library
                     , base ^>=4.20.2.0
                     , base64-bytestring
                     , bytestring
+                    , containers
                     , cryptohash-sha256
                     , directory
                     , http-client

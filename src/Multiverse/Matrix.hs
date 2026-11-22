@@ -15,7 +15,7 @@ import Data.ByteString (ByteString)
 import Data.ByteString qualified as ByteString
 import Data.ByteString.Lazy qualified as LByteString
 import Data.List.NonEmpty (NonEmpty ((:|)), nonEmpty)
-import Data.Maybe (fromMaybe, listToMaybe, mapMaybe)
+import Data.Maybe (fromMaybe, isJust, isNothing, listToMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as Text.Encoding
@@ -126,18 +126,26 @@ observeEvent observer platformRoom room event
           case target of
             Nothing -> logDebug observer.bridge.logger ("matrix ignoring redaction for unknown event " <> redactedEvent)
             Just targetEventId -> do
-              let timelineEvent =
-                    Event
-                      { platformKey = matrixRedactionKey platformRoom event.eventId
-                      , content = RetractMessage (MessageId targetEventId)
-                      }
-              submitted <- submitMapped observer.bridge.logger observer.bridge.timeline observer.bridge.mappingStore timelineEvent
-              case submitted of
-                Right _ -> pure ()
-                Left (MissingReferences missing)
-                  | targetEventId `elem` missing ->
-                      logDebug observer.bridge.logger ("matrix ignoring redaction for missing timeline event " <> renderEventId targetEventId)
-                Left err -> logError observer.bridge.logger ("matrix retraction submit error: " <> Text.pack (show err))
+              root <- resolveMessageId observer.bridge.timeline targetEventId
+              case root of
+                Nothing -> logDebug observer.bridge.logger ("matrix ignoring redaction for unknown timeline message " <> renderEventId targetEventId)
+                Just message -> do
+                  state <- getMessageState observer.bridge.timeline message
+                  case state of
+                    Nothing -> logDebug observer.bridge.logger ("matrix ignoring redaction for unknown timeline message " <> renderEventId targetEventId)
+                    Just current -> do
+                      let timelineEvent =
+                            Event
+                              { platformKey = matrixRedactionKey platformRoom event.eventId
+                              , content = RetractMessage current.messageHead
+                              }
+                      submitted <- submitMapped observer.bridge.logger observer.bridge.timeline observer.bridge.mappingStore timelineEvent
+                      case submitted of
+                        Right _ -> pure ()
+                        Left (MissingReferences missing)
+                          | current.messageHead `elem` missing ->
+                              logDebug observer.bridge.logger ("matrix ignoring redaction for missing timeline event " <> renderEventId current.messageHead)
+                        Left err -> logError observer.bridge.logger ("matrix retraction submit error: " <> Text.pack (show err))
         MatrixMember member -> observeMatrixMember observer room event member
         MatrixRoomAvatar mxc -> observeMatrixRoomAvatar observer platformRoom room mxc
         MatrixIgnored reason
@@ -161,15 +169,29 @@ observeMatrixMessage observer event platformRoom room messageContent = do
       case target of
         Nothing -> logDebug context.logger ("matrix ignoring edit for unknown event " <> targetEventId)
         Just targetMessage -> do
-          let timelineEvent =
-                Event
-                  { platformKey = PlatformKey "matrix" "edit" (platformRoom <> "/" <> event.eventId)
-                  , content = EditMessage (MessageId targetMessage) body
-                  }
-          submitted <- submitMapped context.logger context.timeline context.mappingStore timelineEvent
-          case submitted of
-            Right _ -> pure ()
-            Left err -> logError context.logger ("matrix edit submit error: " <> Text.pack (show err))
+          let platformKey = PlatformKey "matrix" "edit" (platformRoom <> "/" <> event.eventId)
+          alreadyObserved <- context.mappingStore.lookupTimelineId platformKey
+          unless (isJust alreadyObserved) do
+            root <- resolveMessageId context.timeline targetMessage
+            case root of
+              Nothing -> logDebug context.logger ("matrix ignoring edit for unknown timeline message " <> renderEventId targetMessage)
+              Just message -> do
+                state <- getMessageState context.timeline message
+                case state of
+                  Nothing -> logDebug context.logger ("matrix ignoring edit for unknown timeline message " <> renderEventId targetMessage)
+                  Just current -> do
+                    if current.messageBody == Just body || isNothing current.messageBody
+                      then context.mappingStore.insertMapping platformKey (messageEventId message)
+                      else do
+                        let timelineEvent =
+                              Event
+                                { platformKey
+                                , content = EditMessage current.messageHead body
+                                }
+                        submitted <- submitMapped context.logger context.timeline context.mappingStore timelineEvent
+                        case submitted of
+                          Right _ -> pure ()
+                          Left err -> logError context.logger ("matrix edit submit error: " <> Text.pack (show err))
     Nothing -> do
       replyTo <- matrixReplyTo context platformRoom messageContent.messageReplyTo
       let timelineEvent =
@@ -301,10 +323,8 @@ observeMatrixMember observer room event member
       "join" -> withUser \user -> do
         submitMembership "join" user
         syncUserProfile context.logger context.timeline context.mappingStore (matrixUserKey member.memberUserId) user (matrixUserProfile context member.memberUserId)
-        case (member.memberPreviousDisplayName, member.memberDisplayName) of
-          (Just previous, Just nick)
-            | nick /= previous -> submitNick user nick
-          _ -> pure ()
+        roomInfo <- matrixRoomUserInfo context user room member
+        submitUserPerRoom context.logger context.timeline context.mappingStore (eventKey "user-room") user room roomInfo
       "leave" -> withUser (submitMembership "leave")
       "ban" -> withUser (submitMembership "leave")
       _ -> pure ()
@@ -327,7 +347,28 @@ observeMatrixMember observer room event member
     let content = if kind == "join" then JoinRoom user room previous else LeaveRoom user room previous
     submitEvent (eventKey kind) content
 
-  submitNick user nick = submitEvent (eventKey "nick") (ChangeRoomNick user room nick)
+matrixRoomUserInfo :: Timeline timeline => Context timeline -> UserId -> RoomId -> MatrixMembership -> IO (Maybe UserInfo)
+matrixRoomUserInfo context user room member
+  | isNothing displayName, isNothing avatarUrl = pure Nothing
+  | otherwise = do
+      base <- getUserInfo context.timeline user (Just room)
+      avatar <- case avatarUrl of
+        Nothing -> pure (base >>= \info -> info.avatar)
+        Just mxc -> do
+          result <- matrixAvatarBlob context mxc
+          pure case result of
+            Just (Just blob) -> Just blob
+            _ -> base >>= \info -> info.avatar
+      let fallbackName = maybe (renderEventId (userEventId user)) (.name) base
+          name = fromMaybe fallbackName displayName
+      pure (Just (UserInfo name avatar))
+ where
+  displayName = member.memberDisplayName >>= nonEmptyText
+  avatarUrl = member.memberAvatarUrl >>= nonEmptyText
+
+  nonEmptyText value
+    | Text.null value = Nothing
+    | otherwise = Just value
 
 observeMatrixRoomAvatar :: Timeline timeline => Observer timeline -> Text -> RoomId -> Text -> IO ()
 observeMatrixRoomAvatar observer platformRoom room mxc = do
@@ -345,13 +386,15 @@ observeMatrixRoomAvatar observer platformRoom room mxc = do
             let updated = RoomInfo currentName currentDescription avatar
             syncRoomProfile context.logger context.timeline context.mappingStore (matrixRoomKey platformRoom) room (pure (Just updated))
 
-matrixReplyTo :: Context timeline -> Text -> Maybe Text -> IO (Maybe MessageId)
+matrixReplyTo :: Timeline timeline => Context timeline -> Text -> Maybe Text -> IO (Maybe MessageId)
 matrixReplyTo context platformRoom replyToEvent =
   case replyToEvent of
     Nothing -> pure Nothing
     Just repliedEvent -> do
       mapped <- context.mappingStore.lookupTimelineId (matrixEventKey platformRoom repliedEvent)
-      pure (MessageId <$> mapped)
+      case mapped of
+        Nothing -> pure Nothing
+        Just target -> resolveMessageId context.timeline target
 
 ensureUser :: Timeline timeline => Observer timeline -> Text -> IO UserId
 ensureUser observer matrixUserId = do
@@ -374,54 +417,63 @@ reflectEvent context stored =
       | otherwise -> do
           roomKeys <- context.mappingStore.lookupPlatformKeys (roomEventId info.room)
           mapM_ (sendToRoom info) (filter (enabledRoom context.config.initialRooms) roomKeys)
-    EditMessage message body
+    EditMessage previous body
       | stored.storedEvent.platformKey.platform /= "matrix" -> do
-          original <- lookupSendMessage context.timeline message
-          case original of
-            Just info -> do
-              unless (messageBlobs info.body == messageBlobs body) do
-                logWarn context.logger "matrix cannot reflect changes to message attachments"
-              targets <- matrixEditTargets context message
-              alreadyMapped <- hasPlatformMapping context.mappingStore "matrix" stored.storedId
-              unless alreadyMapped do
-                forM_ targets \(roomId, matrixEventId) -> do
-                  resolved <- matrixReflectedBody context roomId (textBody body)
-                  (profile, text) <- matrixRelayBody context info (renderMessageBody resolved)
-                  let txnId = matrixTransactionId stored "edit" roomId
-                  result <- matrixSendEdit context roomId txnId matrixEventId profile text
-                  case result of
-                    Left err -> logError context.logger ("matrix edit reflect error: " <> Text.pack err)
-                    Right editEventId -> do
-                      let platformKey = matrixEventKey roomId editEventId
-                      context.mappingStore.insertMapping platformKey stored.storedId
-                      logReflected context.logger stored platformKey
-            _ -> pure ()
-    RetractMessage message
+          root <- getMessageRoot context.timeline previous
+          case root of
+            Nothing -> logError context.logger ("matrix edit references unknown message " <> renderEventId previous)
+            Just message -> do
+              original <- lookupSendMessage context.timeline message
+              case original of
+                Just info -> do
+                  unless (messageBlobs info.body == messageBlobs body) do
+                    logWarn context.logger "matrix cannot reflect changes to message attachments"
+                  targets <- matrixEditTargets context message
+                  alreadyMapped <- hasPlatformMapping context.mappingStore "matrix" stored.storedId
+                  unless alreadyMapped do
+                    forM_ targets \(roomId, matrixEventId) -> do
+                      resolved <- matrixReflectedBody context roomId (textBody body)
+                      (profile, text) <- matrixRelayBody context info (renderMessageBody resolved)
+                      let txnId = matrixTransactionId stored "edit" roomId
+                      result <- matrixSendEdit context roomId txnId matrixEventId profile text
+                      case result of
+                        Left err -> logError context.logger ("matrix edit reflect error: " <> Text.pack err)
+                        Right editEventId -> do
+                          let platformKey = matrixEventKey roomId editEventId
+                          context.mappingStore.insertMapping platformKey stored.storedId
+                          logReflected context.logger stored platformKey
+                _ -> pure ()
+    RetractMessage previous
       | stored.storedEvent.platformKey.platform == "matrix" ->
           logDebug context.logger ("matrix not reflecting own-origin event " <> renderEventId stored.storedId)
       | otherwise -> do
-          alreadyMapped <- hasPlatformMapping context.mappingStore "matrix" stored.storedId
-          unless alreadyMapped do
-            target <- lookupSendMessage context.timeline message
-            targets <- matrixRetractTargets context message
-            mapM_ (redactInRoom target) (filter (enabledRoom context.config.initialRooms . matrixRoomKey . fst) targets)
-    ChangeRoomNick user room nick
+          root <- getMessageRoot context.timeline previous
+          case root of
+            Nothing -> logError context.logger ("matrix retraction references unknown message " <> renderEventId previous)
+            Just message -> do
+              alreadyMapped <- hasPlatformMapping context.mappingStore "matrix" stored.storedId
+              unless alreadyMapped do
+                target <- lookupSendMessage context.timeline message
+                targets <- matrixRetractTargets context message
+                mapM_ (redactInRoom target) (filter (enabledRoom context.config.initialRooms . matrixRoomKey . fst) targets)
+    ModifyUserPerRoom user room info previous
       | stored.storedEvent.platformKey.platform == "matrix" ->
-          logDebug context.logger ("matrix not reflecting own-origin nick change " <> renderEventId stored.storedId)
+          logDebug context.logger ("matrix not reflecting own-origin room profile change " <> renderEventId stored.storedId)
       | otherwise -> do
-          body <- renderNickChange context.timeline user nick
-          roomKeys <- context.mappingStore.lookupPlatformKeys (roomEventId room)
-          forM_ (filter (enabledRoom context.config.initialRooms) roomKeys) \roomKey -> do
-            alreadySent <- matrixMessageMappedToRoom context stored.storedId roomKey.key
-            unless alreadySent do
-              let txnId = matrixTransactionId stored "nick" roomKey.key
-              result <- matrixSendMessage context roomKey.key txnId Nothing Nothing body
-              case result of
-                Left err -> logError context.logger ("matrix nick reflect error: " <> Text.pack err)
-                Right matrixEventId -> do
-                  let platformKey = matrixEventKey roomKey.key matrixEventId
-                  context.mappingStore.insertMapping platformKey stored.storedId
-                  logReflected context.logger stored platformKey
+          body <- renderUserPerRoomChange context.timeline user room previous info
+          forM_ body \rendered -> do
+            roomKeys <- context.mappingStore.lookupPlatformKeys (roomEventId room)
+            forM_ (filter (enabledRoom context.config.initialRooms) roomKeys) \roomKey -> do
+              alreadySent <- matrixMessageMappedToRoom context stored.storedId roomKey.key
+              unless alreadySent do
+                let txnId = matrixTransactionId stored "nick" roomKey.key
+                result <- matrixSendMessage context roomKey.key txnId Nothing Nothing rendered
+                case result of
+                  Left err -> logError context.logger ("matrix room profile reflect error: " <> Text.pack err)
+                  Right matrixEventId -> do
+                    let platformKey = matrixEventKey roomKey.key matrixEventId
+                    context.mappingStore.insertMapping platformKey stored.storedId
+                    logReflected context.logger stored platformKey
     _ -> pure ()
  where
   sendToRoom info roomKey = do
