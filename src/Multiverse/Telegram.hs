@@ -829,52 +829,92 @@ instance FromJSON TelegramFile where
   parseJSON = withObject "TelegramFile" \obj -> TelegramFile <$> obj .:? "file_path"
 
 telegramMessageFromEntities :: Text -> [TelegramEntity] -> Message
-telegramMessageFromEntities text entities =
-  case wholeBlockQuote text entities of
-    Just quote -> BlockQuote (Text quote :| []) :| []
-    Nothing -> Text (telegramInline text entities) :| []
+telegramMessageFromEntities text entities
+  | wholeBlockQuote text entities =
+      BlockQuote (Text (telegramInline text (filter ((/= "blockquote") . (.entityType)) entities)) :| []) :| []
+  | otherwise = Text (telegramInline text entities) :| []
 
-wholeBlockQuote :: Text -> [TelegramEntity] -> Maybe InlineText
-wholeBlockQuote text entities =
-  case [entity | entity <- entities, entity.entityType == "blockquote", entity.offset == 0, entity.length >= Text.length text] of
-    _ : _ -> Just (telegramInline text (filter ((/= "blockquote") . (.entityType)) entities))
-    [] -> Nothing
+-- | A blockquote covering the whole message becomes a quotation part instead of
+-- an inline span.
+wholeBlockQuote :: Text -> [TelegramEntity] -> Bool
+wholeBlockQuote text entities = any covers (filter ((== "blockquote") . (.entityType)) entities)
+ where
+  total = utf16Length (utf16Units text)
+  covers entity = entity.offset <= 0 && entity.length >= total
+
+-- | Telegram measures entity offsets and lengths in UTF-16 code units, so a
+-- span is taken from the UTF-16 encoding of the text: an astral character such
+-- as an emoji counts as two units, while 'Text.take' and 'Text.drop' count code
+-- points.
+type Utf16 = ByteString.ByteString
+
+utf16Units :: Text -> Utf16
+utf16Units = Text.Encoding.encodeUtf16LE
+
+utf16Length :: Utf16 -> Int
+utf16Length units = ByteString.length units `div` 2
+
+utf16Span :: Utf16 -> Int -> Int -> Text
+utf16Span units offset length_ =
+  Text.Encoding.decodeUtf16LE
+    (ByteString.take (2 * length_) (ByteString.drop (2 * offset) units))
+
+entityEnd :: TelegramEntity -> Int
+entityEnd entity = entity.offset + entity.length
 
 telegramInline :: Text -> [TelegramEntity] -> InlineText
 telegramInline text entities =
-  case nonEmpty (go 0 (filter supportedInlineEntity (sortTelegramEntities entities))) of
+  case nonEmpty (render 0 total (nestEntities total entities)) of
     Just inline -> inline
     Nothing -> Plain text :| []
  where
-  go index [] =
-    [Plain (Text.drop index text) | index < Text.length text]
-  go index (entity : rest) =
-    let before = Text.take (entity.offset - index) (Text.drop index text)
-        body = Text.take entity.length (Text.drop entity.offset text)
-        afterIndex = entity.offset + entity.length
-        beforePart = [Plain before | not (Text.null before)]
-     in beforePart <> entityPart entity body <> go afterIndex rest
+  units = utf16Units text
+  total = utf16Length units
+  render start end [] =
+    [Plain (utf16Span units start (end - start)) | start < end]
+  render start end (EntityTree entity children : rest) =
+    [Plain (utf16Span units start (entity.offset - start)) | start < entity.offset]
+      <> entityPart entity (inlineOf (render entity.offset (entityEnd entity) children))
+      <> render (entityEnd entity) end rest
+  inlineOf parts = case nonEmpty parts of
+    Just inline -> inline
+    Nothing -> plainInline ""
 
-supportedInlineEntity :: TelegramEntity -> Bool
-supportedInlineEntity entity =
-  entity.entityType `elem` ["bold", "italic", "code", "text_link", "url", "text_mention"]
+-- | Entities may be nested but must not cross, so a malformed span that starts
+-- inside another entity and ends outside it is dropped instead of corrupting
+-- the spans around it. Spans are clamped to the text and empty ones ignored.
+nestEntities :: Int -> [TelegramEntity] -> [EntityTree]
+nestEntities total =
+  nest
+    . sortOn (\entity -> (entity.offset, negate (entityEnd entity)))
+    . mapMaybe (clampEntity total)
+ where
+  nest [] = []
+  nest (entity : rest) =
+    let (children, siblings) = span (\child -> entityEnd child <= entityEnd entity) rest
+        (_, later) = span (\sibling -> sibling.offset < entityEnd entity) siblings
+     in EntityTree entity (nest children) : nest later
 
-sortTelegramEntities :: [TelegramEntity] -> [TelegramEntity]
-sortTelegramEntities = sortOn (.offset)
+clampEntity :: Int -> TelegramEntity -> Maybe TelegramEntity
+clampEntity total entity = do
+  let offset = max 0 (min total entity.offset)
+      length_ = min (total - offset) entity.length
+  if length_ <= 0 then Nothing else Just entity {offset, length = length_}
 
-entityPart :: TelegramEntity -> Text -> [InlineTextPart]
-entityPart entity body =
-  let inline = Plain body :| []
-   in case entity.entityType of
-        "bold" -> [Bold inline]
-        "italic" -> [Italic inline]
-        "code" -> [InlineQuote inline]
-        "text_link" -> [Link inline (maybe body id entity.url)]
-        "url" -> [Link inline body]
-        "text_mention" -> case entity.entityUser of
-          Just user -> [Link inline ("tg://user?id=" <> Text.pack (show user.userId))]
-          Nothing -> [Plain body]
-        _ -> [Plain body]
+data EntityTree = EntityTree TelegramEntity [EntityTree]
+
+entityPart :: TelegramEntity -> InlineText -> [InlineTextPart]
+entityPart entity inline =
+  case entity.entityType of
+    "bold" -> [Bold inline]
+    "italic" -> [Italic inline]
+    "code" -> [InlineQuote inline]
+    "text_link" -> [Link inline (maybe (inlineToText inline) id entity.url)]
+    "url" -> [Link inline (inlineToText inline)]
+    "text_mention" -> case entity.entityUser of
+      Just user -> [Link inline ("tg://user?id=" <> Text.pack (show user.userId))]
+      Nothing -> toList inline
+    _ -> toList inline
 
 readTextInt :: Text -> Int
 readTextInt = maybe 0 id . readMaybe . Text.unpack
