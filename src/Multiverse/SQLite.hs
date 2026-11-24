@@ -6,6 +6,7 @@ module Multiverse.SQLite
 where
 
 import Control.Applicative ((<|>))
+import Control.Concurrent.MVar (MVar, newMVar, withMVar)
 import Control.Exception (Exception, throwIO)
 import Control.Monad (filterM)
 import Data.Map.Strict qualified as Map
@@ -17,7 +18,10 @@ import Multiverse.Event
 import Multiverse.Timeline
 import Multiverse.Types
 
-newtype SQLiteTimeline = SQLiteTimeline Connection
+-- | The connection is guarded by an 'MVar': every bridge observer and
+-- reflector queries the same timeline concurrently, and one sqlite connection
+-- (and the statement state behind it) cannot be shared between threads.
+newtype SQLiteTimeline = SQLiteTimeline (MVar Connection)
 
 data StoredRow = StoredRow
   { rowEventId :: Text
@@ -31,28 +35,36 @@ openTimeline :: FilePath -> IO SQLiteTimeline
 openTimeline path = do
   connection <- open path
   migrate connection
-  pure (SQLiteTimeline connection)
+  SQLiteTimeline <$> newMVar connection
 
 closeTimeline :: SQLiteTimeline -> IO ()
-closeTimeline (SQLiteTimeline connection) = close connection
+closeTimeline timeline = withTimelineDb timeline close
+
+withTimelineDb :: SQLiteTimeline -> (Connection -> IO a) -> IO a
+withTimelineDb (SQLiteTimeline connection) action = withMVar connection action
 
 instance Timeline SQLiteTimeline where
-  submit (SQLiteTimeline connection) = submitEvent connection
-  getEvent (SQLiteTimeline connection) = lookupEvent connection
-  getEventsAfter (SQLiteTimeline connection) = eventsAfter connection
-  getUserInfo (SQLiteTimeline connection) = lookupUserInfo connection
-  getUserInfoAt (SQLiteTimeline connection) = lookupUserInfoAt connection
-  getRoomUserInfo (SQLiteTimeline connection) = lookupRoomUserInfo connection
-  getRoomInfo (SQLiteTimeline connection) = lookupRoomInfo connection
-  getUserProfileEvent (SQLiteTimeline connection) = lookupUserProfileEvent connection
-  getRoomProfileEvent (SQLiteTimeline connection) = lookupRoomProfileEvent connection
-  getRoomMembers (SQLiteTimeline connection) = lookupRoomMembers connection
-  getMembership (SQLiteTimeline connection) = lookupMembership connection
-  getMessageState (SQLiteTimeline connection) = lookupMessageState connection
-  getMessageRoot (SQLiteTimeline connection) = lookupMessageRoot connection
+  submit timeline event = withTimelineDb timeline \connection -> submitEvent connection event
+  getEvent timeline event = withTimelineDb timeline \connection -> lookupEvent connection event
+  getEventsAfter timeline afterEventId = withTimelineDb timeline \connection -> eventsAfter connection afterEventId
+  getUserInfo timeline user room = withTimelineDb timeline \connection -> lookupUserInfo connection user room
+  getUserInfoAt timeline user room upper = withTimelineDb timeline \connection -> lookupUserInfoAt connection user room upper
+  getRoomUserInfo timeline user room = withTimelineDb timeline \connection -> lookupRoomUserInfo connection user room
+  getRoomInfo timeline room = withTimelineDb timeline \connection -> lookupRoomInfo connection room
+  getUserProfileEvent timeline user = withTimelineDb timeline \connection -> lookupUserProfileEvent connection user
+  getRoomProfileEvent timeline room = withTimelineDb timeline \connection -> lookupRoomProfileEvent connection room
+  getRoomMembers timeline room = withTimelineDb timeline \connection -> lookupRoomMembers connection room
+  getMembership timeline user room = withTimelineDb timeline \connection -> lookupMembership connection user room
+  getMessageState timeline message = withTimelineDb timeline \connection -> lookupMessageState connection message
+  getMessageRoot timeline event = withTimelineDb timeline \connection -> lookupMessageRoot connection event
 
 migrate :: Connection -> IO ()
 migrate connection = do
+  -- WAL lets another process (a sqlite shell, a backup) read while bridges
+  -- write, and a busy timeout turns a momentary lock into a short wait instead
+  -- of an immediate 'SQLITE_BUSY'.
+  execute_ connection "PRAGMA journal_mode = WAL"
+  execute_ connection "PRAGMA busy_timeout = 5000"
   execute_ connection "PRAGMA foreign_keys = ON"
   execute_
     connection
@@ -68,8 +80,15 @@ migrate connection = do
     connection
     "CREATE INDEX IF NOT EXISTS events_event_id_idx ON events (event_id)"
 
+-- | The checks and the insert form one transaction: two bridges can submit
+-- concurrently, and the loser must observe the winner's event id instead of a
+-- constraint violation.
 submitEvent :: Connection -> Event -> IO (Either SubmitError EventId)
-submitEvent connection event = do
+submitEvent connection event =
+  withImmediateTransaction connection (insertEvent connection event)
+
+insertEvent :: Connection -> Event -> IO (Either SubmitError EventId)
+insertEvent connection event = do
   let newId = eventId event
   existing <- eventExists connection newId
   if existing

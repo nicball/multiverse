@@ -45,7 +45,7 @@ module Multiverse.Bridge
 where
 
 import Control.Applicative ((<|>))
-import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent (forkIO, newMVar, threadDelay, withMVar)
 import Control.Exception (SomeException, try)
 import Control.Monad (forever, unless, void, when)
 import Data.ByteString (ByteString)
@@ -663,13 +663,18 @@ openMappingStore :: FilePath -> IO MappingStore
 openMappingStore path = do
   connection <- open path
   initializeMappingStore connection
+  -- The observer and the reflector of one bridge share the store, so the
+  -- connection is guarded by an 'MVar' just like the timeline's.
+  guarded <- newMVar connection
+  let withDb :: (Connection -> IO a) -> IO a
+      withDb = withMVar guarded
   pure
     MappingStore
-      { lookupTimelineId = lookupTimelineIdSql connection
-      , lookupPlatformKeys = lookupPlatformKeysSql connection
-      , insertMapping = insertMappingSql connection
-      , lookupState = lookupStateSql connection
-      , setState = setStateSql connection
+      { lookupTimelineId = \platformKey -> withDb \connection' -> lookupTimelineIdSql connection' platformKey
+      , lookupPlatformKeys = \eventId -> withDb \connection' -> lookupPlatformKeysSql connection' eventId
+      , insertMapping = \platformKey eventId -> withDb \connection' -> insertMappingSql connection' platformKey eventId
+      , lookupState = \key -> withDb \connection' -> lookupStateSql connection' key
+      , setState = \key value -> withDb \connection' -> setStateSql connection' key value
       }
 
 ensureInitialRooms ::
@@ -780,6 +785,8 @@ bridgeStateDdl =
 
 initializeMappingStore :: Connection -> IO ()
 initializeMappingStore connection = do
+  execute_ connection "PRAGMA journal_mode = WAL"
+  execute_ connection "PRAGMA busy_timeout = 5000"
   execute_ connection bridgeStateDdl
   execute_ connection bridgeMappingsDdl
   execute_ connection bridgeMappingsIndexDdl
