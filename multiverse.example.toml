@@ -29,6 +29,8 @@ enable = true
 [qq]
 enable = true
 api_url = "http://127.0.0.1:3000"
+# NapCat's forward WebSocket. Only plain ws:// is supported; terminate TLS in
+# front of NapCat if the connection crosses an untrusted network.
 websocket_url = "ws://127.0.0.1:6700/event"
 access_token = "replace-me"
 mapping_db = "qq-mapping.sqlite3"

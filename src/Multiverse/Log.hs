@@ -20,11 +20,14 @@ type Logger = LogEnv
 
 type LogLevel = Severity
 
+-- | Registration is the only step that acquires an OS resource (the scribe
+-- worker thread), and it runs last, so a failure cannot strand one: the handle
+-- scribe itself only owns an 'hFlush'. The returned environment is released
+-- with 'closeLogger', which stops every scribe worker.
 newLogger :: LogLevel -> IO Logger
 newLogger level = do
   scribe <- mkHandleScribe ColorIfTerminal stdout (permitItem level) V2
-  logEnv <- initLogEnv "multiverse" "production"
-  registerScribe "stdout" scribe defaultScribeSettings logEnv
+  registerScribe "stdout" scribe defaultScribeSettings =<< initLogEnv "multiverse" "production"
 
 closeLogger :: Logger -> IO ()
 closeLogger logger = do

@@ -5,7 +5,7 @@ where
 
 import Control.Applicative ((<|>))
 import Control.Concurrent (threadDelay)
-import Control.Exception (SomeException, try)
+import Control.Exception (AsyncException, SomeException, catch, fromException, throwIO, try)
 import Control.Monad (forM_, forever, unless, when)
 import Data.Aeson
 import Data.ByteString qualified as ByteString
@@ -95,7 +95,27 @@ reflectTelegram context =
   reflectForever context.timeline context.mappingStore "telegram.reflect_event" (reflectEvent context)
 
 observeUpdate :: Timeline timeline => Context timeline -> TelegramUpdate -> IO ()
-observeUpdate context update = do
+observeUpdate context update =
+  handleUpdate context update `catch` logUpdateFailure context.logger update
+
+-- | The poll offset only advances after a whole batch, so one bad update must
+-- not escape: the next poll would fetch it again and fail on it forever. Async
+-- exceptions are rethrown so supervision keeps working.
+logUpdateFailure :: Logger -> TelegramUpdate -> SomeException -> IO ()
+logUpdateFailure logger update err =
+  case fromException err of
+    Just async -> throwIO (async :: AsyncException)
+    Nothing ->
+      logError
+        logger
+        ( "telegram update "
+            <> Text.pack (show update.updateId)
+            <> " failed: "
+            <> Text.pack (show err)
+        )
+
+handleUpdate :: Timeline timeline => Context timeline -> TelegramUpdate -> IO ()
+handleUpdate context update = do
   case update.editedMessage of
     Just message -> observeTelegramEdit context update.updateId message
     Nothing -> pure ()
@@ -131,7 +151,7 @@ observeUpdate context update = do
               submitted <- submitMessageMapped context.logger context.timeline context.mappingStore event
               case submitted of
                 Right _ -> pure ()
-                Left err -> fail ("telegram submit error: " <> show err)
+                Left err -> logError context.logger ("telegram submit error: " <> Text.pack (show err))
 
 observeTelegramMembership :: Timeline timeline => Context timeline -> TelegramMessage -> RoomId -> IO ()
 observeTelegramMembership context message roomId = do
@@ -178,7 +198,9 @@ observeTelegramEdit context updateId message = do
                           then context.mappingStore.insertMapping key (messageEventId messageId)
                           else do
                             result <- submitMapped context.logger context.timeline context.mappingStore Event {platformKey = key, content = EditMessage current.messageHead newBody}
-                            either (fail . show) (const (pure ())) result
+                            case result of
+                              Right _ -> pure ()
+                              Left err -> logError context.logger ("telegram edit submit error: " <> Text.pack (show err))
 
 telegramReplyTo :: Timeline timeline => Context timeline -> TelegramMessage -> IO (Maybe MessageId)
 telegramReplyTo context message =

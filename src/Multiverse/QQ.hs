@@ -16,6 +16,7 @@ import Data.ByteString qualified as ByteString
 import Data.ByteString.Base64 qualified as Base64
 import Data.ByteString.Lazy qualified as LByteString
 import Data.Foldable (toList)
+import Data.Int (Int64)
 import Data.List.NonEmpty (NonEmpty ((:|)), nonEmpty)
 import Data.Maybe (catMaybes, fromMaybe, isNothing, listToMaybe, mapMaybe)
 import Data.Text (Text)
@@ -110,14 +111,20 @@ runQQWebSocket context =
             Nothing -> logDebug context.logger "qq observer ignored unrecognized event"
             Just event -> observeQQEvent context event
 
+-- | NapCat's forward WebSocket must be plain @ws://@: the event feed is read
+-- with 'WebSockets.runClientWith', which opens a TCP socket and has no TLS
+-- transport. TLS is a separate concern handled by the reverse proxy in front of
+-- NapCat.
 parseWebSocketUrl :: Text -> IO (String, Int, String)
 parseWebSocketUrl url
-  | not ("ws://" `Text.isPrefixOf` url) = fail "qq websocket_url must use ws://"
-  | otherwise = do
+  | "ws://" `Text.isPrefixOf` url = do
       request <- parseRequest ("http://" <> Text.unpack (Text.drop 5 url))
       let host = Text.Encoding.decodeUtf8 request.host
           path = Text.Encoding.decodeUtf8 request.path <> Text.Encoding.decodeUtf8 request.queryString
       pure (Text.unpack host, request.port, Text.unpack path)
+  | "wss://" `Text.isPrefixOf` url =
+      fail "qq websocket_url must use ws://: wss:// needs a TLS transport the bridge does not provide; terminate TLS in front of NapCat instead"
+  | otherwise = fail "qq websocket_url must use ws://<host>:<port>/<path>"
 
 observeQQEvent :: Timeline timeline => Context timeline -> QQEvent -> IO ()
 observeQQEvent context event =
@@ -785,41 +792,35 @@ downloadQQMedia :: Context timeline -> Text -> IO (Maybe ByteString)
 downloadQQMedia context mediaUrl = do
   parsed <- try (parseRequest (Text.unpack mediaUrl)) :: IO (Either HttpException Request)
   case parsed of
-    Left err -> logWarn context.logger ("qq media URL rejected: " <> Text.pack (show err)) >> pure Nothing
-    Right request0 -> do
-      let host = Text.toLower (Text.Encoding.decodeUtf8 request0.host)
-      download 1 host request0 {redirectCount = 0}
- where
-  download attempt host request = do
-    logDebug context.logger ("qq media GET host=" <> host)
-    result <- try (httpLbs request context.manager) :: IO (Either HttpException (Response LByteString.ByteString))
-    case result of
-      Left err
-        | attempt < 3 -> do
-            logWarn context.logger ("qq media request failed; retrying: " <> Text.pack (show err))
-            threadDelay (attempt * 1000000)
-            download (attempt + 1) host request
-        | otherwise -> logError context.logger ("qq media request failed: " <> Text.pack (show err)) >> pure Nothing
-      Right response -> do
-        let bytes = response.responseBody
-            size = LByteString.length bytes
-            status = statusCode response.responseStatus
-        logDebug context.logger ("qq media response status=" <> Text.pack (show status) <> " bytes=" <> Text.pack (show size))
-        if status >= 200 && status < 300 && size <= 8000000
-          then pure (Just (LByteString.toStrict bytes))
-          else do
-            logWarn context.logger "qq media response rejected (status or size limit)"
-            pure Nothing
+    Left err -> do
+      logWarn context.logger ("qq media URL rejected: " <> Text.pack (show err))
+      pure Nothing
+    Right request -> do
+      logDebug context.logger ("qq media GET host=" <> Text.toLower (Text.Encoding.decodeUtf8 request.host))
+      -- CDNs hand out redirects, so the request follows them (http-client's
+      -- default) and retries network failures with backoff.
+      result <- try (HTTP.loggedHttp context.logger qqHttpLogOptions request context.manager) :: IO (Either HttpException (Response LByteString.ByteString))
+      case result of
+        Left err -> do
+          logError context.logger ("qq media request failed: " <> Text.pack (show err))
+          pure Nothing
+        Right response -> do
+          let bytes = response.responseBody
+              size = LByteString.length bytes
+              status = statusCode response.responseStatus
+          logDebug context.logger ("qq media response status=" <> Text.pack (show status) <> " bytes=" <> Text.pack (show size))
+          if status >= 200 && status < 300 && size <= maxQQMediaBytes
+            then pure (Just (LByteString.toStrict bytes))
+            else do
+              logWarn context.logger "qq media response rejected (status or size limit)"
+              pure Nothing
+
+maxQQMediaBytes :: Int64
+maxQQMediaBytes = 8000000
 
 reflectQQ :: Timeline timeline => Context timeline -> IO ()
 reflectQQ context =
-  forever do
-    afterEventId <- fmap (fmap EventId) (context.mappingStore.lookupState "qq.reflect_event")
-    storedEvents <- getEventsAfter context.timeline afterEventId
-    mapM_ (reflectQQEvent context) storedEvents
-    case storedEvents of
-      [] -> threadDelay 2000000
-      _ -> context.mappingStore.setState "qq.reflect_event" (renderEventId ((last storedEvents).storedId))
+  reflectForever context.timeline context.mappingStore "qq.reflect_event" (reflectQQEvent context)
 
 reflectQQEvent :: Timeline timeline => Context timeline -> StoredEvent -> IO ()
 reflectQQEvent context stored =
